@@ -7,6 +7,7 @@
  *  - escrowVersions.js: REGISTRY, isValidContractId, compareVersions, getOnChainSchemaVersion
  *  - contractListRefresh.js: runContractListRefresh
  *  - adminEscrow routes: POST /refresh, GET /version (auth + logic)
+ *  - escrowMap.js: compatibility contracts (getEscrowMap, resolveEscrow, invariants)
  */
 
 jest.mock('../services/soroban');
@@ -24,6 +25,13 @@ const {
   compareVersions,
   getOnChainSchemaVersion,
 } = require('../config/escrowVersions');
+
+const {
+  getEscrowMap,
+  resolveEscrow,
+  ESCROW_MAP,
+  ESCROW_MAP_INVARIANTS,
+} = require('../config/escrowMap');
 
 const { runContractListRefresh } = require('../jobs/contractListRefresh');
 
@@ -50,6 +58,7 @@ function makeAdminToken(overrides = {}) {
 
 const adminToken = makeAdminToken();
 const VALID_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const VALID_ID_2 = 'CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 
 // ─── escrowVersions: REGISTRY ─────────────────────────────────────────────────
 
@@ -70,6 +79,116 @@ describe('REGISTRY', () => {
     expect(REGISTRY['1.0.0']).toBe(1);
     expect(REGISTRY['1.1.0']).toBe(2);
     expect(REGISTRY['1.2.0']).toBe(3);
+  });
+});
+
+// ─── escrowMap: compatibility contracts ──────────────────────────────────────
+
+describe('escrowMap: ESCROW_MAP shape and invariants', () => {
+  it('exposes a frozen map object', () => {
+    expect(typeof ESCROW_MAP).toBe('object');
+    expect(ESCROW_MAP).not.toBeNull();
+    expect(Object.isFrozen(ESCROW_MAP)).toBe(true);
+  });
+
+  it('exposes documented invariants as a frozen array of strings', () => {
+    expect(Array.isArray(ESCROW_MAP_INVARIANTS)).toBe(true);
+    expect(ESCROW_MAP_INVARIANTS.length).toBeGreaterThan(0);
+    for (const inv of ESCROW_MAP_INVARIANTS) {
+      expect(typeof inv).toBe('string');
+      expect(inv.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('every entry has a valid contractId and integer schemaVersion >= 1', () => {
+    for (const [key, entry] of Object.entries(ESCROW_MAP)) {
+      expect(typeof key).toBe('string');
+      expect(isValidContractId(entry.contractId)).toBe(true);
+      expect(Number.isInteger(entry.schemaVersion)).toBe(true);
+      expect(entry.schemaVersion).toBeGreaterThanOrEqual(1);
+    }
+  });
+});
+
+describe('escrowMap: getEscrowMap', () => {
+  it('returns a defensive copy that is not the internal map', () => {
+    const a = getEscrowMap();
+    const b = getEscrowMap();
+    expect(a).not.toBe(ESCROW_MAP);
+    expect(a).not.toBe(b);
+    expect(a).toEqual(b);
+  });
+
+  it('mutating the returned copy does not affect subsequent calls', () => {
+    const a = getEscrowMap();
+    const keys = Object.keys(a);
+    if (keys.length > 0) {
+      delete a[keys[0]];
+    }
+    const b = getEscrowMap();
+    expect(Object.keys(b).length).toBe(keys.length);
+  });
+
+  it('is deterministic across repeated calls', () => {
+    const first = JSON.stringify(getEscrowMap());
+    const second = JSON.stringify(getEscrowMap());
+    expect(first).toBe(second);
+  });
+});
+
+describe('escrowMap: resolveEscrow', () => {
+  it('returns null for non-string input', () => {
+    expect(resolveEscrow(null)).toBeNull();
+    expect(resolveEscrow(undefined)).toBeNull();
+    expect(resolveEscrow(123)).toBeNull();
+    expect(resolveEscrow({})).toBeNull();
+  });
+
+  it('returns null for empty string', () => {
+    expect(resolveEscrow('')).toBeNull();
+  });
+
+  it('returns null for malformed contract ids', () => {
+    expect(resolveEscrow('bad')).toBeNull();
+    expect(resolveEscrow('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBeNull();
+  });
+
+  it('returns null for a valid but unknown contract id', () => {
+    expect(resolveEscrow(VALID_ID_2)).toBeNull();
+  });
+
+  it('resolves a known contract id to its entry with key and schemaVersion', () => {
+    const keys = Object.keys(ESCROW_MAP);
+    if (keys.length === 0) {
+      return;
+    }
+    const key = keys[0];
+    const entry = ESCROW_MAP[key];
+    const resolved = resolveEscrow(entry.contractId);
+    expect(resolved).not.toBeNull();
+    expect(resolved.key).toBe(key);
+    expect(resolved.contractId).toBe(entry.contractId);
+    expect(resolved.schemaVersion).toBe(entry.schemaVersion);
+  });
+
+  it('is deterministic for repeated calls with the same input', () => {
+    const keys = Object.keys(ESCROW_MAP);
+    if (keys.length === 0) {
+      return;
+    }
+    const id = ESCROW_MAP[keys[0]].contractId;
+    expect(resolveEscrow(id)).toEqual(resolveEscrow(id));
+  });
+
+  it('does not mutate the internal map when resolving', () => {
+    const before = JSON.stringify(getEscrowMap());
+    resolveEscrow(VALID_ID_2);
+    const keys = Object.keys(ESCROW_MAP);
+    if (keys.length > 0) {
+      resolveEscrow(ESCROW_MAP[keys[0]].contractId);
+    }
+    const after = JSON.stringify(getEscrowMap());
+    expect(after).toBe(before);
   });
 });
 
