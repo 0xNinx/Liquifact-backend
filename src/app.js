@@ -144,7 +144,6 @@ function handleInternalError(err, req, res, _next) {
  * @returns {import('express').Express} Configured Express application.
  */
 function createApp() {
-  resetFeatureRouterMounts();
   const app = express();
 
   // ── 1. CORS ──────────────────────────────────────────────────────────────
@@ -401,7 +400,7 @@ function createApp() {
   mountFeatureRouter(app, '/v1', v1Routes);
   mountFeatureRouter(app, '/api', apiKeysRoutes);
 
-  assertNoDuplicateRouterMounts();
+  assertNoDuplicateRouterMounts(app);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
   // Rate limiter mounted BEFORE metricsAuth so unauthenticated attempts
