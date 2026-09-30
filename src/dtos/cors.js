@@ -90,11 +90,11 @@ function corsConfigDtoFromEnv(env = process.env) {
     !env.CORS_ALLOWED_ORIGINS &&
     env.NODE_ENV === 'development';
 
-  // Use the env-specific CORS_MAX_AGE when a custom env is provided;
-  // fall back to the module-level getMaxAge() for the real process.env path.
-  const maxAge = env !== process.env && env.CORS_MAX_AGE !== undefined
-    ? corsConfig.parseMaxAge(env.CORS_MAX_AGE)
-    : corsConfig.getMaxAge();
+  // Keep custom environment snapshots isolated from the module-level value
+  // cached from process.env; callers must get a deterministic policy per env.
+  const maxAge = env === process.env
+    ? corsConfig.getMaxAge()
+    : corsConfig.parseMaxAge(env.CORS_MAX_AGE);
 
   return {
     allowedOrigins: [...allowedOrigins],
@@ -174,6 +174,8 @@ function validateOriginDto(origin, allowedOrigins) {
  * app.use(cors(corsOptions));
  */
 function corsConfigDtoToOptions(dto) {
+  // Capture the policy once so later DTO mutations cannot change in-flight
+  // middleware decisions.
   const allowedOrigins = [...(dto.allowedOrigins || [])];
 
   return {
