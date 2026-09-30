@@ -33,7 +33,7 @@ const {
   validateGetMetricsQuery,
 } = require('../../schemas/metrics');
 const {
-  toSmeMetricsResponse,
+  toStrictSmeMetricsResponse,
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
 } = require('../../dto/metrics');
@@ -162,7 +162,11 @@ router.get(
       const { userId, tenantId } = ctx;
 
       const rawMetrics = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
-      const data = toSmeMetricsResponse(rawMetrics);
+      // The compatibility DTO remains permissive for existing callers, but
+      // this endpoint must not turn malformed service output into zero counts.
+      // Strict validation forwards a bounded, value-free error to the global
+      // handler, which logs it with request correlation and returns a generic 500.
+      const data = toStrictSmeMetricsResponse(rawMetrics);
 
       // Only schema-validated query values are consumed here. `validateGetMetricsQuery`
       // runs ahead of this handler and rejects the request outright on malformed
