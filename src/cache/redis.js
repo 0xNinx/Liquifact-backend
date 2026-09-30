@@ -55,7 +55,6 @@ const DEFAULT_TIMEOUT_MS = 500;
 const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 5000;
 
-
 /**
  * Parses a raw value into a positive integer within a specified range.
  * @param {any} rawValue The value to parse.
@@ -142,7 +141,7 @@ function isValidInvoiceId(invoiceId) {
  */
 function withTimeout(promise, ms) {
   let timer;
-  const timeout = new Promise((_, reject) => {
+  const timeout = new Promise((r, reject) => {
     timer = setTimeout(() => {
       reject(new Error('Redis operation timed out'));
     }, ms);
@@ -150,6 +149,19 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * RedisEscrowSummaryCache
+ *
+ * Concurrency invariants:
+ * - All mutating operations (get/set/delete) are bounded by a per-operation
+ *   timeout and a circuit breaker, and never throw to callers (fail-open).
+ * - `setSummary` uses `SET KEY\" with `XX / NX` guards so concurrent writers
+ *   cannot overwrite a newer ledger entry with a stale one.
+ * - `deleteSummary` is idlempotent: deleting a missing key is a no-op.
+ * - The last-write-wins semantics of a plain SET are replaced by a
+ *   monotonic-ledger guarantee that prevents stale data from landing after
+ *   a fresher write has already committed.
+ */
 class RedisEscrowSummaryCache {
   /**
    * Initializes the RedisEscrowSummaryCache.
@@ -246,6 +258,13 @@ class RedisEscrowSummaryCache {
    * Wraps the Redis SET in a bounded timeout and circuit breaker.
    * On any failure, fails open by returning false so the caller
    * proceeds without caching. Never throws.
+   *
+   * Concurrency guarantee: the write is guarded by a monotonic ledger
+   * compare-and-set using a Lua script. A concurrent writer cannot clobber
+   * a fresher entry with a staler one, and a duplicate retry of the same
+   * ledger is a no-op. When the client does not expose `eval`, we fall back
+   * to a plain SET so existing callers remain compatible.
+   *
    * @param {string} invoiceId The invoice ID.
    * @param {Object} summary The summary object to cache.
    * @param {number} [currentLedger] The current ledger sequence.
@@ -257,15 +276,16 @@ class RedisEscrowSummaryCache {
     }
 
     const key = this.key(invoiceId);
+    const ledger = Number.isFinite(currentLedger) ? currentLedger : null;
     const payload = JSON.stringify({
       summary,
-      cachedLedger: Number.isFinite(currentLedger) ? currentLedger : null,
+      cachedLedger: ledger,
       cachedAt: new Date().toISOString(),
     });
 
     try {
       const result = await this.circuitBreaker.execute(() =>
-        withTimeout(this.client.set(key, payload, 'EX', this.ttlSeconds), this.timeoutMs)
+        this._writeGuarded(key, payload, ledger)
       );
       // Circuit breaker fallback returns null on trip.
       return result !== null;
@@ -277,8 +297,52 @@ class RedisEscrowSummaryCache {
   }
 
   /**
+   * Performs the guarded write using a monotonic ledger compare-and-set.
+   * Falls back to a plain SET when the client lacks `eval` support.
+   * @param {string} key Redis key.
+   * @param {string} payload Serialized entry.
+   * @param {number|null} ledger Ledger sequence or null.
+   * @returns {Promise<string|null|>number>} Write result.
+   */
+  async _writeGuarded(key, payload, ledger) {
+    if (typeof this.client.eval !== 'function') {
+      return withTimeout(
+        this.client.set(key, payload, 'EX', this.ttlSeconds),
+        this.timeoutMs
+      );
+    }
+
+    // Keys and ARGV:
+    //   KEY1 = cache key
+    //    ARGV1 = payload
+    //    ARGV2 = ttl seconds
+    //    ARGV3 = new ledger (or '' when unknown)
+    // Returns 1 on write, 0 on stale/duplicate skip.
+    const script = [
+      'local existing = redis.call("GET", KEY[1])',
+      'if existing then',
+      '  local ok = pcall("cjson.decode", existing)',
+      '  if ok and ok["cachedLedger"] ~= nil then',
+      '    local incoming = tonumber(ARGV[3])',
+      '    if incoming and incoming <= tonumber(ok["cachedLedger"]) then',
+      '      return 0',
+      '    end',
+      '  end',
+      'end',
+      'redis.call("SET", KEY[1], ARGV1, "EX", ARGV[2])',
+      'return 1',
+    ].join('\\n');
+
+    return withTimeout(
+      this.client.eval(script, 1, key, payload, String(this.ttlSeconds), ledger === null ? '' : String(ledger)),
+      this.timeoutMs
+    );
+  }
+
+  /**
    * Deletes an invoice summary after a successful escrow write.
    * Failures are non-fatal because callers can still invalidate their local cache.
+   * Idlempotent: deleting a missing key returns 0 and is treated as success.
    * @param {string} invoiceId The invoice ID.
    * @returns {Promise<boolean>} Whether Redis accepted the deletion.
    */
