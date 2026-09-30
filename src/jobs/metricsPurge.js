@@ -15,6 +15,10 @@ const {
 const JOB_TYPE = 'metrics_purge';
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MIN_INTERVAL_MS = 60_000;
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_RETRY_BASE_MS = 1000;
+const DEFAULT_RETRY_MAX_MS = 30_000;
+const DEFAULT_STOP_TIMEOUT_MS = 10_000;
 
 function _counter(config) {
   const registry = getRegistry();
@@ -42,6 +46,70 @@ function getIntervalMs() {
     return DEFAULT_INTERVAL_MS;
   }
   return parsed;
+}
+
+function getMaxAttempts() {
+  const parsed = parseInt(process.env.METRICS_PURGE_MAX_ATTEMPTS, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    return DEFAULT_MAX_ATTEMPTS;
+  }
+  return parsed;
+}
+
+function getRetryBaseMs() {
+  const parsed = parseInt(process.env.METRICS_PURGE_RETRY_BASE_MS, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_RETRY_BASE_MS;
+  }
+  return parsed;
+}
+
+function getRetryMaxMs() {
+  const parsed = parseInt(process.env.METRICS_PURGE_RETRY_MAX_MS, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_RETRY_MAX_MS;
+  }
+  return parsed;
+}
+
+/**
+ * Deterministic exponential backoff with full jitter.
+ *
+ * The jitter is derived from a pure hash of the attempt number and the
+ * supplied seed, so the same input always produces the same delay. This
+ * makes retry scheduling replayable and observable while still avoiding
+ * thundering herds across independent job runs.
+ *
+ * @param {number} attempt 1-based attempt number.
+ * @param {number} baseMs Base delay in milliseconds.
+ * @param {number} maxMs Maximum delay in milliseconds.
+ * @param {string|number} [seed] Stable seed for the jitter hash.
+ * @returns {number} Delay in milliseconds.
+ */
+function computeBackoffMs(attempt, baseMs, maxMs, seed = 0) {
+  const safeBase = Number.isFinite(baseMs) && baseMs >= 0 ? baseMs : DEFAULT_RETRY_BASE_MS;
+  const safeMax = Number.isFinite(maxMs) && maxMs >= 0 ? maxMs : DEFAULT_RETRY_MAX_MS;
+  const safeAttempt = Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 1;
+  const exponential = safeBase * Math.pow(2, Math.max(0, safeAttempt - 1));
+  const capped = Math.min(exponential, safeMax);
+  const maxJitter = Math.max(1, Math.floor(capped / 4));
+  const hash = _hashSeed(`${safeAttempt}:${seed}`);
+  const jitter = hash % maxJitter;
+  return Math.min(capped + jitter, safeMax);
+}
+
+/**
+ * Deterministic FNV-1a-style hash for jitter generation.
+ * @param {string} input
+ * @returns {number} Unsigned 32-bit integer.
+ */
+function _hashSeed(input) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0);
 }
 
 async function runMetricsPurge(job = {}, options = {}) {
@@ -77,6 +145,52 @@ async function runMetricsPurge(job = {}, options = {}) {
   }
 }
 
+async function runMetricsPurgeWithRetry(job = {}, options = {}) {
+  const maxAttempts = options.maxAttempts ?? getMaxAttempts();
+  const baseMs = options.retryBaseMs ?? getRetryBaseMs();
+  const maxMs = options.retryMaxMs ?? getRetryMaxMs();
+  const seed = options.retrySeed ?? job.id ?? JOB_TYPE;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await runMetricsPurge(job, options);
+      if (attempt > 1) {
+        logger.info(
+          { jobId: job.id, attempt, maxAttempts },
+          'metricsPurge: retry succeeded'
+        );
+      }
+      return { ...result, attempts };
+    } catch (error) {
+      lastError = error;
+      const isLast = attempt >= maxAttempts;
+      logger.warn(
+        {
+          jobId: job.id,
+          attempt,
+          maxAttempts,
+          err: error.message,
+          willRetry: !isLast,
+        },
+        'metricsPurge: attempt failed'
+      );
+      if (isLast) {
+        break;
+      }
+      const delayMs = computeBackoffMs(attempt, baseMs, maxMs, seed);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  metricsPurgeRunsTotal.inc({ status: 'exhausted' });
+  logger.error(
+    { jobId: job.id, maxAttempts, err: lastError && lastError.message },
+    'metricsPurge: retries exhausted'
+  );
+  throw lastError;
+}
+
 const purgeQueue = new JobQueue();
 const purgeWorker = new BackgroundWorker({
   jobQueue: purgeQueue,
@@ -84,7 +198,7 @@ const purgeWorker = new BackgroundWorker({
   pollIntervalMs: 5000,
 });
 
-purgeWorker.registerHandler(JOB_TYPE, (job) => runMetricsPurge(job));
+purgeWorker.registerHandler(JOB_TYPE, (job) => runMetricsPurgeWithRetry(job));
 
 function schedulePurge(options = {}) {
   const delayMs = options.delayMs ?? getIntervalMs();
@@ -104,7 +218,7 @@ function startPurgeWorker() {
   }
 }
 
-async function stopPurgeWorker(timeoutMs = 10000) {
+async function stopPurgeWorker(timeoutMs = DEFAULT_STOP_TIMEOUT_MS) {
   await purgeWorker.stop(timeoutMs);
   logger.info('metricsPurge: worker stopped');
 }
@@ -122,6 +236,9 @@ function getStats() {
       batchSize: getPurgeBatchSize(),
       maxBatches: getPurgeMaxBatches(),
       intervalMs: getIntervalMs(),
+      maxAttempts: getMaxAttempts(),
+      retryBaseMs: getRetryBaseMs(),
+      retryMaxMs: getRetryMaxMs(),
     },
   };
 }
@@ -129,12 +246,17 @@ function getStats() {
 module.exports = {
   JOB_TYPE,
   runMetricsPurge,
+  runMetricsPurgeWithRetry,
   schedulePurge,
   startPurgeWorker,
   stopPurgeWorker,
   triggerPurge,
   getStats,
   getIntervalMs,
+  getMaxAttempts,
+  getRetryBaseMs,
+  getRetryMaxMs,
+  computeBackoffMs,
   purgeQueue,
   purgeWorker,
 };

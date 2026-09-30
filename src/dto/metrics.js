@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * @fileoverview Typed request/response DTOs for the metrics module.
+ * @fileoverview Typed request/response JTOs for the metrics module.
  *
  * Defines JSDoc typedefs for every data shape that crosses a module boundary
  * (routes &#x21D2; services &#x21D2; metrics instrumentation) and provides pure
@@ -25,9 +25,9 @@
  * @module dto/metrics
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // SME Metrics Dashboard DTOs
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Aggregated invoice counts returned by the SME metrics endpoint.
@@ -49,7 +49,7 @@
  * @typedef {Object} SmeMetricsMeta
  * @property {string}           timestamp   - ISO-8601 timestamp of the response.
  * @property {string}           version     - API version string (semver).
- * @property {Array<Object>}   [invoices]   - Paginated invoice rows for the current page.
+ * @property {Array<Object?}   [invoices]   - Paginated invoice rows for the current page.
  * @property {number}           [total]     - Total matching invoice count across all pages.
  * @property {number}           [limit]     - Page size applied to the response.
  * @property {boolean}          [hasMore]   - Whether additional pages exist.
@@ -66,9 +66,9 @@
  * @property {string}             timestamp - ISO-8601 timestamp of the response.
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Persistence Instrumentation DTOs
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Bounded endpoint label for persistence metrics.
@@ -104,9 +104,9 @@
  * @property {import('express').Request} [req]          - Express request (for scoped logging).
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // SME Metrics — mapping functions
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Maps a raw invoice-counts object to a typed {@link SmeMetricsResponse} DTO.
@@ -119,11 +119,15 @@
  */
 function toSmeMetricsResponse(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const toCount = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
   return {
-    open: Number(obj.open) || 0,
-    funded: Number(obj.funded) || 0,
-    settled: Number(obj.settled) || 0,
-    defaulted: Number(obj.defaulted) || 0,
+    open: toCount(obj.open),
+    funded: toCount(obj.funded),
+    settled: toCount(obj.settled),
+    defaulted: toCount(obj.defaulted),
   };
 }
 
@@ -141,9 +145,15 @@ function toSmeMetricsMeta(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
 
   // Mandatory fields with defaults.
+  // Invariant: timestamp and version are always present and non-empty strings
+  // so downstream consumers can rely on them without null checks.
   const meta = {
-    timestamp: typeof obj.timestamp === 'string' ? obj.timestamp : new Date().toISOString(),
-    version: typeof obj.version === 'string' ? obj.version : '0.1.0',
+    timestamp: (typeof obj.timestamp === 'string' && obj.timestamp.length > 0)
+      ? obj.timestamp
+      : new Date().toISOString(),
+    version: (typeof obj.version === 'string' && obj.version.length > 0)
+      ? obj.version
+      : '0.1.0',
   };
 
   // Optional pagination fields — only include when the source had them.
@@ -153,7 +163,7 @@ function toSmeMetricsMeta(raw) {
   if (typeof obj.total === 'number' && Number.isFinite(obj.total)) {
     meta.total = Math.max(0, Math.floor(obj.total));
   }
-  if (typeof obj.limit === 'number' && Number.isFinite(obj.limit)) {
+  if (typeof obj.limit === 'number' && Number.isFinite(obj.limit) && obj.limit > 0) {
     meta.limit = obj.limit;
   }
   if (typeof obj.hasMore === 'boolean') {
@@ -187,9 +197,9 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
   };
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Persistence instrumentation — mapping functions
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Maps raw persistence-outcome arguments to a typed {@link PersistenceRecordParams} DTO.
@@ -210,18 +220,25 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
 function toPersistenceRecordParams(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
 
+  const endpoint = String(obj.endpoint || 'unknown');
+  const statusCode = Number(obj.statusCode);
+  const durationSeconds = Number(obj.durationSeconds);
+  const cause = String(obj.cause || 'none');
+
   return {
-    endpoint: String(obj.endpoint || 'unknown'),
-    statusCode: Number(obj.statusCode) || 200,
-    durationSeconds: Number(obj.durationSeconds) || 0,
-    cause: /** @type {PersistenceCause} */ (String(obj.cause || 'none')),
+    endpoint: endpoint.length > 0 ? endpoint : 'unknown',
+    statusCode: Number.isFinite(statusCode) && statusCode > 0 ? statusCode : 200,
+    durationSeconds: Number.isFinite(durationSeconds) && durationSeconds >= 0
+      ? durationSeconds
+      : 0,
+    cause: /** @type {PersistenceCause} */ (cause.length > 0 ? cause : 'none'),
     req: obj.req || undefined,
   };
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Validation helpers (primarily for tests / guards)
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Checks whether a value is a conformant {@link SmeMetricsResponse} DTO.
@@ -234,10 +251,10 @@ function isValidSmeMetricsResponse(value) {
     return false;
   }
   return (
-    typeof value.open === 'number' &&
-    typeof value.funded === 'number' &&
-    typeof value.settled === 'number' &&
-    typeof value.defaulted === 'number'
+    Number.isInteger(value.open) && value.open >= 0 &&
+    Number.isInteger(value.funded) && value.funded >= 0 &&
+    Number.isInteger(value.settled) && value.settled >= 0 &&
+    Number.isInteger(value.defaulted) && value.defaulted >= 0
   );
 }
 
@@ -252,10 +269,12 @@ function isValidPersistenceRecordParams(value) {
     return false;
   }
   return (
-    typeof value.endpoint === 'string' &&
-    typeof value.statusCode === 'number' &&
+    typeof value.endpoint === 'string' && value.endpoint.length > 0 &&
+    typeof value.statusCode === 'number' && Number.isFinite(value.statusCode) &&
+    value.statusCode > 0 &&
     typeof value.durationSeconds === 'number' &&
-    typeof value.cause === 'string'
+    Number.isFinite(value.durationSeconds) && value.durationSeconds >= 0 &&
+    typeof value.cause === 'string' && value.cause.length > 0
   );
 }
 

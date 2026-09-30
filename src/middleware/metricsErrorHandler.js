@@ -31,6 +31,35 @@
  */
 
 /**
+ * Bounded set of machine-readable validation codes for metrics request
+ * validation failures. These are the stable contract that clients can
+ * branch on; message wording remains free to change.
+ *
+ * @readonly
+ * @enum {string}
+ */
+const METRICS_VALIDATION_CODES = Object.freeze({
+  /** A required field was missing or empty. */
+  REQUIRED: 'REQUIRED',
+  /** A field had the wrong type. */
+  INVALID_TYPE: 'INVALID_TYPE',
+  /** A field exceeded its maximum allowed length. */
+  TOO_LONG: 'TOO_LONG',
+  /** A field fell below its minimum allowed length. */
+  TOO_SHORT: 'TOO_SHORT',
+  /** A field failed a range constraint. */
+  OUT_OF_RANGE: 'OUT_OF_RANGE',
+  /** A field failed a format/pattern constraint. */
+  INVALID_FORMAT: 'INVALID_FORMAT',
+  /** A field was not one of the allowed enum values. */
+  INVALID_ENUM: 'INVALID_ENUM',
+  /** A field was duplicated where uniqueness is required. */
+  DUPLICATE: 'DUPLICATE',
+  /** Catch-all for validation failures without a more specific code. */
+  INVALID: 'INVALID',
+});
+
+/**
  * Bounded set of error codes that the metrics error handler recognises.
  * Codes outside this set fall through to the next error handler.
  *
@@ -74,6 +103,8 @@ const METRICS_CODE_TO_STATUS = Object.freeze({
  *   2. HTTP status on the error object (`err.status` / `err.statusCode`).
  *   3. Fallback: `INTERNAL_SERVER_ERROR`.
  *
+ * Classification is deterministic: identical inputs always yield the same code.
+ *
  * @param {Error|unknown} err - The thrown error.
  * @returns {string} A member of `METRICS_ERROR_CODES`.
  */
@@ -81,7 +112,7 @@ function classifyMetricsError(err) {
   if (err && typeof err === 'object') {
     // Honour explicit code if it is within our bounded set
     const knownCodes = Object.values(METRICS_ERROR_CODES);
-    if (typeof err.code === 'string' && knownCodes.includes(err.code)) {
+    if (typeof err.code === 'string' && knownCodes.indexOf(err.code) !== -1) {
       return err.code;
     }
 
@@ -91,6 +122,7 @@ function classifyMetricsError(err) {
     if (status === 403) return METRICS_ERROR_CODES.FORBIDDEN;
     if (status === 404) return METRICS_ERROR_CODES.NOT_FOUND;
     if (status === 422 || status === 400) return METRICS_ERROR_CODES.VALIDATION_ERROR;
+    if (status === 429) return METRICS_ERROR_CODES.UPSTREAM_ERROR;
     if (status === 502 || status === 503 || status === 504) return METRICS_ERROR_CODES.UPSTREAM_ERROR;
   }
 
@@ -99,6 +131,8 @@ function classifyMetricsError(err) {
 
 /**
  * Returns a safe, non-leaking human-readable message for the given code.
+ *
+ * Deterministic: the same (code, err, NODE_ENV) always produces the same string.
  *
  * In `NODE_ENV !== 'production'` the raw `err.message` is included so
  * developers get actionable feedback without a log search.  In production
@@ -121,7 +155,7 @@ function buildMetricsErrorMessage(code, err) {
   const safe = SAFE_MESSAGES[code] || SAFE_MESSAGES[METRICS_ERROR_CODES.INTERNAL_SERVER_ERROR];
 
   const isDev = process.env.NODE_ENV !== 'production';
-  if (isDev && err && err.message) {
+  if (isDev && err && typeof err.message === 'string' && err.message.length > 0) {
     return `${safe} (${err.message})`;
   }
 
@@ -131,6 +165,15 @@ function buildMetricsErrorMessage(code, err) {
 /**
  * Express error-handling middleware that produces a uniform structured
  * response for all metrics-related errors.
+ *
+ * ## Determinism & recovery invariants
+ * - The same error object always maps to the same `code`, `status`, and
+ *   `retryable` flag, regardless of call order or concurrency.
+ * - Headers are only written once; if the response has already been sent
+ *   (e.g. a partial write occurred upstream), the error is forwarded to
+ *   `next(err)` so the global handler can decide how to recover without
+ *   corrupting the in-flight response.
+ * - No in-memory or persisted state is mutated here, so retries are safe.
  *
  * Response body shape (identical across all metrics error scenarios):
  *
@@ -159,12 +202,20 @@ function metricsErrorHandler(err, req, res, next) {
     return next();
   }
 
+  // If the response is already committed we cannot safely rewrite it.
+  if (res && (res.headersSent || res.writableEnded)) {
+    return next(err);
+  }
+
   const code = classifyMetricsError(err);
   const status = METRICS_CODE_TO_STATUS[code] || 500;
   const message = buildMetricsErrorMessage(code, err);
   const retryable = code === METRICS_ERROR_CODES.UPSTREAM_ERROR;
 
   // Set correct content type before writing
+  res.setHeader('Content-Type', 'application/problem+json');
+  res.setHeader('Cache-Control', 'no-store');
+
   res.status(status).json({
     error: {
       code,
@@ -180,4 +231,5 @@ module.exports = {
   buildMetricsErrorMessage,
   METRICS_ERROR_CODES,
   METRICS_CODE_TO_STATUS,
+  METRICS_VALIDATION_CODES,
 };
