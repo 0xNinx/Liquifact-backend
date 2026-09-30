@@ -82,6 +82,45 @@ const METRICS_VALIDATION_PROBLEM_TYPE =
   'https://liquifact.io/problems/validation-error';
 
 /**
+ * Resolves the value at `path` inside `payload`, or `undefined` when any
+ * segment along the way is absent or not traversable.
+ *
+ * @param {unknown} payload - Original, unparsed request payload.
+ * @param {Array<string|number|symbol>} path - Zod issue path.
+ * @returns {unknown} The value at `path`, or `undefined`.
+ */
+function valueAtPath(payload, path) {
+  let current = payload;
+  for (const segment of path) {
+    if (current === null || typeof current !== 'object') {
+      return undefined;
+    }
+    current = current[segment];
+  }
+  return current;
+}
+
+/**
+ * Decides whether an `invalid_type` issue means the value was absent.
+ *
+ * Signals, in priority order: Zod 3's `received`, an explicit `input` key,
+ * then the original payload (real Zod 4 issues carry neither of the first two).
+ *
+ * @param {object} issue - The `invalid_type` Zod issue.
+ * @param {unknown} payload - Original payload, if the caller supplied it.
+ * @returns {boolean} True when the field was absent or `undefined`.
+ */
+function isMissingValue(issue, payload) {
+  if (issue.received !== undefined) {
+    return issue.received === 'undefined';
+  }
+  if ('input' in issue) {
+    return issue.input === undefined;
+  }
+  return valueAtPath(payload, Array.isArray(issue.path) ? issue.path : []) === undefined;
+}
+
+/**
  * Maps a Zod issue to a stable {@link METRICS_VALIDATION_CODES} member.
  *
  * A schema raising a `custom` issue may declare its own code through
@@ -95,9 +134,11 @@ const METRICS_VALIDATION_PROBLEM_TYPE =
  * 129-character string.
  *
  * @param {object} issue - A single issue from a `ZodError`.
+ * @param {unknown} [payload] - Original unparsed payload; needed on Zod 4 to tell
+ *   a missing field from a wrong-type one, since its issues omit the input.
  * @returns {string} A member of {@link METRICS_VALIDATION_CODES}.
  */
-function codeForIssue(issue) {
+function codeForIssue(issue, payload) {
   if (!issue || typeof issue !== 'object') {
     return METRICS_VALIDATION_CODES.FIELD_INVALID;
   }
@@ -115,7 +156,7 @@ function codeForIssue(issue) {
 
   switch (issue.code) {
     case 'invalid_type':
-      return issue.received === 'undefined' || issue.input === undefined
+      return isMissingValue(issue, payload)
         ? METRICS_VALIDATION_CODES.FIELD_REQUIRED
         : METRICS_VALIDATION_CODES.FIELD_TYPE_INVALID;
 
