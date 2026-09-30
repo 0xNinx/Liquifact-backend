@@ -1,10 +1,85 @@
 /**
  * Centralized typed configuration module with runtime validation.
  * Uses Zod for schema validation and type safety.
+ *
+ * ## Public API contract
+ *
+ * The following exports form the public contract of this module. Each entry is
+ * versioned implicitly by the module path `src/config/index.js`. Any breaking
+ * change must include a migration path documented in this file and tested in
+ * the companion test suite.
+ *
+ * ### Functions
+ * | Export              | Signature                                              | Since     |
+ * |---------------------|--------------------------------------------------------|-----------|
+ * | `validate()`        | `() => Config`                                         | initial   |
+ * | `get()`             | `() => Config`                                         | initial   |
+ * | `getValue(key)`     | `(key: keyof Config) => Config[key]`                   | initial   |
+ * | `getInvoiceFileMaxSize()` | `() => string`                                  | initial   |
+ * | `logRedactedSummary(err)` | `(err) => void`                                 | initial   |
+ * | `getFeatureFlag(key)` | `(key: FeatureFlagKey) => boolean`                  | #1306     |
+ *
+ * ### Classes / schemas
+ * | Export                   | Type              | Since   |
+ * |--------------------------|-------------------|---------|
+ * | `ConfigSchema`           | ZodObject         | initial |
+ * | `InvoiceFileMaxSizeSchema` | ZodString        | initial |
+ *
+ * ### Objects
+ * | Export            | Type              | Since   |
+ * |-------------------|-------------------|---------|
+ * | `securityHeaders` | plain object      | initial |
+ * | `CONFIG_VERSION`  | string (semver)   | #1306   |
+ *
+ * ### Compatibility guarantees
+ * 1. All exports listed in the "initial" column existed before this PR and are
+ *    preserved with identical signatures. Callers do not need to change.
+ * 2. `getFeatureFlag(key)` is additive — existing callers using `getValue(key)`
+ *    for feature flags continue to work.
+ * 3. `CONFIG_VERSION` is a constant string. Callers may import it to assert
+ *    the minimum config API version they depend on.
+ * 4. `InvoiceFileMaxSizeSchema` remains exported so callers that import it
+ *    directly (e.g. route builders) keep working.
+ * 5. `securityHeaders` remains a plain object so callers can spread or
+ *    reference its fields without change.
+ *
  * @module config
  */
 
 const z = require('zod');
+
+// ─── Public API version ───────────────────────────────────────────────────────
+
+/**
+ * Semantic version of the config module's public API.
+ *
+ * Bump the minor version when adding new exports.
+ * Bump the major version when removing or renaming existing exports, and include
+ * a migration guide in this file and the CHANGELOG.
+ *
+ * @type {string}
+ */
+const CONFIG_VERSION = '1.1.0';
+
+// ─── Feature-flag key type guard ─────────────────────────────────────────────
+
+/**
+ * The complete set of boolean feature-flag keys in the config schema.
+ * This tuple is the source of truth for `getFeatureFlag()` key validation.
+ *
+ * @type {readonly string[]}
+ */
+const FEATURE_FLAG_KEYS = Object.freeze([
+  'ESCROW_INDEXER_ENABLED',
+  'ESCROW_READ_PROJECTION_ENABLED',
+  'INVOICE_STATE_ENABLED',
+  'CONFIG_RUNTIME_ENABLED',
+  'KYC_WEBHOOK_ENABLED',
+  'KYC_PROVIDER_SIGN_REQUESTS',
+  'KYC_PROVIDER_VERIFY_RESPONSE_SIGNATURE',
+  'CURSOR_TTL_ENABLED',
+  'METRICS_ENABLED',
+]);
 
 /** Express-compatible request size string. @type {z.ZodDefault<z.ZodString>} */
 const InvoiceFileMaxSizeSchema = z
@@ -131,17 +206,26 @@ const ConfigSchema = z
     }
   });
 
+// ─── Singleton state ───────────────────────────────────────────────────────────
+
 /**
  * Runtime validated configuration object.
  * @type {z.infer<typeof ConfigSchema>}
  */
 let config;
 
+// ─── Public API — existing contracts (preserved) ─────────────────────────────
+
 /**
  * Validates environment variables against schema and returns typed config.
  * Throws ZodError on validation failure.
  * Should be called once early in app bootstrap.
+ *
+ * CONTRACT: return type is `z.infer<typeof ConfigSchema>`. Shape is stable.
+ * Callers may destructure any key documented in ConfigSchema.
+ *
  * @returns {z.infer<typeof ConfigSchema>} Validated config.
+ * @throws {z.ZodError} If any environment variable fails its boundary check.
  */
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
@@ -155,7 +239,11 @@ function validate() {
 /**
  * Format and log a redacted summary of validation issues to console.error.
  * Never prints secret values (only key names and validation error messages).
- * @param {z.ZodError} error - The Zod error to summarize.
+ *
+ * CONTRACT: this function never throws. It accepts any value including null
+ * and undefined.
+ *
+ * @param {z.ZodError | Error | null | undefined} error - The Zod error to summarize.
  * @returns {void}
  */
 function logRedactedSummary(error) {
@@ -172,6 +260,11 @@ function logRedactedSummary(error) {
 
 /**
  * Getter for validated config. Throws if not validated.
+ *
+ * CONTRACT: returns the same object reference that `validate()` returned.
+ * Never returns `undefined` or a partial config — throws instead.
+ *
+ * @throws {Error} If `validate()` has not been called successfully yet.
  * @returns {z.infer<typeof ConfigSchema>}
  */
 function get() {
@@ -183,6 +276,11 @@ function get() {
 
 /**
  * Returns a value from the validated configuration with key-aware JSDoc types.
+ *
+ * CONTRACT: signature is `(key: keyof Config) => Config[key]`. The key type
+ * will never widen; callers that pass a valid key today will compile without
+ * error after future schema additions.
+ *
  * @template {keyof z.infer<typeof ConfigSchema>} K
  * @param {K} key - Validated configuration key.
  * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
@@ -193,6 +291,11 @@ function getValue(key) {
 
 /**
  * Returns the validated invoice PDF upload limit used when routes are built.
+ *
+ * CONTRACT: always returns a non-empty string in the format accepted by the
+ * `body-parser` package (e.g. "5mb", "512kb"). Falls back to "5mb" when the
+ * singleton is absent.
+ *
  * @returns {string} Express-compatible request size limit.
  */
 function getInvoiceFileMaxSize() {
@@ -201,6 +304,40 @@ function getInvoiceFileMaxSize() {
   }
   return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
 }
+
+// ─── Public API — new contracts (additive, #1306) ─────────────────────────────
+
+/**
+ * Returns the boolean value of a named feature flag from the validated config.
+ *
+ * This is an additive helper that converts the stored string literal
+ * ("true" | "false") to a native boolean, removing the need for callers to
+ * perform string comparison. Existing callers using `getValue(key)` and
+ * comparing against `'true'` continue to work without change.
+ *
+ * CONTRACT:
+ *   - Returns `true`  when the stored value is `"true"`.
+ *   - Returns `false` when the stored value is `"false"`.
+ *   - Throws `TypeError` when `key` is not a recognised feature-flag key, so
+ *     callers get an early error rather than a silent `false`.
+ *   - Throws `Error` if `validate()` has not been called (same as `get()`).
+ *
+ * @param {string} key - One of the keys in FEATURE_FLAG_KEYS.
+ * @returns {boolean}
+ * @throws {TypeError} If `key` is not a valid feature-flag key.
+ * @throws {Error} If `validate()` has not been called yet.
+ */
+function getFeatureFlag(key) {
+  if (!FEATURE_FLAG_KEYS.includes(key)) {
+    throw new TypeError(
+      `"${key}" is not a valid feature-flag key. ` +
+      `Valid keys: ${FEATURE_FLAG_KEYS.join(', ')}.`
+    );
+  }
+  return getValue(key) === 'true';
+}
+
+// ─── Security headers ─────────────────────────────────────────────────────────
 
 const securityHeaders = {
   contentSecurityPolicy: {
@@ -238,7 +375,10 @@ const securityHeaders = {
   }
 };
 
+// ─── Exports ──────────────────────────────────────────────────────────────────
+
 module.exports = {
+  // ── Preserved (initial contract) ─────────────────────────────────────────
   validate,
   get,
   getValue,
@@ -247,4 +387,8 @@ module.exports = {
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
   securityHeaders,
+  // ── New (additive, #1306) ─────────────────────────────────────────────────
+  getFeatureFlag,
+  FEATURE_FLAG_KEYS,
+  CONFIG_VERSION,
 };
