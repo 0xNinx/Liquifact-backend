@@ -271,14 +271,52 @@ function mapServiceResultToResponseDTO(serviceResult) {
  * the shape contract is expressed once in this module rather than scattered
  * across the job.
  *
+ * Concurrent-execution invariants
+ * ────────────────────────────────
+ * - `observedAt` is always captured from `raw.observedAt` when present, or
+ *   pinned to `capturedAt` (which the caller may supply, defaulting to the
+ *   current instant).  This means two concurrent calls for the same raw event
+ *   without an explicit `observedAt` will share the same timestamp when
+ *   supplied the same `capturedAt`, producing deterministic ordering.
+ * - `eventBody` is a shallow copy of the source so that subsequent mutations
+ *   to `raw` do not affect the already-frozen DTO.
+ * - `invoiceId` must be a non-empty string; an empty invoiceId makes the DTO
+ *   unusable for projection keying and is therefore rejected here rather than
+ *   inside the persistence layer.
+ *
  * @param {object} raw - Raw record from `fetchEscrowEventsFromHorizon`.
  * @param {string} invoiceId - Pre-resolved invoice ID for this event.
+ * @param {object} [opts] - Optional overrides for deterministic behaviour.
+ * @param {string} [opts.capturedAt] - ISO-8601 timestamp to use when
+ *   `raw.observedAt` is absent.  Callers that process a batch should derive
+ *   this once before the loop so every event in the batch shares the same
+ *   fallback timestamp.
  * @returns {IndexerIngestEventDTO}
+ * @throws {TypeError} If `invoiceId` is falsy (empty string, null, undefined).
  */
-function mapRawToIngestDTO(raw, invoiceId) {
+function mapRawToIngestDTO(raw, invoiceId, { capturedAt } = {}) {
+  // Guard: invoiceId is the projection key; an empty value would silently corrupt
+  // per-invoice state.  Reject early rather than propagate a broken DTO.
+  const resolvedInvoiceId = invoiceId != null ? String(invoiceId) : '';
+  if (!resolvedInvoiceId) {
+    throw new TypeError('mapRawToIngestDTO: invoiceId must be a non-empty string');
+  }
+
+  // Capture the fallback timestamp once, outside the freeze, so that concurrent
+  // calls sharing the same raw event and capturedAt produce identical observedAt
+  // values and can be safely deduplicated by (eventId, observedAt) downstream.
+  const fallbackTimestamp = capturedAt || new Date().toISOString();
+
+  // Shallow-copy eventBody so that subsequent mutations to the source `raw`
+  // object (e.g. by the Horizon fetch loop) do not penetrate the frozen DTO.
+  const sourceBody = raw.eventBody !== undefined ? raw.eventBody : raw;
+  const eventBody = (sourceBody !== null && typeof sourceBody === 'object' && !Array.isArray(sourceBody))
+    ? Object.assign({}, sourceBody)
+    : (sourceBody || {});
+
   return Object.freeze({
     eventId: String(raw.id || raw.eventId || ''),
-    invoiceId: String(invoiceId),
+    invoiceId: resolvedInvoiceId,
     eventType: String(raw.type || raw.eventType || 'contract_event'),
     ledgerSequence: Number(raw.ledger || raw.ledgerSequence || 0),
     pagingToken: String(raw.paging_token || raw.pagingToken || ''),
@@ -288,8 +326,8 @@ function mapRawToIngestDTO(raw, invoiceId) {
     txHash: (raw.tx_hash || raw.txHash) != null
       ? String(raw.tx_hash || raw.txHash)
       : null,
-    eventBody: (raw.eventBody !== undefined ? raw.eventBody : raw) || {},
-    observedAt: raw.observedAt || new Date().toISOString(),
+    eventBody,
+    observedAt: raw.observedAt || fallbackTimestamp,
   });
 }
 
@@ -298,11 +336,15 @@ function mapRawToIngestDTO(raw, invoiceId) {
  * expected by `persistEscrowEvent` (the canonical event object).  This is the
  * inverse of `mapRawToIngestDTO` plus field aliasing.
  *
+ * The returned object is frozen so that concurrent consumers of the same
+ * normalized event cannot accidentally mutate shared state between the
+ * persistence write and the projection update.
+ *
  * @param {IndexerIngestEventDTO} dto
- * @returns {object} Normalized internal event.
+ * @returns {object} Normalized internal event (frozen).
  */
 function mapIngestDTOToNormalized(dto) {
-  return {
+  return Object.freeze({
     eventId: dto.eventId,
     invoiceId: dto.invoiceId,
     eventType: dto.eventType,
@@ -312,7 +354,7 @@ function mapIngestDTOToNormalized(dto) {
     txHash: dto.txHash,
     eventBody: dto.eventBody,
     observedAt: dto.observedAt,
-  };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
