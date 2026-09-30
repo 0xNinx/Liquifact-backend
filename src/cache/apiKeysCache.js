@@ -78,13 +78,21 @@ class ApiKeysCache {
       return this._buildSnapshot(entry.registry, now);
     }
 
+    if (entry) {
+      // Expired entry: remove it before loading so a failed load cannot leave
+      // a stale entry that would be served as a hit on the next call.
+      this._cache.delete(key);
+    }
+
     if (apiKeysCacheMissesTotal) {
       apiKeysCacheMissesTotal.inc();
     }
 
     const registry = loadApiKeyRegistry();
 
-    if (this._cache.size >= this.maxEntries) {
+    // Evict the oldest entry only when inserting a new key, so repeated loads
+    // for the same key cannot evict unrelated entries.
+    if (!this._cache.has(key) && this._cache.size >= this.maxEntries) {
       const oldestKey = this._cache.keys().next().value;
       if (oldestKey !== undefined) {
         this._cache.delete(oldestKey);
@@ -99,7 +107,7 @@ class ApiKeysCache {
     return this._buildSnapshot(registry, now);
   }
 
-  _buildSnapshot(registry, now) {
+  _buildHSnapshot(registry, now) {
     const snapshot = new Map();
     for (const [key, value] of registry) {
       if (isKeyActive(value, now)) {
@@ -114,7 +122,7 @@ class ApiKeysCache {
   }
 
   invalidate(key) {
-    this._cache.delete(key);
+    return this._cache.delete(key);
   }
 
   get size() {

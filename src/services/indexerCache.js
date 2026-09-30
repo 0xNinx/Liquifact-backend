@@ -14,12 +14,28 @@
  * @module services/indexerCache
  */
 
+const assert = require('assert');
+
 const { cacheConfig } = require('../config/cache');
 const {
   indexerCacheHitsTotal,
   indexerCacheMissesTotal,
   indexerCacheEvictionsTotal,
 } = require('../metrics');
+
+/**
+ * Validates cache configuration invariants.  A misconfigured cache (non-positive
+ * TTL, non-positive max entries, or a non-function clock) would silently break
+ * the TTL/LRU guarantees, so we fail fast at construction time.
+ *
+ * @param {object} options - Resolved cache options.
+ * @returns {void}
+ */
+function assertCacheInvariants({ ttlMs, maxEntries, now }) {
+  assert(Number.isFinite(ttlMs) && ttlMs > 0, 'indexerCache: ttlMs must be a positive finite number');
+  assert(Number.isInteger(maxEntries) && maxEntries > 0, 'indexerCache: maxEntries must be a positive integer');
+  assert(typeof now === 'function', 'indexerCache: now must be a function');
+}
 
 /**
  * Bounded in-process TTL cache for indexer listing responses.
@@ -40,6 +56,7 @@ class IndexerCache {
     maxEntries = cacheConfig.indexerMaxEntries,
     now = Date.now,
   } = {}) {
+    assertCacheInvariants({ ttlMs, maxEntries, now });
     this.ttlMs = ttlMs;
     this.maxEntries = maxEntries;
     this.now = now;
@@ -61,6 +78,10 @@ class IndexerCache {
    * @returns {string} Serialised cache key.
    */
   static buildKey({ filters = {}, sorting = {}, pagination = {} } = {}) {
+    assert(filters !== null && typeof filters === 'object', 'indexerCache: filters must be an object');
+    assert(sorting !== null && typeof sorting === 'object', 'indexerCache: sorting must be an object');
+    assert(pagination !== null && typeof pagination === 'object', 'indexerCache: pagination must be an object');
+
     return JSON.stringify({
       filters,
       sorting: {
@@ -80,6 +101,8 @@ class IndexerCache {
    * @returns {object|undefined} Cached `{ data, meta }`, or undefined on miss.
    */
   get(key) {
+    assert(typeof key === 'string' && key.length > 0, 'indexerCache: key must be a non-empty string');
+
     const entry = this.entries.get(key);
     if (!entry) {
       indexerCacheMissesTotal.inc();
@@ -93,7 +116,7 @@ class IndexerCache {
       return undefined;
     }
 
-    // Refresh recency (LRU): delete then reinsert at end.
+    // Refresh recency (LRU).
     this.entries.delete(key);
     this.entries.set(key, entry);
     indexerCacheHitsTotal.inc();
@@ -108,6 +131,10 @@ class IndexerCache {
    * @returns {void}
    */
   set(key, value) {
+    assert(typeof key === 'string' && key.length > 0, 'indexerCache: key must be a non-empty string');
+    assert(value !== null && typeof value === 'object', 'indexerCache: value must be a non-null object');
+    assert('data' in value && 'meta' in value, 'indexerCache: value must contain data and meta');
+
     if (this.entries.has(key)) {
       this.entries.delete(key);
     }
