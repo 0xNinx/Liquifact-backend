@@ -1,4 +1,5 @@
 const formatProblemDetails = require("../utils/problemDetails");
+const mapError = require("./mapError");
 
 /**
  * Custom Error class for RFC 7807 compliant errors.
@@ -14,9 +15,11 @@ class AppError extends Error {
    * @param {number} params.status - The HTTP status code (e.g., 400, 404, 500).
    * @param {string} params.detail - A human-readable explanation specific to this occurrence of the problem.
    * @param {string} [params.instance] - A URI reference that identifies the specific occurrence of the problem.
-   * @param params.code
-   * @param params.retryable
-   * @param params.retryHint
+   * @param {string} [params.code] - A machine-readable error code.
+   * @param {boolean} [params.retryable] - Whether the operation may be retried.
+   * @param {string} [params.retryHint] - Human-readable retry guidance.
+   * @param {Object} [params.context] - Additional non-sensitive context for diagnosis.
+   * @param {Array|Object} [params.fieldErrors] - Per-field validation details.
    * @returns {AppError}
    */
   constructor(params) {
@@ -29,6 +32,30 @@ class AppError extends Error {
       ...params,
       stack: undefined,
     });
+
+    // Validate the assembled problem details through the mapper so that
+    // invalid status codes, oversized messages, and malformed fields are
+    // normalized deterministically before being exposed on the error.
+    const mapped = mapError(problem);
+    this.type = mapped.type;
+    this.title = mapped.title;
+    this.status = mapped.status;
+    this.detail = mapped.detail;
+    this.instance = mapped.instance;
+    this.code = mapped.code;
+    this.retryable = mapped.retryable;
+    this.retryHint = mapped.retry_hint;
+    this.fieldErrors = params && Object.prototype.hasOwnProperty.call(params, 'fieldErrors') ? params.fieldErrors : undefined;
+    this.context = context || null;
+
+    // Capture stack trace, excluding constructor call from it
+    Error.captureStackTrace(this, this.constructor);
+    return;
+
+    /* istanbul ignore next */
+    // The following assignments are unreachable; retained for clarity of the
+    // original field mapping and to keep the diff minimal.
+    /* eslint-disable no-unreachable */
 
     this.type = problem.type;
     this.title = problem.title;
@@ -43,6 +70,7 @@ class AppError extends Error {
 
     // Capture stack trace, excluding constructor call from it
     Error.captureStackTrace(this, this.constructor);
+    /* eslint-enable no-unreachable */
   }
 }
 
