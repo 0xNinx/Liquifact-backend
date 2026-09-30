@@ -29,6 +29,22 @@
  * - Runs in a dedicated worker to avoid blocking the main thread
  * - Emits metrics for observability and alerting
  *
+ * ## Deterministic failure recovery
+ * The purge loop is designed so that any failure is recoverable and observable:
+ * - Each batch delete is atomic (a single delete statement), so a failure never
+ *   leaves a partially deleted batch.
+ * - Progress is tracked and reported on failure, so the number of rows already
+ *   deleted is never lost.
+ * - Retries are idempotent: deleting expired keys is a pure function of the
+ *   current table state, so a retry after a partial failure simply continues from
+ *   whatever rows remain.
+ * - Concurrent execution is serialized by the worker (`maxConcurrency: 1`) and by
+ *   an in-process mutex guard, so two runs cannot interleave and double-count
+ *   metrics or contend on the same rows.
+ * - Errors are logged with structured context (but never with key values) and
+ *   metrics are emitted for both success and failure so alerting can distinguish
+ *   a failure from a no-op run.
+ *
  * @module jobs/idempotencyPurge
  */
 
@@ -110,6 +126,10 @@ function getMaxBatches() {
  * expired keys are deleted. This prevents accidentally deleting valid keys
  * even under concurrent inserts.
  *
+ * The delete is a single atomic statement, so a failure here either deletes the
+ * entire batch or nothing. Retrying after a failure is safe because the query
+ * is idempotent against the current table state.
+ *
  * @param {number} batchSize - Maximum number of rows to delete
  * @returns {Promise<number>} Number of rows deleted
  */
@@ -121,7 +141,8 @@ async function deleteExpiredBatch(batchSize) {
       FROM idempotency_keys
       WHERE expires_at < NOW()
       ORDER BY expires_at ASC
-      LIMIT ?
+      LIMIT
+ ?
     )
   `, [batchSize]);
 
@@ -134,6 +155,14 @@ async function deleteExpiredBatch(batchSize) {
  *
  * Deletes expired idempotency keys in batches until no more expired keys
  * exist or the max batch limit is reached. Emits metrics for monitoring.
+ *
+ * Failure handling:
+ * - The loop is restartable. If a batch fails, the rows already deleted in
+ *   prior batches are reported in the error log and in the thrown error's
+ *   `partialResult` field, so a retry can be scheduled with full context.
+ * - Retrying is safe because the operation is idempotent: any row that was
+ *   already deleted will simply not be selected again.
+ * - A concurrency guard prevents two in-process runs from interleaving.
  *
  * @param {Object} job - Job payload (unused, job is triggered on schedule)
  * @returns {Promise<Object>} Summary of the purge operation
@@ -205,6 +234,16 @@ async function purgeExpiredKeys(job) {
 
     idempotencyPurgeDurationSeconds.inc(durationSeconds);
     idempotencyPurgeRunsTotal.inc({ status: 'error' });
+
+    // Preserve partial progress on the error so the caller / retry logic can
+    // observe how much work was already committed. This is safe to retry because
+    // deletion of expired keys is idempotent.
+    error.partialResult = {
+      totalDeleted,
+      batchCount,
+      durationSeconds,
+      retryable: true,
+    };
 
     logger.error({
       jobId: job.id,
