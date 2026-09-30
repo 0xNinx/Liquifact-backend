@@ -29,6 +29,123 @@ const { contractWasmVersionMismatchAlertsTotal } = require('../metrics');
 const MISMATCH_STATUSES = new Set(['ahead', 'unknown']);
 
 /**
+ * Every status `compareVersions` is allowed to return. Anything else means the
+ * comparison module violated its contract, and a mismatch alert must not be
+ * raised or suppressed on the strength of an unknown value.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const VALID_STATUSES = new Set(['current', 'ahead', 'unknown']);
+
+/**
+ * Largest value a Soroban `u32` SCHEMA_VERSION can hold. A decoded version
+ * outside `[0, MAX_U32]` (NaN, a float, a negative, an overflow) is a corrupt
+ * read, not a real on-chain version — alerting on it would be a false positive.
+ *
+ * @constant {number}
+ */
+const MAX_U32 = 0xffffffff;
+
+/**
+ * Error codes raised by input validation. Callers branch on `code`, never on
+ * message text.
+ *
+ * @constant {Readonly<Record<string, string>>}
+ */
+const REFRESH_ERRORS = Object.freeze({
+  /** `contractId` override was present but not a usable string. */
+  INVALID_CONTRACT_ID: 'INVALID_CONTRACT_ID',
+  /** The decoded on-chain SCHEMA_VERSION was not a valid u32. */
+  INVALID_ON_CHAIN_VERSION: 'INVALID_ON_CHAIN_VERSION',
+  /** `compareVersions` returned a status outside {@link VALID_STATUSES}. */
+  INVALID_STATUS: 'INVALID_STATUS',
+});
+
+/**
+ * Builds a tagged validation error.
+ *
+ * @param {string} code - One of {@link REFRESH_ERRORS}.
+ * @param {string} message - Human-readable detail.
+ * @returns {Error} Error with `code` set.
+ */
+function _refreshError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+/**
+ * Validates the optional `contractId` override.
+ *
+ * `undefined`/`null` are allowed and mean "fall back to ESCROW_CONTRACT_ID".
+ * A supplied override must be a non-empty string; it is trimmed so callers
+ * cannot smuggle a whitespace id past the downstream address validation. This
+ * deliberately does not enforce the Stellar address *format* — that concern is
+ * owned by `config/escrowVersions` and is exercised by its own tests.
+ *
+ * @param {unknown} contractId - Candidate override.
+ * @returns {string|undefined} Trimmed override, or undefined when absent.
+ * @throws {Error} `INVALID_CONTRACT_ID` for a present-but-unusable override.
+ */
+function validateContractIdOverride(contractId) {
+  if (contractId === undefined || contractId === null) {
+    return undefined;
+  }
+  if (typeof contractId !== 'string' || contractId.trim().length === 0) {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_CONTRACT_ID,
+      'contractId override must be a non-empty string'
+    );
+  }
+  return contractId.trim();
+}
+
+/**
+ * Validates the on-chain SCHEMA_VERSION decoded from the RPC read.
+ *
+ * @param {unknown} value - Decoded version.
+ * @returns {number} The validated integer.
+ * @throws {Error} `INVALID_ON_CHAIN_VERSION` when not an integer in [0, MAX_U32].
+ */
+function validateOnChainVersion(value) {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_U32) {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_ON_CHAIN_VERSION,
+      `on-chain SCHEMA_VERSION must be an integer in [0, ${MAX_U32}], got ${String(value)}`
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the comparison envelope returned by `compareVersions`.
+ *
+ * Guards against a malformed/`undefined` return (which would otherwise be
+ * destructured or silently treated as "no mismatch") and against an unexpected
+ * status (which would otherwise skip the alert path entirely).
+ *
+ * @param {unknown} comparison - Return value of `compareVersions`.
+ * @returns {{ status: 'current'|'ahead'|'unknown', knownVersion: string|null }}
+ *   The validated envelope.
+ * @throws {Error} `INVALID_STATUS` when the envelope or status is not recognised.
+ */
+function validateComparison(comparison) {
+  if (!comparison || typeof comparison !== 'object') {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_STATUS,
+      'compareVersions returned a non-object result'
+    );
+  }
+  if (!VALID_STATUSES.has(comparison.status)) {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_STATUS,
+      `compareVersions returned an unexpected status: ${String(comparison.status)}`
+    );
+  }
+  return comparison;
+}
+
+/**
  * De-dupe state for raised mismatch alerts, keyed by resolved contract id.
  * The value is the last alerted `expected|observed` version-pair signature, so a
  * persistent, already-reported mismatch does not re-alert on every scheduled
@@ -128,12 +245,16 @@ function resetVersionMismatchAlertState() {
  * @throws On RPC failure or invalid contract ID.
  */
 async function runContractListRefresh(contractId) {
-  logger.info({ contractId }, 'Starting contract list refresh');
+  // ── Validation boundary ──────────────────────────────────────────────────
+  // Validate before any RPC call or alert so bad inputs fail deterministically
+  // and never produce a false mismatch alert.
+  const override = validateContractIdOverride(contractId);
+  logger.info({ contractId: override }, 'Starting contract list refresh');
 
-  const onChainVersion = await getOnChainSchemaVersion(contractId);
-  const { status, knownVersion } = compareVersions(onChainVersion);
+  const onChainVersion = validateOnChainVersion(await getOnChainSchemaVersion(override));
+  const { status, knownVersion } = validateComparison(compareVersions(onChainVersion));
 
-  const resolvedId = contractId || process.env.ESCROW_CONTRACT_ID || null;
+  const resolvedId = override || process.env.ESCROW_CONTRACT_ID || null;
 
   if (MISMATCH_STATUSES.has(status)) {
     raiseVersionMismatchAlert({
@@ -156,5 +277,11 @@ module.exports = {
   runContractListRefresh,
   raiseVersionMismatchAlert,
   resetVersionMismatchAlertState,
+  validateContractIdOverride,
+  validateOnChainVersion,
+  validateComparison,
   MISMATCH_STATUSES,
+  VALID_STATUSES,
+  REFRESH_ERRORS,
+  MAX_U32,
 };
