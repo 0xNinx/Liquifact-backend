@@ -2,6 +2,12 @@
 
 const { v4: uuidv4 } = require('uuid');
 
+// Distributed per-invoice lock (issue #1213) — mocked to a pass-through so
+// this suite's assertions about purge/audit behavior aren't gated on a real
+// or fake Redis connection. Lock-contention behavior itself is covered by
+// tests/redisLock.test.js and tests/retentionPurge.lock.test.js.
+jest.mock('../src/services/redisLock');
+
 // Mock database before importing modules
 jest.mock('../src/db/knex', () => {
   const mockQuery = {
@@ -16,21 +22,62 @@ jest.mock('../src/db/knex', () => {
     del: jest.fn().mockResolvedValue(1),
     select: jest.fn().mockResolvedValue([]),
     insert: jest.fn().mockReturnThis(),
-    update: jest.fn().mockReturnThis(),
+    update: jest.fn().mockResolvedValue(1),
     first: jest.fn().mockResolvedValue(null),
     andWhere: jest.fn().mockReturnThis(),
     orWhere: jest.fn().mockReturnThis(),
     returning: jest.fn().mockReturnThis(),
+    then: jest.fn(function(resolve, reject) {
+      return Promise.resolve([]).then(resolve, reject);
+    })
   };
 
-  // Make the chain resolve properly
-  mockQuery.insert.mockResolvedValue([{ id: 'test-id', created_at: new Date() }]);
-  mockQuery.update.mockResolvedValue(1);
-  mockQuery.returning.mockResolvedValue([{ id: 'test-id', created_at: new Date() }]);
-  mockQuery.first.mockResolvedValue(null);
-  mockQuery.select.mockResolvedValue([]);
+  const underlyingMock = jest.fn(() => mockQuery);
 
-  const db = jest.fn(() => mockQuery);
+  const db = new Proxy(underlyingMock, {
+    apply(target, thisArg, argumentsList) {
+      const result = target.apply(thisArg, argumentsList);
+      if (result && typeof result === 'object' && typeof result.then !== 'function') {
+        if (!result.where) result.where = jest.fn().mockReturnThis();
+        if (!result.whereNotIn) result.whereNotIn = jest.fn().mockReturnThis();
+        if (!result.whereNull) result.whereNull = jest.fn().mockReturnThis();
+        if (!result.whereIn) result.whereIn = jest.fn().mockReturnThis();
+        if (!result.andWhere) result.andWhere = jest.fn().mockReturnThis();
+        if (!result.orWhere) result.orWhere = jest.fn().mockReturnThis();
+        if (!result.limit) result.limit = jest.fn().mockReturnThis();
+        if (!result.orderBy) result.orderBy = jest.fn().mockReturnThis();
+        if (!result.returning) result.returning = jest.fn().mockReturnThis();
+        if (!result.insert) result.insert = jest.fn().mockReturnThis();
+        if (!result.update) result.update = jest.fn().mockResolvedValue(1);
+        if (!result.first) {
+          result.first = jest.fn(function() {
+            result._isFirst = true;
+            return this;
+          });
+        }
+        if (!result.select) result.select = jest.fn().mockResolvedValue([]);
+        
+        result.then = jest.fn(function(resolve, reject) {
+          if (result._isFirst) {
+            if (result.select && typeof result.select.mock === 'object') {
+              return result.select().then(res => {
+                resolve(Array.isArray(res) ? res[0] : res);
+              }, reject);
+            }
+          }
+          if (result.select && typeof result.select.mock === 'object') {
+            return result.select().then(resolve, reject);
+          }
+          if (result.first && typeof result.first.mock === 'object') {
+            return result.first().then(resolve, reject);
+          }
+          return Promise.resolve([]).then(resolve, reject);
+        });
+      }
+      return result;
+    }
+  });
+
   db.raw = jest.fn();
   return db;
 });
@@ -124,7 +171,7 @@ describe('Retention System - Coverage Tests', () => {
       db.mockImplementation(() => ({
         where: jest.fn().mockReturnThis(),
         whereNull: jest.fn().mockReturnThis(),
-        first: jest.fn().mockRejectedValue(new Error('Database connection failed'))
+        select: jest.fn().mockRejectedValue(new Error('Database connection failed'))
       }));
 
       const mockHandler = jest.fn().mockImplementation(async (job) => {

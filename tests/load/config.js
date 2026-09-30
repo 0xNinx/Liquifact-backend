@@ -6,6 +6,15 @@ const DEFAULT_CONNECTIONS = 10;
 const DEFAULT_TIMEOUT_SECONDS = 10;
 const DEFAULT_ESCROW_INVOICE_ID = 'placeholder-invoice';
 
+// Load baseline thresholds — p99 latency (ms) and max error rate (%)
+const BASELINE_THRESHOLDS = {
+  'health': { p99LatencyMs: 50, maxErrorRate: 0 },
+  'invoices-list': { p99LatencyMs: 500, maxErrorRate: 1 },
+  'escrow-read': { p99LatencyMs: 500, maxErrorRate: 1 },
+  'marketplace': { p99LatencyMs: 1000, maxErrorRate: 1 },
+  'invest-opportunities': { p99LatencyMs: 1000, maxErrorRate: 1 },
+};
+
 /**
  * Resolve load test runtime configuration from environment variables.
  *
@@ -43,6 +52,7 @@ function loadLoadTestConfig(env = process.env) {
     reportDir: path.resolve(env.LOAD_REPORT_DIR || path.join('tests', 'load', 'reports')),
     authToken: env.LOAD_AUTH_TOKEN || null,
     escrowInvoiceId: env.LOAD_ESCROW_INVOICE_ID || DEFAULT_ESCROW_INVOICE_ID,
+    thresholds: BASELINE_THRESHOLDS,
   };
 }
 
@@ -72,6 +82,18 @@ function getLoadScenarios(config) {
       name: 'escrow-read',
       method: 'GET',
       path: `/api/escrow/${encodeURIComponent(config.escrowInvoiceId)}`,
+      headers: authHeaders,
+    },
+    {
+      name: 'marketplace',
+      method: 'GET',
+      path: '/api/marketplace',
+      headers: authHeaders,
+    },
+    {
+      name: 'invest-opportunities',
+      method: 'GET',
+      path: '/api/invest/opportunities',
       headers: authHeaders,
     },
   ];
@@ -136,6 +158,7 @@ function parsePositiveInteger(rawValue, fallback, name) {
 
 module.exports = {
   DEFAULT_BASE_URL,
+  BASELINE_THRESHOLDS,
   loadLoadTestConfig,
   getLoadScenarios,
   buildAuthHeaders,

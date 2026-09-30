@@ -19,28 +19,36 @@ const SENSITIVE_KEY_PATTERNS = [
  * Redacts sensitive values from an object.
  *
  * @param {*} value The value to redact.
+ * @param {RegExp[]} [extraPatterns] Additional key-name patterns to treat as
+ *   sensitive for this call only, layered on top of the base
+ *   {@link SENSITIVE_KEY_PATTERNS}. Optional and backward compatible — every
+ *   existing caller that omits it keeps its exact current behaviour. Callers
+ *   with a domain-specific denylist (e.g. identity/document field names for
+ *   KYC telemetry) should pass their own list here rather than forking this
+ *   function or mutating the shared {@link SENSITIVE_KEY_PATTERNS}.
  * @returns {*} The redacted value.
  */
-function redactValue(value) {
+function redactValue(value, extraPatterns = []) {
   if (value === null || value === undefined) {
     return value;
   }
 
   if (Array.isArray(value)) {
-    return value.map((item) => redactValue(item));
+    return value.map((item) => redactValue(item, extraPatterns));
   }
 
   if (typeof value !== 'object') {
     return value;
   }
 
+  const patterns = extraPatterns.length ? [...SENSITIVE_KEY_PATTERNS, ...extraPatterns] : SENSITIVE_KEY_PATTERNS;
   const sanitized = {};
   for (const [key, currentValue] of Object.entries(value)) {
-    if (SENSITIVE_KEY_PATTERNS.some((pattern) => pattern.test(key))) {
+    if (patterns.some((pattern) => pattern.test(key))) {
       sanitized[key] = REDACTED;
       continue;
     }
-    sanitized[key] = redactValue(currentValue);
+    sanitized[key] = redactValue(currentValue, extraPatterns);
   }
   return sanitized;
 }
@@ -88,10 +96,25 @@ async function appendAuditEvent(event, options = {}) {
 }
 
 /**
- * Escapes a single CSV field value to prevent formula-injection attacks
- * (cells beginning with =, +, -, @, TAB, or CR are prefixed with a single
- * quote so that spreadsheet software treats them as plain text) and to
- * conform to RFC 4180 quoting rules.
+ * Escapes a single CSV field value to prevent formula-injection attacks and
+ * to conform to RFC 4180 quoting rules.
+ *
+ * Formula-injection neutralisation (OWASP CSV Injection guidance):
+ *   - Leading whitespace is stripped before the dangerous-character check so
+ *     that values like " =HYPERLINK(...)" or "\t=cmd" are not overlooked.
+ *   - Any field whose leading non-whitespace character is one of
+ *     = + - @ | \t \r is prefixed with a single quote (') on the *original*
+ *     string so that spreadsheet software treats the cell as plain text.
+ *
+ * Covered cases:
+ *   "=SUM(...)"          → "'=SUM(...)"
+ *   " =HYPERLINK(...)"   → "' =HYPERLINK(...)"  (leading space + =)
+ *   "\t=cmd"             → "'\t=cmd"            (leading tab + =)
+ *   "+cmd|..."           → "'+cmd|..."
+ *   "-2+3"               → "'-2+3"
+ *   "@SUM(1)"            → "'@SUM(1)"
+ *   "|calc.exe"          → "'|calc.exe"
+ *   "\r=evil"            → "'\r=evil"           (leading CR)
  *
  * @param {*} val - Raw field value (any type; will be coerced to string).
  * @returns {string} Safely-escaped CSV field, quoted when necessary.
@@ -99,10 +122,11 @@ async function appendAuditEvent(event, options = {}) {
 function escapeCsvField(val) {
   const str = val == null ? '' : String(val);
 
-  // Neutralise formula-injection: prefix dangerous leading characters.
-  // Covers the OWASP-recommended set: = + - @ \t \r
+  // Neutralise formula-injection: inspect the first non-whitespace character.
+  // Covers the OWASP-recommended set: = + - @ | \t \r
+  const trimmedFirst = str.trimStart();
   const injectionSafe =
-    str.length > 0 && /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+    trimmedFirst.length > 0 && /^[=+\-@|\t\r]/.test(trimmedFirst) ? `'${str}` : str;
 
   // RFC 4180 quoting: wrap in double-quotes if the value contains a
   // comma, double-quote, or newline; escape embedded double-quotes by
@@ -247,7 +271,9 @@ function createCsvTransform() {
 module.exports = {
   appendAuditEvent,
   redactValue,
+  normalizeMetadata,
   REDACTED,
+  SENSITIVE_KEY_PATTERNS,
   escapeCsvField,
   CSV_HEADERS,
   rowToCsvLine,

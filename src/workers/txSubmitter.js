@@ -1,8 +1,9 @@
 'use strict';
 
-const JobQueue = require('./jobQueue');
+const { JobQueue, DurableJobQueue } = require('./jobQueue');
 const BackgroundWorker = require('./worker');
 const logger = require('../logger');
+const db = require('../db/knex');
 
 const DEFAULT_CONFIG = {
   maxRetries: Math.min(parseInt(process.env.SOROBAN_TX_SUBMIT_MAX_RETRIES || '3', 10), 10),
@@ -111,22 +112,61 @@ async function handleTxSubmitJob(job, submitTransactionFn, config = {}) {
 /**
  * Creates a worker for background transaction submission.
  *
+ * When `durable` is enabled (default), jobs are persisted to `tx_submissions`
+ * and restored on startup so in-flight Soroban submissions survive restarts.
+ *
  * @param {Function} submitTransactionFn - Function to submit transactions.
  * @param {object} [options={}] - Worker and retry options.
+ * @param {boolean} [options.durable=true] - Persist queued submissions to Postgres.
+ * @param {import('knex').Knex} [options.db] - Knex instance for persistence.
+ * @param {string} [options.tableName='tx_submissions'] - Persistence table name.
  * @returns {object} The worker controller object.
  */
 function createTxSubmitterWorker(submitTransactionFn, options = {}) {
-  const txQueue = new JobQueue({ maxRetries: 0 });
+  const durable = options.durable !== false;
+  const persistenceDb = options.db || db;
+  const txQueue = durable
+    ? new DurableJobQueue({
+      maxRetries: 0,
+      db: persistenceDb,
+      tableName: options.tableName || 'tx_submissions',
+    })
+    : new JobQueue({ maxRetries: 0 });
   const txWorker = new BackgroundWorker({ jobQueue: txQueue, pollIntervalMs: options.pollIntervalMs ?? 100, maxConcurrency: options.maxConcurrency ?? 1 });
+  let restored = !durable;
 
   txWorker.registerHandler('submit_soroban_tx', async (job) => {
     return handleTxSubmitJob(job, submitTransactionFn, options.retryConfig);
   });
 
+  /**
+   * Restores durable jobs from the database once per process.
+   *
+   * @returns {Promise<{restored: number, skipped: number}>} Restore summary.
+   */
+  async function ensureRestored() {
+    if (restored || typeof txQueue.restore !== 'function') {
+      return { restored: 0, skipped: 0 };
+    }
+
+    const summary = await txQueue.restore();
+    restored = true;
+    return summary;
+  }
+
   return {
     txQueue,
     txWorker,
-    enqueueTxSubmission: (payload, enqueueOptions = {}) => txQueue.enqueue('submit_soroban_tx', payload, enqueueOptions),
+    restore: ensureRestored,
+    enqueueTxSubmission: async (payload, enqueueOptions = {}) => {
+      await ensureRestored();
+      return txQueue.enqueue('submit_soroban_tx', payload, enqueueOptions);
+    },
+    start: async () => {
+      await ensureRestored();
+      txWorker.start();
+    },
+    stop: (timeoutMs) => txWorker.stop(timeoutMs),
   };
 }
 

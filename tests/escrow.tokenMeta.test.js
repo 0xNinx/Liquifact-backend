@@ -9,13 +9,16 @@ const {
   getCacheStats,
   validateAsset,
   generateCacheKey,
+  resolveMany,
   DEFAULT_CACHE_TTL_MS,
 } = require('../src/services/tokenMeta');
 const { readEscrowState } = require('../src/services/escrowRead');
 
-// Mock the cache store and soroban calls
-jest.mock('../src/services/cacheStore');
-jest.mock('../src/services/soroban');
+// Mock the soroban calls
+// We use the real in-memory cache for cacheStore
+jest.mock('../src/services/soroban', () => ({
+  callSorobanContract: jest.fn(async (op) => op())
+}));
 
 const PUBLIC_KEY = `G${'A'.repeat(55)}`;
 const CONTRACT_ID = `C${'A'.repeat(55)}`;
@@ -253,6 +256,106 @@ describe('tokenMeta - Token Metadata Service', () => {
     });
   });
 
+  describe('resolveMany (Batched Resolution with Stampede Protection)', () => {
+    it('returns empty array for empty input', async () => {
+      const results = await resolveMany([]);
+      expect(results).toEqual([]);
+    });
+
+    it('handles all cache misses', async () => {
+      const assets = [
+        { code: 'USDC', issuer: PUBLIC_KEY },
+        { code: 'TOKEN', contractId: CONTRACT_ID }
+      ];
+      const results = await resolveMany(assets);
+      expect(results).toHaveLength(2);
+      expect(results[0].symbol).toBe('USDC');
+      expect(results[1].symbol).toBe('TOKEN');
+    });
+
+    it('handles all cache hits immediately', async () => {
+      const assets = [
+        { code: 'USDC', issuer: PUBLIC_KEY },
+        { code: 'TOKEN', contractId: CONTRACT_ID }
+      ];
+      // Seed cache
+      await getTokenMetadata(assets[0]);
+      await getTokenMetadata(assets[1]);
+      
+      const results = await resolveMany(assets);
+      expect(results).toHaveLength(2);
+      expect(results[0].symbol).toBe('USDC');
+      expect(results[1].symbol).toBe('TOKEN');
+    });
+
+    it('handles mixed hit/miss', async () => {
+      const assets = [
+        { code: 'USDC', issuer: PUBLIC_KEY },
+        { code: 'TOKEN', contractId: CONTRACT_ID }
+      ];
+      // Seed only one cache entry
+      await getTokenMetadata(assets[0]);
+      
+      const results = await resolveMany(assets);
+      expect(results).toHaveLength(2);
+      expect(results[0].symbol).toBe('USDC');
+      expect(results[1].symbol).toBe('TOKEN');
+    });
+
+    it('handles concurrent identical misses via single-flight deduplication', async () => {
+      const asset = { code: 'USDC', issuer: PUBLIC_KEY };
+      // Fire 5 identical requests concurrently
+      const promises = [
+        getTokenMetadata(asset),
+        getTokenMetadata(asset),
+        getTokenMetadata(asset),
+        getTokenMetadata(asset),
+        getTokenMetadata(asset),
+      ];
+      const results = await Promise.all(promises);
+      
+      // All results should share the exact same cached timestamp
+      // meaning they shared the single-flight RPC fetch.
+      for (let i = 1; i < results.length; i++) {
+        expect(results[i].cachedAt).toBe(results[0].cachedAt);
+      }
+    });
+
+    it('deduplicates identical assets in the batch request', async () => {
+      const asset = { code: 'USDC', issuer: PUBLIC_KEY };
+      const assets = [asset, asset, asset];
+      const results = await resolveMany(assets);
+      
+      expect(results).toHaveLength(3);
+      expect(results[0]).toBe(results[1]); // Exact same object reference
+      expect(results[1]).toBe(results[2]);
+    });
+
+    it('rejects invalid assets in the batch resolver', async () => {
+      await expect(resolveMany([{ code: 'INVALID' }])).rejects.toMatchObject({
+        code: 'INVALID_ASSET',
+        status: 400,
+      });
+    });
+
+    it('handles RPC failure for one token without failing the whole batch', async () => {
+      const { callSorobanContract } = require('../src/services/soroban');
+      // Mock failure for Soroban token but success for Horizon token
+      callSorobanContract.mockRejectedValueOnce(new Error('RPC failure'));
+      
+      const assets = [
+        { code: 'USDC', issuer: PUBLIC_KEY }, // Horizon (mock succeeds)
+        { code: 'TOKEN', contractId: CONTRACT_ID } // Soroban (mock fails)
+      ];
+      
+      const results = await resolveMany(assets);
+      expect(results).toHaveLength(2);
+      
+      expect(results[0].symbol).toBe('USDC'); // Succeeds
+      expect(results[1].source).toBe('soroban_fallback'); // Graceful fallback
+    });
+  });
+
   describe('invalidateTokenMetadata', () => {
     it('invalidates cached metadata for specific asset', async () => {
       const asset = { code: 'USDC', issuer: PUBLIC_KEY };
@@ -281,6 +384,7 @@ describe('tokenMeta - Token Metadata Service', () => {
       
       const metadata1 = await getTokenMetadata(asset);
       invalidateTokenMetadata(asset);
+      await new Promise(resolve => setTimeout(resolve, 10)); // Small delay
       const metadata2 = await getTokenMetadata(asset);
 
       expect(metadata1.cachedAt).not.toBe(metadata2.cachedAt);

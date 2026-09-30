@@ -34,16 +34,16 @@ function notFoundHandler(req, _res, next) {
  */
 function errorHandler(error, req, res, _next) {
   const mapped = mapError(error);
-  const requestId = req.id || 'unknown';
+  const correlationId = req.correlationId || req.id || 'unknown';
 
-  logError(error, requestId);
+  logError(error, correlationId, req);
   captureException(error, req);
 
   res.status(mapped.status).json({
     error: {
       code: mapped.code,
       message: mapped.message,
-      correlation_id: req.id || 'unknown',
+      correlation_id: correlationId,
       retryable: mapped.retryable,
       retry_hint: mapped.retryHint,
     },
@@ -54,16 +54,18 @@ function errorHandler(error, req, res, _next) {
  * Log the error with correlation context without exposing internals to clients.
  *
  * @param {unknown} error Thrown error value.
- * @param {string} requestId Request correlation ID.
+ * @param {string} correlationId Request correlation ID.
+ * @param {import('express').Request} req Request object.
  * @returns {void}
  */
-function logError(error, requestId) {
+function logError(error, correlationId, req) {
   const message =
     error && typeof error === 'object' && typeof error.message === 'string'
       ? error.message
       : 'Non-error value thrown';
 
-  logger.error({ err: error, requestId }, message);
+  const requestLogger = req?.log || logger;
+  requestLogger.error({ err: error, requestId: correlationId, correlationId }, message);
 }
 
 module.exports = errorHandler;

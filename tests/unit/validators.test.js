@@ -1,4 +1,7 @@
 const { validateInvoiceQueryParams } = require('../../src/utils/validators');
+const { ALL_INVOICE_STATUSES } = require('../../src/services/invoiceStateMachine');
+
+const statusErrorMessage = `Invalid status. Must be one of: ${ALL_INVOICE_STATUSES.join(', ')}`;
 
 describe('Validators Utility', () => {
   describe('validateInvoiceQueryParams', () => {
@@ -13,7 +16,7 @@ describe('Validators Utility', () => {
       const query = { status: 'invalid' };
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
-      expect(result.errors).toContain('Invalid status. Must be one of: paid, pending, overdue');
+      expect(result.fieldErrors.status).toBe(statusErrorMessage);
     });
 
     it('should validate valid SME ID', () => {
@@ -34,7 +37,7 @@ describe('Validators Utility', () => {
       const query = { buyerId: '' };
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
-      expect(result.errors).toContain('Invalid buyerId format');
+      expect(result.fieldErrors.buyerId).toBe('Invalid buyerId format');
     });
 
     it('should validate valid dates', () => {
@@ -49,13 +52,14 @@ describe('Validators Utility', () => {
       const query = { dateFrom: '01-01-2023' };
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
-      expect(result.errors).toContain('Invalid dateFrom format. Use YYYY-MM-DD');
+      expect(result.fieldErrors.dateFrom).toBe('Invalid dateFrom format. Use YYYY-MM-DD');
     });
 
     it('should reject logically invalid dates', () => {
       const query = { dateFrom: '2023-13-01' }; // Invalid month
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
+      expect(result.fieldErrors.dateFrom).toBe('Invalid dateFrom format. Use YYYY-MM-DD');
     });
 
     it('should validate sorting parameters', () => {
@@ -70,21 +74,23 @@ describe('Validators Utility', () => {
       const query = { sortBy: 'unsupported' };
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
-      expect(result.errors).toContain('Invalid sortBy. Must be one of: amount, date');
+      expect(result.fieldErrors.sortBy).toBe('Invalid sortBy. Must be one of: amount, date');
     });
 
     it('should reject invalid order', () => {
       const query = { order: 'sideways' };
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
-      expect(result.errors).toContain('Invalid order. Must be "asc" or "desc"');
+      expect(result.fieldErrors.order).toBe('Invalid order. Must be "asc" or "desc"');
     });
 
     it('should handle multiple errors', () => {
       const query = { status: 'none', sortBy: 'unknown' };
       const result = validateInvoiceQueryParams(query);
       expect(result.isValid).toBe(false);
-      expect(result.errors.length).toBe(2);
+      expect(Object.keys(result.fieldErrors).length).toBe(2);
+      expect(result.fieldErrors.status).toBeDefined();
+      expect(result.fieldErrors.sortBy).toBeDefined();
     });
   });
 });

@@ -9,7 +9,7 @@ class AppError extends Error {
    * Creates a new AppError instance.
    *
    * @param {Object} params
-   * @param {string} params.type - A URI reference [RFC3986] that identifies the problem type.
+   * @param {string} params.type - A URI reference [RF3986] that identifies the problem type.
    * @param {string} params.title - A short, human-readable summary of the problem type.
    * @param {number} params.status - The HTTP status code (e.g., 400, 404, 500).
    * @param {string} params.detail - A human-readable explanation specific to this occurrence of the problem.
@@ -20,14 +20,14 @@ class AppError extends Error {
    * @returns {AppError}
    */
   constructor(params) {
-    const { title, code, retryable, retryHint } = params || {};
+    const { title, context } = params || {};
     super(title);
     this.name = this.constructor.name;
 
-    // Delegate to canonical builder for assembly/defaulting
+    // Delegate to canonical builder for ALL field assembly/defaulting
     const problem = formatProblemDetails({
       ...params,
-      stack: undefined, // Do not format stack within AppError construction
+      stack: undefined,
     });
 
     this.type = problem.type;
@@ -35,13 +35,23 @@ class AppError extends Error {
     this.status = problem.status;
     this.detail = problem.detail;
     this.instance = problem.instance;
-    this.code = code;
-    this.retryable = retryable;
-    this.retryHint = retryHint;
+    this.code = problem.code;
+    this.retryable = problem.retryable;
+    this.retryHint = problem.retry_hint;
+    this.fieldErrors = params && Object.prototype.hasOwnProperty.call(params, 'fieldErrors') ? params.fieldErrors : undefined;
+    this.context = context || null;
 
     // Capture stack trace, excluding constructor call from it
     Error.captureStackTrace(this, this.constructor);
   }
 }
+
+/**
+ * Error code indicating that a job lease fencing token was rejected.
+ * This is returned when a worker attempts a write/complete operation after
+ * its lease has expired or been reassigned. It is non-retryable by default.
+ * @type {string}
+ */
+AppError.FENCING_TOKEN_REJECTED = 'FENCING_TOKEN_REJECTED';
 
 module.exports = AppError;

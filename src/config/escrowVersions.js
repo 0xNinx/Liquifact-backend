@@ -11,6 +11,7 @@
 
 const { callSorobanContract } = require('../services/soroban');
 const logger = require('../logger');
+const { isValidStellarContractAddress } = require('../utils/validators');
 
 /**
  * Known LiquifactEscrow deployments: semver -> SCHEMA_VERSION (u32).
@@ -25,30 +26,28 @@ const REGISTRY = {
 };
 
 /**
- * Stellar contract address pattern (C + 55 base-32 chars).
- * @type {RegExp}
- */
-const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
-
-/**
  * Validates a Stellar contract address.
  *
  * @param {string} contractId
  * @returns {boolean}
  */
 function isValidContractId(contractId) {
-  return typeof contractId === 'string' && CONTRACT_ID_RE.test(contractId);
+  return isValidStellarContractAddress(contractId);
 }
 
 /**
  * Reads SCHEMA_VERSION from the deployed LiquifactEscrow contract via Soroban RPC.
  *
- * Uses `callSorobanContract` for automatic retry on transient errors.
+ * Fetches persistent contract data for the key `SCHEMA_VERSION` (a Symbol ScVal)
+ * and decodes the returned XDR value as a u32.  Uses `callSorobanContract` for
+ * automatic retry on transient errors.
+ *
  * Rejects with a structured error on RPC failure — never calls process.exit.
  *
- * @param {string} [contractId] - Contract address. Defaults to ESCROW_CONTRACT_ID env var.
- * @returns {Promise<number>} The on-chain SCHEMA_VERSION integer.
- * @throws {{ code: string, message: string }} On invalid input or RPC failure.
+ * @param {string} [contractId] - Contract address (C…56 chars). Defaults to
+ *   `ESCROW_CONTRACT_ID` env var.
+ * @returns {Promise<number>} The on-chain SCHEMA_VERSION u32.
+ * @throws {{ code: 'INVALID_CONTRACT_ID'|'RPC_ERROR', message: string }}
  */
 async function getOnChainSchemaVersion(contractId) {
   const id = contractId || process.env.ESCROW_CONTRACT_ID;
@@ -60,15 +59,37 @@ async function getOnChainSchemaVersion(contractId) {
   }
 
   try {
+    /**
+     * Read the persistent `SCHEMA_VERSION` Symbol key from the contract.
+     *
+     * The Stellar SDK's `SorobanRpc.Server.getContractData` accepts:
+     *   - contract: the StrKey-encoded contract address
+     *   - key:      an ScVal identifying the storage key
+     *   - durability: 'persistent' | 'temporary'
+     *
+     * It resolves to an `LedgerEntryResult` whose `.val` is the raw ScVal.
+     * We decode it with `.u32()` since SCHEMA_VERSION is always a u32.
+     *
+     * @returns {Promise<number>}
+     */
     const version = await callSorobanContract(async () => {
-      // Real implementation would use SorobanClient to read persistent storage:
-      //   const rpc = new SorobanClient.Server(process.env.SOROBAN_RPC_URL);
-      //   const key = SorobanClient.xdr.ScVal.scvSymbol('SCHEMA_VERSION');
-      //   const { entries } = await rpc.getContractData(id, key);
-      //   return Number(entries[0].val.u32());
-      //
-      // Placeholder: resolved by the caller / test mock.
-      throw new Error('RPC_NOT_IMPLEMENTED');
+      const { SorobanRpc, xdr, Contract } = require('@stellar/stellar-sdk');
+      const rpcUrl = process.env.SOROBAN_RPC_URL;
+      const server = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith('http://') });
+      const key = xdr.ScVal.scvSymbol('SCHEMA_VERSION');
+      const contract = new Contract(id);
+      const ledgerKey = xdr.LedgerKey.contractData(
+        new xdr.LedgerKeyContractData({
+          contract: contract.address().toScAddress(),
+          key,
+          durability: xdr.ContractDataDurability.persistent(),
+        })
+      );
+      const response = await server.getLedgerEntries(ledgerKey);
+      if (!response.entries || response.entries.length === 0) {
+        throw new Error('SCHEMA_VERSION not found in contract persistent storage');
+      }
+      return response.entries[0].val.contractData().val().u32();
     });
     return version;
   } catch (err) {

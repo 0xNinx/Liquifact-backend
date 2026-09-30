@@ -5,6 +5,7 @@ const {
   createRedisEscrowSummaryCache,
   parseRedisEscrowCacheConfig,
 } = require('../src/cache/redis');
+const { CircuitBreaker, CircuitBreakerState } = require('../src/utils/circuitBreaker');
 
 class FakeRedisClient {
   constructor() {
@@ -48,6 +49,28 @@ describe('redis escrow cache config', () => {
     expect(config.enabled).toBe(true);
     expect(config.ttlSeconds).toBe(300);
     expect(config.ledgerGapThreshold).toBe(1);
+  });
+
+  it('parses and clamps REDIS_ESCROW_CACHE_TIMEOUT_MS', () => {
+    const config = parseRedisEscrowCacheConfig({
+      REDIS_ESCROW_CACHE_ENABLED: 'true',
+      REDIS_URL: 'redis://localhost:6379',
+      REDIS_ESCROW_CACHE_TIMEOUT_MS: '99999',
+    });
+    expect(config.timeoutMs).toBe(5000);
+
+    const config2 = parseRedisEscrowCacheConfig({
+      REDIS_ESCROW_CACHE_ENABLED: 'true',
+      REDIS_URL: 'redis://localhost:6379',
+      REDIS_ESCROW_CACHE_TIMEOUT_MS: '10',
+    });
+    expect(config2.timeoutMs).toBe(50);
+
+    const config3 = parseRedisEscrowCacheConfig({
+      REDIS_ESCROW_CACHE_ENABLED: 'true',
+      REDIS_URL: 'redis://localhost:6379',
+    });
+    expect(config3.timeoutMs).toBe(500);
   });
 });
 
@@ -97,6 +120,15 @@ describe('RedisEscrowSummaryCache', () => {
     expect(result.value).toEqual({ invoiceId: 'inv_ok', status: 'not_found' });
   });
 
+  it('deletes the affected invoice on write invalidation', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
+    await cache.setSummary('inv_write', { status: 'pending' }, 10);
+
+    expect(await cache.deleteSummary('inv_write')).toBe(true);
+    expect((await cache.getSummary('inv_write')).hit).toBe(false);
+  });
+
   it('does not create cache instance when optional redis cache is disabled', () => {
     const cache = createRedisEscrowSummaryCache({
       env: {
@@ -106,5 +138,110 @@ describe('RedisEscrowSummaryCache', () => {
     });
 
     expect(cache).toBeNull();
+  });
+
+  // ── Fail-open tests ────────────────────────────────────────────────────
+
+  it('getSummary fails open on Redis timeout (returns miss, does not throw)', async () => {
+    const slowClient = {
+      get: () => new Promise((resolve) => setTimeout(() => resolve('data'), 5000)),
+      set: () => Promise.resolve('OK'),
+      del: () => Promise.resolve(1),
+    };
+
+    const cache = new RedisEscrowSummaryCache({
+      client: slowClient,
+      ttlSeconds: 30,
+      timeoutMs: 50, // very short timeout to trigger fail-open quickly
+    });
+
+    const result = await cache.getSummary('inv_slow');
+
+    expect(result.hit).toBe(false);
+    expect(result.reason).toBe('fail_open');
+  });
+
+  it('setSummary fails open on Redis timeout (returns false, does not throw)', async () => {
+    const slowClient = {
+      get: () => Promise.resolve(null),
+      set: () => new Promise((resolve) => setTimeout(() => resolve('OK'), 5000)),
+      del: () => Promise.resolve(1),
+    };
+
+    const cache = new RedisEscrowSummaryCache({
+      client: slowClient,
+      ttlSeconds: 30,
+      timeoutMs: 50,
+    });
+
+    const result = await cache.setSummary('inv_slow', { status: 'funded' }, 100);
+
+    expect(result).toBe(false);
+  });
+
+  it('getSummary fails open when circuit breaker is OPEN', async () => {
+    const client = new FakeRedisClient();
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      recoveryTimeout: 60000, // long recovery so it stays open
+      fallbackLogic: () => null,
+    });
+
+    // Trip the breaker by forcing a failure.
+    breaker.state = CircuitBreakerState.OPEN;
+    breaker.nextAttemptTime = Date.now() + 60000;
+
+    const cache = new RedisEscrowSummaryCache({
+      client,
+      ttlSeconds: 30,
+      circuitBreaker: breaker,
+    });
+
+    const result = await cache.getSummary('inv_cb');
+
+    expect(result.hit).toBe(false);
+    // CB fallback returns null → treated as a miss by getSummary.
+    expect(result.reason).toBe('miss');
+  });
+
+  it('setSummary fails open when circuit breaker is OPEN', async () => {
+    const client = new FakeRedisClient();
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      recoveryTimeout: 60000,
+      fallbackLogic: () => null,
+    });
+
+    breaker.state = CircuitBreakerState.OPEN;
+    breaker.nextAttemptTime = Date.now() + 60000;
+
+    const cache = new RedisEscrowSummaryCache({
+      client,
+      ttlSeconds: 30,
+      circuitBreaker: breaker,
+    });
+
+    const result = await cache.setSummary('inv_cb', { status: 'funded' }, 100);
+
+    // CB fallback returns null → setSummary returns false.
+    expect(result).toBe(false);
+  });
+
+  it('getSummary fails open when Redis client.get throws', async () => {
+    const errorClient = {
+      get: () => Promise.reject(new Error('Connection refused')),
+      set: () => Promise.resolve('OK'),
+      del: () => Promise.resolve(1),
+    };
+
+    const cache = new RedisEscrowSummaryCache({
+      client: errorClient,
+      ttlSeconds: 30,
+    });
+
+    const result = await cache.getSummary('inv_err');
+
+    expect(result.hit).toBe(false);
+    expect(result.reason).toBe('fail_open');
   });
 });

@@ -11,14 +11,24 @@ const marketplaceService = require('../services/marketplaceService');
 const { validateMarketplaceQueryParams } = require('../utils/validators');
 const { CursorError } = require('../utils/cursorPagination');
 const { authenticatedTenantStack } = require('../middleware/stacks');
+const { cacheResponse, makeMarketplaceKey } = require('../middleware/cache');
+const { getSharedStore } = require('../services/cacheStore');
 const logger = require('../logger');
 
 router.use(...authenticatedTenantStack);
+
+const CACHE_TTL_MS = 15000;
+const cacheMiddleware = cacheResponse({
+  ttl: CACHE_TTL_MS,
+  store: getSharedStore(),
+  keyFn: makeMarketplaceKey,
+});
 
 /**
  * @swagger
  * /api/marketplace:
  *   get:
+ *     operationId: listMarketplaceInvoices
  *     summary: Search and sort marketplace invoices
  *     description: |
  *       Retrieve a paginated list of invoices available in the marketplace with
@@ -167,12 +177,18 @@ router.use(...authenticatedTenantStack);
  *       401:
  *         $ref: '#/components/responses/Problem401'
  */
-router.get('/', async (req, res, next) => {
+router.get('/', cacheMiddleware, async (req, res, next) => {
   try {
-    const { isValid, errors, validatedParams } = validateMarketplaceQueryParams(req.query);
+    const { isValid, fieldErrors, validatedParams } = validateMarketplaceQueryParams(req.query);
 
     if (!isValid) {
-      return res.status(400).json({ errors });
+      return res.status(400).json({
+        type: 'https://liquifact.io/problems/validation-error',
+        title: 'Validation Error',
+        status: 400,
+        detail: 'Query parameters contain invalid values.',
+        fieldErrors,
+      });
     }
 
     // Enforce explicit visibility rules; never allow clients to enumerate
@@ -183,9 +199,13 @@ router.get('/', async (req, res, next) => {
       !marketplaceService.PUBLIC_INVESTABLE_INVOICE_STATUSES.includes(validatedParams.filters.status)
     ) {
       return res.status(400).json({
-        errors: [
-          `Invalid status for marketplace. Must be one of: ${marketplaceService.PUBLIC_INVESTABLE_INVOICE_STATUSES.join(', ')}`,
-        ],
+        type: 'https://liquifact.io/problems/validation-error',
+        title: 'Validation Error',
+        status: 400,
+        detail: 'Query parameters contain invalid values.',
+        fieldErrors: {
+          status: `Invalid status for marketplace. Must be one of: ${marketplaceService.PUBLIC_INVESTABLE_INVOICE_STATUSES.join(', ')}`,
+        },
       });
     }
 
@@ -198,7 +218,15 @@ router.get('/', async (req, res, next) => {
     } catch (err) {
       // CursorError is a client error (malformed/tampered cursor) → 400
       if (err instanceof CursorError) {
-        return res.status(400).json({ errors: [err.message] });
+        return res.status(400).json({
+          type: 'https://liquifact.io/problems/validation-error',
+          title: 'Validation Error',
+          status: 400,
+          detail: 'Query parameters contain invalid values.',
+          fieldErrors: {
+            cursor: err.message,
+          },
+        });
       }
       throw err;
     }

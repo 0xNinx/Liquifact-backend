@@ -1,16 +1,32 @@
 'use strict';
 
+const crypto = require('crypto');
 const db = require('../db/knex');
 const JobQueue = require('../workers/jobQueue');
 const BackgroundWorker = require('../workers/worker');
 const logger = require('../logger');
 const { z } = require('zod');
+const { createRedisLockService, RedisLockError } = require('../services/redisLock');
+
+/**
+ * Retention purge is a background job that may run on more than one worker
+ * replica (a scheduled run overlapping a manually-triggered one, for
+ * instance). This per-invoice distributed lock ensures at most one worker
+ * purges a given invoice's PII at a time (issue #1213) — using the shared
+ * default Redis client is intentional here rather than per-call injection,
+ * matching how `db` above is required once at module scope; tests replace
+ * this via `jest.mock('../src/services/redisLock')`.
+ */
+const retentionLockService = createRedisLockService();
+
+/** How long a single invoice's purge-and-audit-log step may hold its lock before it is considered stuck. */
+const RETENTION_LOCK_TTL_MS = 30_000;
 
 /**
  * Schema for retention job payload validation
  */
 const RetentionJobSchema = z.object({
-  tenantId: z.string().uuid(),
+  tenantId: z.string().uuid(),classes: z.array(z.enum(['INVOICE', 'UPLOAD', 'AUDIT'])).default(['INVOICE']),
   policyId: z.string().uuid().optional(),
   dryRun: z.boolean().default(false),
   retentionDays: z.number().positive().optional(),
@@ -112,6 +128,52 @@ async function getEligibleInvoices(tenantId, policy, batchSize) {
 }
 
 /**
+ * Generates a salted SHA-256 hash of a PII field value.
+ * Uses the invoice ID as a local salt and the system JWT_SECRET as a global salt
+ * to protect against dictionary attacks.
+ * @param {string} value - Clear text PII value
+ * @param {string} salt - Local salt (invoice UUID)
+ * @returns {string|null} - Hex-encoded salted SHA-256 hash, or null if value is null/undefined
+ */
+function hashPiiValue(value, salt) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const systemSalt = process.env.JWT_SECRET || 'default-retention-salt';
+  return crypto
+    .createHash('sha256')
+    .update(`${salt}:${systemSalt}:${value}`)
+    .digest('hex');
+}
+
+/**
+ * Builds a forensic before-state snapshot for PII fields that are about to be
+ * destructively purged. The snapshot intentionally stores only field names and
+ * salted hashes of non-null prior values; it never returns clear-text PII.
+ *
+ * @param {Object|null} invoice - Invoice row before destructive purge
+ * @param {string[]} piiFields - Validated PII field names to snapshot
+ * @returns {{fieldHashes: Object, fieldCount: number, valueHashCount: number}} Minimal hashed snapshot
+ */
+function buildPiiBeforeStateSnapshot(invoice, piiFields) {
+  const fieldHashes = {};
+
+  if (invoice) {
+    piiFields.forEach(field => {
+      if (invoice[field] !== null && invoice[field] !== undefined) {
+        fieldHashes[field] = hashPiiValue(invoice[field], invoice.id);
+      }
+    });
+  }
+
+  return {
+    fieldHashes,
+    fieldCount: piiFields.length,
+    valueHashCount: Object.keys(fieldHashes).length
+  };
+}
+
+/**
  * Purges PII from an invoice (or simulates for dry run)
  * @param {string} invoiceId - Invoice UUID
  * @param {string[]} piiFields - PII fields to purge
@@ -120,18 +182,17 @@ async function getEligibleInvoices(tenantId, policy, batchSize) {
  */
 async function purgeInvoicePii(invoiceId, piiFields, dryRun = false) {
   const updateData = {};
-  const oldValues = {};
+  let beforeStateSnapshot = {
+    fieldHashes: {},
+    fieldCount: piiFields.length,
+    valueHashCount: 0
+  };
 
-  // Get current values for audit
+  // Capture a hashed before-state only for destructive purges. Dry-run audit
+  // behavior remains unchanged and does not fetch or persist additional values.
   if (!dryRun) {
     const current = await db('invoices').where('id', invoiceId).first();
-    if (current) {
-      piiFields.forEach(field => {
-        if (current[field] !== null) {
-          oldValues[field] = current[field];
-        }
-      });
-    }
+    beforeStateSnapshot = buildPiiBeforeStateSnapshot(current, piiFields);
   }
 
   // Prepare update data (set to null for purging)
@@ -144,7 +205,8 @@ async function purgeInvoicePii(invoiceId, piiFields, dryRun = false) {
       success: true,
       dryRun: true,
       purgedFields: piiFields,
-      oldValues
+      oldValues: beforeStateSnapshot.fieldHashes,
+      beforeStateSnapshot
     };
   }
 
@@ -156,7 +218,8 @@ async function purgeInvoicePii(invoiceId, piiFields, dryRun = false) {
     success: result > 0,
     dryRun: false,
     purgedFields: result > 0 ? piiFields : [],
-    oldValues
+    oldValues: beforeStateSnapshot.fieldHashes,
+    beforeStateSnapshot
   };
 }
 
@@ -202,6 +265,7 @@ async function createJobExecution(executionData) {
  * Updates retention job execution record
  * @param {string} executionId - Execution UUID
  * @param {Object} updateData - Update data
+ * @returns {Promise<void>} - Resolves when complete
  */
 async function updateJobExecution(executionId, updateData) {
   try {
@@ -313,36 +377,83 @@ retentionWorker.registerHandler('retention_purge', async (job) => {
             continue;
           }
 
-          // Purge PII
-          const result = await purgeInvoicePii(invoice.id, validatedFields, dryRun);
+          // Hold a per-invoice lock across the purge + audit-log write so a
+          // second worker processing the same policy concurrently cannot
+          // purge (and double-audit-log) the same invoice. Fail closed: if
+          // the lock cannot even be acquired (Redis unavailable), this
+          // invoice is skipped for this run rather than purged without an
+          // exclusivity guarantee — it will be picked up again on the next
+          // scheduled run. See docs/PR notes (issue #1213) for the
+          // operational implication of this choice.
+          const lockKey = retentionLockService.buildResourceKey('invoice', tenantId, invoice.id);
+          let lockOutcome;
+          try {
+            lockOutcome = await retentionLockService.withLock(
+              { resourceKey: lockKey, ttlMs: RETENTION_LOCK_TTL_MS },
+              async () => {
+                // Purge PII
+                const result = await purgeInvoicePii(invoice.id, validatedFields, dryRun);
 
-          if (result.success) {
-            totalPurged++;
-            result.purgedFields.forEach(field => allPurgedFields.add(field));
+                if (result.success) {
+                  totalPurged++;
+                  result.purgedFields.forEach(field => allPurgedFields.add(field));
 
-            // Log audit trail
-            await logRetentionOperation({
+                  // Log audit trail
+                  await logRetentionOperation({
+                    tenantId,
+                    invoiceId: invoice.id,
+                    operation: dryRun ? 'dry_run' : 'pii_purged',
+                    piiFields: result.purgedFields,
+                    oldValues: result.oldValues,
+                    reason: `Retention policy: ${policy.name} (${policyRetentionDays} days)`,
+                    performedBy,
+                    metadata: {
+                      policyId: policy.id,
+                      dryRun: result.dryRun,
+                      invoiceNumber: invoice.invoice_number,
+                      purgedFieldsCount: result.purgedFields.length,
+                      beforeStateSnapshot: dryRun ? undefined : {
+                        fieldNames: result.purgedFields,
+                        fieldCount: result.beforeStateSnapshot.fieldCount,
+                        valueHashCount: result.beforeStateSnapshot.valueHashCount
+                      }
+                    }
+                  });
+
+                  logger.info({
+                    tenantId,
+                    invoiceId: invoice.id,
+                    invoiceNumber: invoice.invoice_number,
+                    purgedFields: result.purgedFields,
+                    dryRun
+                  }, result.dryRun ? 'Dry run: Would purge PII' : 'Purged PII from invoice');
+                }
+              },
+            );
+          } catch (lockError) {
+            if (lockError instanceof RedisLockError) {
+              const errorInfo = {
+                invoiceId: invoice.id,
+                invoiceNumber: invoice.invoice_number,
+                error: lockError.message,
+                code: lockError.code,
+              };
+              errors.push(errorInfo);
+              logger.error(errorInfo, lockError.code === 'LOCK_LOST'
+                ? 'Invoice lock lost mid-purge; a purged/audited record may not have been exclusively owned throughout'
+                : 'Could not acquire invoice lock; skipping invoice for this run (fail closed)');
+              continue;
+            }
+            throw lockError;
+          }
+
+          if (lockOutcome && lockOutcome.executed === false) {
+            logger.debug({
               tenantId,
               invoiceId: invoice.id,
-              operation: dryRun ? 'dry_run' : 'pii_purged',
-              piiFields: result.purgedFields,
-              oldValues: result.oldValues,
-              reason: `Retention policy: ${policy.name} (${policyRetentionDays} days)`,
-              performedBy,
-              metadata: {
-                policyId: policy.id,
-                dryRun: result.dryRun,
-                invoiceNumber: invoice.invoice_number
-              }
-            });
-
-            logger.info({
-              tenantId,
-              invoiceId: invoice.id,
-              invoiceNumber: invoice.invoice_number,
-              purgedFields: result.purgedFields,
-              dryRun
-            }, result.dryRun ? 'Dry run: Would purge PII' : 'Purged PII from invoice');
+              reason: lockOutcome.reason,
+            }, 'Skipping invoice already being processed by another worker');
+            continue;
           }
         } catch (error) {
           const errorInfo = {
@@ -415,6 +526,10 @@ function scheduleRetentionPurge(options) {
     batchSize = 100,
     delayMs = 0
   } = options;
+
+  if (piiFields) {
+    validatePiiFields(piiFields);
+  }
 
   const payload = {
     tenantId,
@@ -509,6 +624,10 @@ module.exports = {
   getEligibleInvoices,
   purgeInvoicePii,
   logRetentionOperation,
+  createJobExecution,
+  updateJobExecution,
+  hashPiiValue,
+  buildPiiBeforeStateSnapshot,
   jobExecutions,
   retentionQueue,
   retentionWorker

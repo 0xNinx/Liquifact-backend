@@ -17,6 +17,10 @@
 const { createCacheStore } = require('./cacheStore');
 const { callSorobanContract } = require('./soroban');
 const logger = require('../logger');
+const {
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+} = require('../utils/validators');
 
 /**
  * Default TTL for token metadata cache in milliseconds (30 minutes).
@@ -40,25 +44,19 @@ const MAX_CACHE_SIZE = 10000;
 const tokenCache = createCacheStore();
 
 /**
+ * Tracks in-flight metadata fetches so concurrent requests for the same token
+ * share a single promise instead of issuing duplicate RPC calls.
+ *
+ * @type {Map<string, Promise<Object>>}
+ */
+const inFlightRequests = new Map();
+
+/**
  * Asset code pattern validation (1-12 alphanumeric characters).
  *
  * @constant {RegExp}
  */
 const ASSET_CODE_PATTERN = /^[A-Z0-9]{1,12}$/;
-
-/**
- * Stellar public key pattern (G...).
- *
- * @constant {RegExp}
- */
-const STELLAR_PUBLIC_KEY_PATTERN = /^G[A-Z2-7]{55}$/;
-
-/**
- * Soroban contract ID pattern (C...).
- *
- * @constant {RegExp}
- */
-const SOROBAN_CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
 
 /**
  * Generates a cache key for a token asset.
@@ -123,7 +121,7 @@ function validateAsset(asset) {
     if (typeof contractId !== 'string') {
       return { valid: false, reason: 'Contract ID must be a string' };
     }
-    if (!SOROBAN_CONTRACT_ID_PATTERN.test(contractId)) {
+    if (!isValidStellarContractAddress(contractId)) {
       return { valid: false, reason: 'Invalid Soroban contract ID format' };
     }
     if (issuer !== null && issuer !== undefined) {
@@ -137,7 +135,7 @@ function validateAsset(asset) {
     if (typeof issuer !== 'string') {
       return { valid: false, reason: 'Issuer must be a string' };
     }
-    if (!STELLAR_PUBLIC_KEY_PATTERN.test(issuer)) {
+    if (!isValidStellarAccountAddress(issuer)) {
       return { valid: false, reason: 'Invalid Stellar public key format for issuer' };
     }
   } else {
@@ -151,10 +149,10 @@ function validateAsset(asset) {
  * Fetches token metadata from Stellar Horizon for traditional assets.
  *
  * @param {string} code - Asset code.
- * @param {string} issuer - Asset issuer public key.
+ * @param {string} _issuer - Asset issuer public key.
  * @returns {Promise<Object>} Token metadata.
  */
-async function fetchFromHorizon(code, issuer) {
+async function fetchFromHorizon(code, _issuer) {
   // TODO: Replace with actual Horizon API call
   // const response = await fetch(`${HORIZON_URL}/assets?asset_code=${code}&asset_issuer=${issuer}`);
   // const data = await response.json();
@@ -275,32 +273,48 @@ async function getTokenMetadata(asset, options = {}) {
     }
   }
 
-  // Fetch from appropriate source
-  let metadata;
-  
-  if (asset.code === 'native' || asset.code === 'XLM') {
-    metadata = await fetchNativeMetadata();
-  } else if (asset.contractId) {
-    metadata = await fetchFromSoroban(asset.contractId);
-  } else {
-    metadata = await fetchFromHorizon(asset.code, asset.issuer);
+  // Check in-flight requests for single-flight deduplication
+  const inFlight = inFlightRequests.get(cacheKey);
+  if (inFlight) {
+    logger.debug({ cacheKey, asset }, 'tokenMeta: Joined in-flight request');
+    return inFlight;
   }
 
-  // Add cache timestamp
-  metadata.cachedAt = Date.now();
+  const fetchPromise = (async () => {
+    let metadata;
+    try {
+      // Fetch from appropriate source
+      if (asset.code === 'native' || asset.code === 'XLM') {
+        metadata = await fetchNativeMetadata();
+      } else if (asset.contractId) {
+        metadata = await fetchFromSoroban(asset.contractId);
+      } else {
+        metadata = await fetchFromHorizon(asset.code, asset.issuer);
+      }
 
-  // Store in cache
-  try {
-    tokenCache.set(cacheKey, metadata, ttlMs);
-    logger.debug({ cacheKey, asset, ttlMs }, 'tokenMeta: Cached metadata');
-  } catch (error) {
-    logger.warn(
-      { cacheKey, error: error.message },
-      'tokenMeta: Failed to cache metadata (cache may be full)',
-    );
-  }
+      // Add cache timestamp
+      metadata.cachedAt = Date.now();
 
-  return metadata;
+      // Store in cache
+      try {
+        tokenCache.set(cacheKey, metadata, ttlMs);
+        logger.debug({ cacheKey, asset, ttlMs }, 'tokenMeta: Cached metadata');
+      } catch (error) {
+        logger.warn(
+          { cacheKey, error: error.message },
+          'tokenMeta: Failed to cache metadata (cache may be full)',
+        );
+      }
+
+      return metadata;
+    } finally {
+      // Always remove from in-flight tracker when done
+      inFlightRequests.delete(cacheKey);
+    }
+  })();
+
+  inFlightRequests.set(cacheKey, fetchPromise);
+  return fetchPromise;
 }
 
 /**
@@ -370,6 +384,83 @@ async function getFreshTokenMetadata(asset) {
 }
 
 /**
+ * Resolves token metadata for many assets with input deduplication and
+ * single-flight protection.
+ *
+ * The resolver deduplicates identical assets by cache key, returns cache hits
+ * immediately, and uses a bounded worker pool to limit RPC fan-out.
+ * Concurrent misses for the same token reuse the existing in-flight promise
+ * tracking in getTokenMetadata.
+ *
+ * @description Resolves metadata for a batched set of assets while preserving
+ * the existing TTL/invalidation semantics and guarding against stampedes.
+ * @param {Array<Object>} assets - Array of asset descriptors.
+ * @param {Object} [options] - Optional configuration.
+ * @param {number} [options.ttlMs] - Cache TTL in milliseconds.
+ * @param {boolean} [options.skipCache] - Skip cache and force fresh fetch.
+ * @param {number} [options.concurrency] - Maximum concurrent metadata fetches.
+ * @returns {Promise<Array<Object>>} Array of token metadata in the same order as input.
+ */
+async function resolveMany(assets, options = {}) {
+  const {
+    ttlMs = DEFAULT_CACHE_TTL_MS,
+    skipCache = false,
+    concurrency = 5,
+  } = options;
+
+  if (!Array.isArray(assets)) {
+    throw new TypeError('assets must be an array');
+  }
+
+  if (assets.length === 0) {
+    return [];
+  }
+
+  const uniqueAssets = [];
+  const seenCacheKeys = new Set();
+
+  for (const asset of assets) {
+    const validation = validateAsset(asset);
+    if (!validation.valid) {
+      const error = new Error(validation.reason);
+      error.code = 'INVALID_ASSET';
+      error.status = 400;
+      throw error;
+    }
+
+    const cacheKey = generateCacheKey(asset);
+    if (!seenCacheKeys.has(cacheKey)) {
+      seenCacheKeys.add(cacheKey);
+      uniqueAssets.push(asset);
+    }
+  }
+
+  const resolvedByCacheKey = new Map();
+  const workerCount = Math.max(1, Math.min(concurrency, uniqueAssets.length));
+  let nextIndex = 0;
+
+  /**
+   * Processes a subset of the pending asset work queue.
+   *
+   * @returns {Promise<void>}
+   */
+  async function worker() {
+    while (nextIndex < uniqueAssets.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      const asset = uniqueAssets[currentIndex];
+      const cacheKey = generateCacheKey(asset);
+      const metadata = await getTokenMetadata(asset, { ttlMs, skipCache });
+      resolvedByCacheKey.set(cacheKey, metadata);
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  return assets.map(asset => resolvedByCacheKey.get(generateCacheKey(asset)));
+}
+
+/**
  * Batch fetches token metadata for multiple assets.
  *
  * Fetches metadata concurrently for better performance. Uses cache where
@@ -386,14 +477,15 @@ async function batchGetTokenMetadata(assets, options = {}) {
 }
 
 module.exports = {
+  DEFAULT_CACHE_TTL_MS,
+  MAX_CACHE_SIZE,
+  generateCacheKey,
+  validateAsset,
   getTokenMetadata,
-  getFreshTokenMetadata,
-  batchGetTokenMetadata,
   invalidateTokenMetadata,
   clearTokenCache,
   getCacheStats,
-  validateAsset,
-  generateCacheKey,
-  DEFAULT_CACHE_TTL_MS,
-  MAX_CACHE_SIZE,
+  getFreshTokenMetadata,
+  batchGetTokenMetadata,
+  resolveMany,
 };

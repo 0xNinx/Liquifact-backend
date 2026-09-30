@@ -2,7 +2,14 @@
  * Tests for centralized config module.
  */
 
-const { validate, ConfigSchema } = require('./index');
+const {
+  validate,
+  get,
+  getValue,
+  getInvoiceFileMaxSize,
+  logRedactedSummary,
+  ConfigSchema,
+} = require('./index');
 
 describe('Config Validation', () => {
   const originalEnv = { ...process.env };
@@ -25,16 +32,29 @@ describe('Config Validation', () => {
     expect(config.NODE_ENV).toBe('development');
     expect(config.PORT).toBe(3001);
     expect(config.JWT_SECRET).toBe(process.env.JWT_SECRET);
+    // JWT_ISSUER/JWT_AUDIENCE are optional with no default — enforcement in
+    // src/middleware/auth.js is conditional on these being explicitly set.
+    expect(config.JWT_ISSUER).toBeUndefined();
+    expect(config.JWT_AUDIENCE).toBeUndefined();
+    expect(config.JWT_ALGORITHMS).toBe('HS256');
   });
 
   test('overrides defaults', () => {
     process.env.PORT = '8080';
     process.env.NODE_ENV = 'production';
     process.env.JWT_SECRET = 'prod-secret-32-chars-minimum-required';
+    process.env.JWT_ISSUER = 'custom-issuer';
+    process.env.JWT_AUDIENCE = 'custom-audience';
+    process.env.JWT_ALGORITHMS = 'HS256,HS384';
+    // Required in production by the PUBLIC_API_BASE_URL superRefine rule.
+    process.env.PUBLIC_API_BASE_URL = 'https://api.example.com';
 
     const config = validate();
     expect(config.PORT).toBe(8080);
     expect(config.NODE_ENV).toBe('production');
+    expect(config.JWT_ISSUER).toBe('custom-issuer');
+    expect(config.JWT_AUDIENCE).toBe('custom-audience');
+    expect(config.JWT_ALGORITHMS).toBe('HS256,HS384');
   });
 
   test('rejects short JWT_SECRET', () => {
@@ -49,7 +69,131 @@ describe('Config Validation', () => {
 
   test('rejects invalid NODE_ENV', () => {
     process.env.NODE_ENV = 'invalid';
-    expect(() => validate()).toThrow(/Enum/i);
+    expect(() => validate()).toThrow(/invalid/i);
+  });
+
+  test('logRedactedSummary output does not contain secrets', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    
+    process.env.JWT_SECRET = 'short';
+    process.env.KYC_PROVIDER_API_KEY = 'some-secret-key-1234';
+
+    let caughtError;
+    try {
+      validate();
+    } catch (e) {
+      caughtError = e;
+    }
+
+    expect(caughtError).toBeDefined();
+    logRedactedSummary(caughtError);
+
+    const loggedOutput = consoleSpy.mock.calls.map(args => args.join(' ')).join('\n');
+    expect(loggedOutput).toContain('JWT_SECRET');
+    expect(loggedOutput).not.toContain('some-secret-key-1234');
+    expect(loggedOutput).not.toContain('short');
+
+    consoleSpy.mockRestore();
+  });
+
+  test('boot validation gate exits on invalid config', () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = 'short-secret';
+      
+      const { startServer } = require('../index');
+      startServer();
+      
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    exitSpy.mockRestore();
+    consoleSpy.mockRestore();
+  });
+
+  test('boot validation gate does not exit on valid config', () => {
+    const exitSpy = jest.spyOn(process, 'exit').mockImplementation(() => {});
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    
+    jest.isolateModules(() => {
+      const app = require('../app');
+      const listenSpy = jest.spyOn(app, 'listen').mockImplementation(() => ({}));
+
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+      // Required in production by the PUBLIC_API_BASE_URL superRefine rule.
+      process.env.PUBLIC_API_BASE_URL = 'https://api.example.com';
+
+      const { startServer } = require('../index');
+      startServer();
+
+      expect(exitSpy).not.toHaveBeenCalled();
+      listenSpy.mockRestore();
+    });
+
+    exitSpy.mockRestore();
+    consoleSpy.mockRestore();
+  });
+
+  test('rejects half-set KYC configuration in non-test env', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+    
+    process.env.KYC_PROVIDER_URL = 'https://kyc.example.com';
+    delete process.env.KYC_PROVIDER_API_KEY;
+    expect(() => validate()).toThrow(/KYC_PROVIDER_API_KEY/i);
+
+    delete process.env.KYC_PROVIDER_URL;
+    process.env.KYC_PROVIDER_API_KEY = 'some-key';
+    expect(() => validate()).toThrow(/KYC_PROVIDER_URL/i);
+  });
+
+  test('rejects missing PUBLIC_API_BASE_URL in production', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+    delete process.env.PUBLIC_API_BASE_URL;
+
+    expect(() => validate()).toThrow(/PUBLIC_API_BASE_URL must be set in production/i);
+  });
+
+  test('rejects non-HTTPS PUBLIC_API_BASE_URL in production', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+    process.env.PUBLIC_API_BASE_URL = 'http://api.example.com';
+
+    expect(() => validate()).toThrow(/must use HTTPS/i);
+  });
+
+  test('rejects loopback PUBLIC_API_BASE_URL in production', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+    process.env.PUBLIC_API_BASE_URL = 'https://localhost:3001';
+
+    expect(() => validate()).toThrow(/must not be a loopback address/i);
+  });
+
+  test('accepts a valid HTTPS non-loopback PUBLIC_API_BASE_URL in production', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+    process.env.PUBLIC_API_BASE_URL = 'https://api.liquifact.com';
+
+    const config = validate();
+    expect(config.PUBLIC_API_BASE_URL).toBe('https://api.liquifact.com');
+  });
+
+  test('allows half-set KYC configuration in test env', () => {
+    process.env.NODE_ENV = 'test';
+    process.env.JWT_SECRET = 'valid-secret-at-least-32-chars-long-here';
+    
+    process.env.KYC_PROVIDER_URL = 'https://kyc.example.com';
+    delete process.env.KYC_PROVIDER_API_KEY;
+    
+    const config = validate();
+    expect(config.KYC_PROVIDER_URL).toBe('https://kyc.example.com');
+    expect(config.KYC_PROVIDER_API_KEY).toBeUndefined();
   });
 
   test('get() throws if not validated', () => {
@@ -66,6 +210,119 @@ describe('Config Validation', () => {
       JWT_SECRET: '0123456789abcdef0123456789abcdef',
     });
     expect(result).toMatchObject({ NODE_ENV: 'test', PORT: 3001 });
+  });
+
+  // ── ESCROW_READ_PROJECTION_ENABLED flag ──────────────────────────────────
+
+  test('ESCROW_READ_PROJECTION_ENABLED defaults to "true"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    const config = validate();
+    expect(config.ESCROW_READ_PROJECTION_ENABLED).toBe('true');
+  });
+
+  test('ESCROW_READ_PROJECTION_ENABLED accepts "false"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.ESCROW_READ_PROJECTION_ENABLED = 'false';
+    const config = validate();
+    expect(config.ESCROW_READ_PROJECTION_ENABLED).toBe('false');
+  });
+
+  test('ESCROW_READ_PROJECTION_ENABLED rejects invalid value', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.ESCROW_READ_PROJECTION_ENABLED = 'invalid';
+    expect(() => validate()).toThrow();
+  });
+
+  // ── ESCROW_INDEXER_ENABLED flag ─────────────────────────────────────────
+
+  test('ESCROW_INDEXER_ENABLED defaults to "false" (safe default)', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    const config = validate();
+    expect(config.ESCROW_INDEXER_ENABLED).toBe('false');
+  });
+
+  test('ESCROW_INDEXER_ENABLED accepts "true"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.ESCROW_INDEXER_ENABLED = 'true';
+    const config = validate();
+    expect(config.ESCROW_INDEXER_ENABLED).toBe('true');
+  });
+
+  test('ESCROW_INDEXER_ENABLED accepts "false"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.ESCROW_INDEXER_ENABLED = 'false';
+    const config = validate();
+    expect(config.ESCROW_INDEXER_ENABLED).toBe('false');
+  });
+
+  test('ESCROW_INDEXER_ENABLED rejects invalid value', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.ESCROW_INDEXER_ENABLED = 'yes';
+    expect(() => validate()).toThrow();
+  });
+
+  // ── CONFIG_RUNTIME_ENABLED flag ──────────────────────────────────────────
+
+  test('CONFIG_RUNTIME_ENABLED defaults to "true" (safe default — surface enabled)', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    const config = validate();
+    expect(config.CONFIG_RUNTIME_ENABLED).toBe('true');
+  });
+
+  test('CONFIG_RUNTIME_ENABLED accepts "true"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.CONFIG_RUNTIME_ENABLED = 'true';
+    const config = validate();
+    expect(config.CONFIG_RUNTIME_ENABLED).toBe('true');
+  });
+
+  test('CONFIG_RUNTIME_ENABLED accepts "false" (disables /api/admin/config routes)', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.CONFIG_RUNTIME_ENABLED = 'false';
+    const config = validate();
+    expect(config.CONFIG_RUNTIME_ENABLED).toBe('false');
+  });
+
+  test('CONFIG_RUNTIME_ENABLED rejects truthy-but-not-"true" values', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    for (const val of ['1', 'yes', 'TRUE', 'enabled', 'on']) {
+      process.env.CONFIG_RUNTIME_ENABLED = val;
+      expect(() => validate()).toThrow();
+    }
+  });
+
+  test('CONFIG_RUNTIME_ENABLED rejects invalid value', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.CONFIG_RUNTIME_ENABLED = 'invalid';
+    expect(() => validate()).toThrow();
+  });
+
+  // ── INVOICE_STATE_ENABLED flag ───────────────────────────────────────────
+
+  test('INVOICE_STATE_ENABLED defaults to "true" (safe default — routes enabled)', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    const config = validate();
+    expect(config.INVOICE_STATE_ENABLED).toBe('true');
+  });
+
+  test('INVOICE_STATE_ENABLED accepts "true"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.INVOICE_STATE_ENABLED = 'true';
+    const config = validate();
+    expect(config.INVOICE_STATE_ENABLED).toBe('true');
+  });
+
+  test('INVOICE_STATE_ENABLED accepts "false"', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.INVOICE_STATE_ENABLED = 'false';
+    const config = validate();
+    expect(config.INVOICE_STATE_ENABLED).toBe('false');
+  });
+
+  test('INVOICE_STATE_ENABLED rejects invalid value', () => {
+    process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
+    process.env.INVOICE_STATE_ENABLED = 'yes';
+    expect(() => validate()).toThrow();
   });
 });
 

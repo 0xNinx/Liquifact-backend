@@ -2,6 +2,12 @@
 
 const { v4: uuidv4 } = require('uuid');
 
+// Distributed per-invoice lock (issue #1213) — mocked to a pass-through so
+// this suite's assertions about purge/audit behavior aren't gated on a real
+// or fake Redis connection. Lock-contention behavior itself is covered by
+// tests/redisLock.test.js and tests/retentionPurge.lock.test.js.
+jest.mock('../src/services/redisLock');
+
 // Mock database with comprehensive coverage
 jest.mock('../src/db/knex', () => {
   const mockQuery = {
@@ -16,20 +22,62 @@ jest.mock('../src/db/knex', () => {
     del: jest.fn().mockResolvedValue(1),
     select: jest.fn().mockResolvedValue([]),
     insert: jest.fn().mockReturnThis(),
-    update: jest.fn().mockReturnThis(),
+    update: jest.fn().mockResolvedValue(1),
     first: jest.fn().mockResolvedValue(null),
     andWhere: jest.fn().mockReturnThis(),
     orWhere: jest.fn().mockReturnThis(),
     returning: jest.fn().mockReturnThis(),
+    then: jest.fn(function(resolve, reject) {
+      return Promise.resolve([]).then(resolve, reject);
+    })
   };
 
-  // Make the chain resolve properly
-  mockQuery.insert.mockResolvedValue([{ id: 'test-id', created_at: new Date() }]);
-  mockQuery.update.mockResolvedValue(1);
-  mockQuery.returning.mockResolvedValue([{ id: 'test-id', created_at: new Date() }]);
-  mockQuery.select.mockResolvedValue([]);
+  const underlyingMock = jest.fn(() => mockQuery);
 
-  const db = jest.fn(() => mockQuery);
+  const db = new Proxy(underlyingMock, {
+    apply(target, thisArg, argumentsList) {
+      const result = target.apply(thisArg, argumentsList);
+      if (result && typeof result === 'object' && typeof result.then !== 'function') {
+        if (!result.where) result.where = jest.fn().mockReturnThis();
+        if (!result.whereNotIn) result.whereNotIn = jest.fn().mockReturnThis();
+        if (!result.whereNull) result.whereNull = jest.fn().mockReturnThis();
+        if (!result.whereIn) result.whereIn = jest.fn().mockReturnThis();
+        if (!result.andWhere) result.andWhere = jest.fn().mockReturnThis();
+        if (!result.orWhere) result.orWhere = jest.fn().mockReturnThis();
+        if (!result.limit) result.limit = jest.fn().mockReturnThis();
+        if (!result.orderBy) result.orderBy = jest.fn().mockReturnThis();
+        if (!result.returning) result.returning = jest.fn().mockReturnThis();
+        if (!result.insert) result.insert = jest.fn().mockReturnThis();
+        if (!result.update) result.update = jest.fn().mockResolvedValue(1);
+        if (!result.first) {
+          result.first = jest.fn(function() {
+            result._isFirst = true;
+            return this;
+          });
+        }
+        if (!result.select) result.select = jest.fn().mockResolvedValue([]);
+        
+        result.then = jest.fn(function(resolve, reject) {
+          if (result._isFirst) {
+            if (result.select && typeof result.select.mock === 'object') {
+              return result.select().then(res => {
+                resolve(Array.isArray(res) ? res[0] : res);
+              }, reject);
+            }
+          }
+          if (result.select && typeof result.select.mock === 'object') {
+            return result.select().then(resolve, reject);
+          }
+          if (result.first && typeof result.first.mock === 'object') {
+            return result.first().then(resolve, reject);
+          }
+          return Promise.resolve([]).then(resolve, reject);
+        });
+      }
+      return result;
+    }
+  });
+
   db.raw = jest.fn();
   return db;
 });
@@ -49,6 +97,7 @@ describe('Retention System - Integration Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     // Start retention worker for tests
+    retentionJob.retentionWorker.pollIntervalMs = 10;
     retentionJob.startQueueProcessing();
   });
 
@@ -130,9 +179,9 @@ describe('Retention System - Integration Tests', () => {
 
       // Schedule and execute job
       const jobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: false,
-        performedBy: 'test-user-id',
+        performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12',
         batchSize: 100
       });
 
@@ -209,9 +258,9 @@ describe('Retention System - Integration Tests', () => {
       });
 
       const jobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: true,
-        performedBy: 'test-user-id'
+        performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
       });
 
       expect(jobId).toBeDefined();
@@ -279,9 +328,9 @@ describe('Retention System - Integration Tests', () => {
       });
 
       const jobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: false,
-        performedBy: 'test-user-id'
+        performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
       });
 
       expect(jobId).toBeDefined();
@@ -346,9 +395,9 @@ describe('Retention System - Integration Tests', () => {
       });
 
       const jobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: false,
-        performedBy: 'test-user-id'
+        performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
       });
 
       expect(jobId).toBeDefined();
@@ -386,10 +435,10 @@ describe('Retention System - Integration Tests', () => {
       });
 
       const jobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
-        policyId: 'non-existent-policy',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+        policyId: 'c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a13',
         dryRun: false,
-        performedBy: 'test-user-id'
+        performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
       });
 
       expect(jobId).toBeDefined();
@@ -403,9 +452,9 @@ describe('Retention System - Integration Tests', () => {
       }));
 
       const jobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: false,
-        performedBy: 'test-user-id'
+        performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
       });
 
       expect(jobId).toBeDefined();
@@ -423,12 +472,12 @@ describe('Retention System - Integration Tests', () => {
 
     test('should handle job cancellation', () => {
       const jobId1 = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: true
       });
 
       const jobId2 = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         dryRun: true
       });
 
@@ -461,10 +510,10 @@ describe('Retention System - Integration Tests', () => {
 
       for (const piiFields of piiFieldCombinations) {
         const jobId = retentionJob.scheduleRetentionPurge({
-          tenantId: 'test-tenant-id',
+          tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
           piiFields,
           dryRun: true,
-          performedBy: 'test-user-id'
+          performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
         });
 
         expect(jobId).toBeDefined();
@@ -477,7 +526,7 @@ describe('Retention System - Integration Tests', () => {
     test('should validate PII fields in job scheduling', () => {
       expect(() => {
         retentionJob.scheduleRetentionPurge({
-          tenantId: 'test-tenant-id',
+          tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
           piiFields: ['invalid_field'],
           dryRun: true
         });
@@ -491,10 +540,10 @@ describe('Retention System - Integration Tests', () => {
 
       for (const batchSize of batchSizes) {
         const jobId = retentionJob.scheduleRetentionPurge({
-          tenantId: 'test-tenant-id',
+          tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
           batchSize,
           dryRun: true,
-          performedBy: 'test-user-id'
+          performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
         });
 
         expect(jobId).toBeDefined();
@@ -507,7 +556,7 @@ describe('Retention System - Integration Tests', () => {
     test('should handle batch size limits', () => {
       // Test maximum batch size
       const maxJobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         batchSize: 1000,
         dryRun: true
       });
@@ -516,7 +565,7 @@ describe('Retention System - Integration Tests', () => {
 
       // Test batch size exceeding maximum (should be capped)
       const overLimitJobId = retentionJob.scheduleRetentionPurge({
-        tenantId: 'test-tenant-id',
+        tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
         batchSize: 2000, // Exceeds max
         dryRun: true
       });
@@ -531,10 +580,10 @@ describe('Retention System - Integration Tests', () => {
 
       for (const retentionDays of retentionPeriods) {
         const jobId = retentionJob.scheduleRetentionPurge({
-          tenantId: 'test-tenant-id',
+          tenantId: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
           retentionDays,
           dryRun: true,
-          performedBy: 'test-user-id'
+          performedBy: 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'
         });
 
         expect(jobId).toBeDefined();

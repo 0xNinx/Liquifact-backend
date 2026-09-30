@@ -2,6 +2,7 @@
 
 const {
   resolveEscrowAddress,
+  resolveInvoiceByAddress,
   EscrowNotFoundError,
   EscrowMapConfigError,
   _resetCache,
@@ -154,6 +155,21 @@ describe('escrowMap – resolveEscrowAddress', () => {
       defaultEnvironment: 'production',
       allowlistEnabled: false,
     });
+
+    expect(resolveEscrowAddress('inv_001')).toBe(ADDR_A);
+    process.env.NODE_ENV = originalNodeEnv;
+  });
+
+  it('falls back to the "development" environment when defaultEnvironment is omitted entirely', () => {
+    delete process.env.NODE_ENV;
+    process.env.ESCROW_ADDR_BY_INVOICE = JSON.stringify({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'development', isActive: true },
+      ],
+      allowlistEnabled: false,
+      // defaultEnvironment intentionally omitted
+    });
+    _resetCache();
 
     expect(resolveEscrowAddress('inv_001')).toBe(ADDR_A);
     process.env.NODE_ENV = originalNodeEnv;
@@ -347,6 +363,32 @@ describe('escrowMap – module-level cache', () => {
     expect(second).toBe(ADDR_A); // still cached
   });
 
+  it('rebuilds on every call when cacheEnabled is false, without waiting for TTL or calling _resetCache()', () => {
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: false,
+      cacheEnabled: false,
+    });
+
+    expect(resolveEscrowAddress('inv_001')).toBe(ADDR_A);
+
+    // Swap env directly — no _resetCache() call. With cacheEnabled: false,
+    // _getConfig() must re-parse on every call regardless of cacheTtlSeconds.
+    process.env.ESCROW_ADDR_BY_INVOICE = JSON.stringify({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_B, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: false,
+      cacheEnabled: false,
+    });
+
+    expect(resolveEscrowAddress('inv_001')).toBe(ADDR_B);
+  });
+
   it('picks up the new config after _resetCache()', () => {
     setConfig({
       mappings: [
@@ -386,5 +428,150 @@ describe('escrowMap – module-level cache', () => {
     _resetCache();
 
     expect(() => resolveEscrowAddress('inv_001')).toThrow(EscrowMapConfigError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('escrowMap – resolveInvoiceByAddress (reverse lookup)', () => {
+  const originalNodeEnv = process.env.NODE_ENV;
+
+  beforeEach(() => {
+    clearConfig();
+    process.env.NODE_ENV = 'test';
+  });
+
+  afterEach(() => {
+    clearConfig();
+    process.env.NODE_ENV = originalNodeEnv;
+    jest.useRealTimers();
+  });
+
+  it('resolves a known active contract address to its invoiceId', () => {
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: true,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_A)).toBe('inv_001');
+  });
+
+  it('returns null for an unknown contract address (allowlist-disabled address)', () => {
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: true,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_B)).toBeNull();
+  });
+
+  it('returns null when ESCROW_ADDR_BY_INVOICE is not set', () => {
+    expect(resolveInvoiceByAddress(ADDR_A)).toBeNull();
+  });
+
+  it('returns null for inactive mapping addresses', () => {
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: false },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: false,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_A)).toBeNull();
+  });
+
+  it('returns null when mapping exists for a different environment', () => {
+    process.env.NODE_ENV = 'production';
+    _resetCache();
+
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'production',
+      allowlistEnabled: false,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_A)).toBeNull();
+  });
+
+  it('resolves only the mapping for the current environment', () => {
+    process.env.NODE_ENV = 'production';
+    _resetCache();
+
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_test', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+        { invoiceId: 'inv_prod', escrowAddress: ADDR_B, environment: 'production', isActive: true },
+      ],
+      defaultEnvironment: 'production',
+      allowlistEnabled: true,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_A)).toBeNull();
+    expect(resolveInvoiceByAddress(ADDR_B)).toBe('inv_prod');
+  });
+
+  it('returns null for malformed contract addresses', () => {
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: false,
+    });
+
+    expect(resolveInvoiceByAddress('not-a-stellar-address')).toBeNull();
+    expect(resolveInvoiceByAddress('')).toBeNull();
+    expect(resolveInvoiceByAddress(null)).toBeNull();
+  });
+
+  it('does not fabricate invoice IDs for unmapped contracts when allowlistEnabled is false', () => {
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: false,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_B)).toBeNull();
+  });
+
+  it('refreshes reverse index after cache TTL expires', () => {
+    jest.useFakeTimers();
+
+    setConfig({
+      mappings: [
+        { invoiceId: 'inv_001', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: true,
+      cacheEnabled: true,
+      cacheTtlSeconds: 60,
+    });
+
+    expect(resolveInvoiceByAddress(ADDR_A)).toBe('inv_001');
+
+    process.env.ESCROW_ADDR_BY_INVOICE = JSON.stringify({
+      mappings: [
+        { invoiceId: 'inv_002', escrowAddress: ADDR_A, environment: 'test', isActive: true },
+      ],
+      defaultEnvironment: 'test',
+      allowlistEnabled: true,
+      cacheEnabled: true,
+      cacheTtlSeconds: 60,
+    });
+
+    jest.advanceTimersByTime(61_000);
+
+    expect(resolveInvoiceByAddress(ADDR_A)).toBe('inv_002');
   });
 });

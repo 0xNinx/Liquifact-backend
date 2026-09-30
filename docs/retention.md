@@ -36,7 +36,7 @@ The LiquiFact data retention system provides automated PII (Personally Identifia
 - `invoice_id` - Reference to affected invoice
 - `operation` - Type of operation performed
 - `pii_fields` - PII fields affected
-- `old_values` - Original PII values before purging
+- `old_values` - For destructive purges, salted SHA-256 hashes of non-null original PII values keyed by field name; dry-run behavior is unchanged
 - `performed_by` - User who initiated the operation
 
 #### Job Executions (`retention_job_executions`)
@@ -69,15 +69,56 @@ The system currently supports purging the following PII fields from invoices:
 
 ### Audit Trail
 - Every retention operation is logged with complete context
-- Captures original PII values before purging
-- Tracks who performed the operation and when
+- Captures a minimal hashed before-state for destructive purges: field names, salted hashes of non-null prior values, and counts in metadata
+- Tracks who performed the operation and the policy id that authorized the purge
 - Immutable audit records for compliance
+
+#### Destructive purge before-state snapshots
+
+Non-dry-run purges write one `retention_audit_log` row per invoice that is actually purged. To support forensic audit without re-storing PII, the row includes:
+
+- `pii_fields` with the field names selected for purge.
+- `old_values` with only salted SHA-256 hashes for fields that had non-null values before deletion.
+- `performed_by` for the actor that scheduled or initiated the job.
+- `metadata.policyId` for the retention policy used.
+- `metadata.beforeStateSnapshot` with field names plus field/hash counts.
+
+The snapshot never stores clear-text PII. Dry-run logging and `retention_job_executions` records remain unchanged. Legal holds are checked during eligibility selection and re-checked immediately before each invoice purge.
+
+#### Policy and legal-hold mutations (`audit_log_events`)
+
+In addition to purge execution records in `retention_audit_log`, every retention **policy create/update** and **legal-hold create/release** emits an append-only event to `audit_log_events` via `src/services/auditLogStore.js`. Each event captures:
+
+| Field | Description |
+| --- | --- |
+| `actor` | Admin JWT subject or API client ID |
+| `tenantId` | Tenant scope (stored in JSON metadata for export filtering) |
+| `target_id` | Policy UUID or legal-hold UUID |
+| `before` / `after` | Redacted snapshots of the mutated record (release includes full hold trace) |
+
+Event actions:
+
+- `retention.policy.create`
+- `retention.policy.update`
+- `retention.legal_hold.create`
+- `retention.legal_hold.release`
+
+Audit persistence failures are logged server-side but do **not** roll back the primary mutation. Sensitive metadata keys (`password`, `token`, `secret`, `apiKey`, etc.) are redacted before write, consistent with admin audit events.
 
 ### Dry Run Mode
 - Safe simulation without data modification
 - Validates eligibility and legal hold status
 - Provides detailed preview of what would be purged
 - Essential for compliance validation
+
+### Forensic Audit Snapshots
+- For destructive (non-dry-run) purges, the before-state of purged PII values is captured as salted SHA-256 hashes inside `old_values`.
+- Prevents storing clear-text PII in audit logs while still providing a provable forensic record of what was redacted.
+- Hashing details:
+  - Algorithm: SHA-256
+  - Local Salt: Invoice UUID (prevents cross-invoice rainbow table attacks)
+  - Global Salt: System `JWT_SECRET` (prevents dictionary attacks if database is compromised)
+  - Computation: `sha256(invoiceId + ":" + JWT_SECRET + ":" + clearTextValue)`
 
 ## Usage Examples
 
@@ -495,3 +536,9 @@ psql $DATABASE_URL -c "\dt retention_*"
 - Security Team: security@liquifact.com  
 - Legal Compliance: legal@liquifact.com
 - Engineering Lead: eng@liquifact.com
+
+## Concurrency Control & Security
+Legal hold creation is now protected by a partial unique index (`unique_active_legal_hold_per_invoice`). 
+- This enforces at-most-one active hold per invoice at the database level.
+- Concurrent requests that attempt to create duplicate holds will be rejected by PostgreSQL with a `SequelizeUniqueConstraintError`.
+- The application layer maps this to a `409 Conflict` response.

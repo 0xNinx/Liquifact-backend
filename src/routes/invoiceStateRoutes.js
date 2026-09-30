@@ -1,43 +1,71 @@
-/**
- * Invoice State Transition Routes
- * Handles invoice lifecycle state transitions with audit logging.
- *
- * Capital-movement routes are protected by the KYC gate:
- *   - POST /:id/link-escrow   — initiates escrow funding lifecycle
- *   - POST /:id/transition     — when targetState is 'funded' or 'settled'
- *
- * @module routes/invoiceStateRoutes
- */
+'use strict';
 
 const express = require('express');
 const router = express.Router();
-const {
-  INVOICE_STATES,
-  executeTransition,
-  getAllowedTransitions,
-  getTransitionHistory,
-  canLinkToEscrow,
-} = require('../services/invoiceStateMachine');
-const { getAuditLogs } = require('../services/auditLog');
-const { requireKycForFunding } = require('../middleware/kycGating');
+const invoiceStateService = require('../services/invoiceStateService');
+const { extractTenant } = require('../middleware/tenant');
+const { createCompressionMiddleware } = require('../middleware/compression');
+const { invoiceStateErrorHandler } = require('../middleware/invoiceStateErrorHandler');
+const { requireKycForFunding, auditKycAccess } = require('../middleware/kycGating');
+const { instrumentInvoiceState } = require('../middleware/invoiceStateMetrics');
+const responseHelper = require('../utils/responseHelper');
+const { cacheResponse, makeInvoiceStateKey } = require('../middleware/cache');
+const { getSharedStore } = require('../services/cacheStore');
+const { cacheConfig } = require('../config/cache');
+const { invoiceStateCacheEvictionsTotal } = require('../metrics');
+
+router.use(extractTenant);
+
+// Compress invoice-state responses above the default 1 KB threshold.
+// Respects Accept-Encoding (gzip preferred over deflate); small responses
+// are always sent as plain JSON regardless of the client's encoding preference.
+router.use(createCompressionMiddleware());
+
+// Per-client (API key / IP) rate limit on the invoice-state endpoints (#739).
+const { invoiceStateLimiter } = require('../middleware/rateLimit');
+router.use(invoiceStateLimiter);
+
+// Response cache for GET /:id/state — bounded, config-driven TTL (#21).
+const cacheState = cacheResponse({
+  ttl: cacheConfig.invoiceStateTtl,
+  store: getSharedStore(),
+  keyFn: makeInvoiceStateKey,
+});
 
 /**
- * States that initiate or settle capital movement and therefore require
- * the caller to be KYC-verified before transitioning to them.
+ * Invalidates the cached state for a given invoice.
+ *
+ * Deletes the cache entry so subsequent reads fetch fresh data.
+ * The eviction is recorded on the invoiceStateCacheEvictionsTotal
+ * counter with reason="invalidation".
+ *
+ * @param {string} tenantId - Tenant identifier.
+ * @param {string} invoiceId - Invoice identifier.
+ * @returns {void}
  */
-const CAPITAL_MOVING_STATES = new Set([
-  'funded',
-  'settled',
-  INVOICE_STATES.FUNDED,
-  INVOICE_STATES.SETTLED,
-].filter(Boolean));
+function invalidateInvoiceStateCache(tenantId, invoiceId) {
+  const store = getSharedStore();
+  const key = 'invoiceState:state:' + tenantId + ':' + invoiceId;
+  store.del(key);
+  invoiceStateCacheEvictionsTotal.labels('invalidation').inc();
+}
 
 /**
- * Helper to extract actor from request
- * In production, this would come from JWT middleware
- * 
- * @param {import('express').Request} req Express request object
- * @returns {string} Actor identifier
+ * Extracts the correlation ID from the request object.
+ * Prefers the explicitly set correlationId, falls back to the request ID,
+ * and returns null when neither is available.
+ *
+ * @param {import('express').Request} req - Express request.
+ * @returns {string|null} Correlation ID.
+ */
+function getCorrelationId(req) {
+  return req.correlationId || req.id || null;
+}
+
+/**
+ * Extracts the actor identifier from the request object.
+ * @param {import('express').Request} req - Express request.
+ * @returns {string} Actor identifier.
  */
 function getActorFromRequest(req) {
   if (req.user && req.user.id) {
@@ -46,401 +74,448 @@ function getActorFromRequest(req) {
   if (req.user && req.user.sub) {
     return req.user.sub;
   }
-  // Fallback to IP for unauthenticated requests (should not happen in production)
-  return req.ip || req.socket.remoteAddress || 'unknown';
+  return req.ip || (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
 /**
- * Mock invoice database
- * In production, this would be replaced with actual database queries
- */
-const mockInvoices = new Map([
-  ['inv-001', { id: 'inv-001', status: 'pending', amount: 1000, customer: 'Acme Corp' }],
-  ['inv-002', { id: 'inv-002', status: 'approved', amount: 2000, customer: 'TechCo' }],
-  ['inv-003', { id: 'inv-003', status: 'linked_escrow', amount: 5000, customer: 'GlobalInc' }],
-]);
-
-/**
- * GET /api/invoices/:id/state
- * Get current state and allowed transitions for an invoice
- */
-router.get('/:id/state', (req, res) => {
-  const { id } = req.params;
-
-  // Get invoice from database
-  const invoice = mockInvoices.get(id);
-
-  if (!invoice) {
-    return res.status(404).json({
-      error: 'Invoice not found',
-      code: 'INVOICE_NOT_FOUND',
-    });
-  }
-
-  const currentState = invoice.status;
-  const allowedTransitions = getAllowedTransitions(currentState);
-
-  res.json({
-    data: {
-      invoiceId: id,
-      currentState,
-      allowedTransitions,
-      isTerminal: allowedTransitions.length === 0,
-    },
-    message: 'Invoice state retrieved successfully',
-  });
-});
-
-/**
- * POST /api/invoices/:id/transition
- * Execute a state transition
- * 
- * Request body:
- * {
- *   "targetState": "approved",
- *   "reason": "Invoice verified and approved by finance team"
- * }
- */
-/**
- * KYC gate selector for transition endpoint.
- * Runs `requireKycForFunding` only when the requested targetState is a
- * capital-moving state; passes through for non-capital transitions.
+ * Builds the context object from the request.
  *
- * @param {import('express').Request} req
- * @param {import('express').Response} res
- * @param {import('express').NextFunction} next
- * @returns {void}
+ * @param {import('express').Request} req - Express request object.
+ * @param {Object} additionalMetadata - Extra metadata to include.
+ * @returns {Object} Context object.
  */
-function conditionalKycGate(req, res, next) {
-  const { targetState } = req.body || {};
-  if (targetState && CAPITAL_MOVING_STATES.has(targetState)) {
-    return requireKycForFunding(req, res, next);
-  }
-  return next();
+function buildContext(req, additionalMetadata = {}) {
+  return {
+    actor: getActorFromRequest(req),
+    correlationId: getCorrelationId(req),
+    ipAddress: req.ip || (req.socket && req.socket.remoteAddress) || 'unknown',
+    userAgent: req.get('user-agent') || 'unknown',
+    metadata: {
+      method: req.method,
+      path: req.path,
+      ...additionalMetadata,
+    },
+  };
 }
 
-router.post('/:id/transition', conditionalKycGate, async (req, res, next) => {
-  const { id } = req.params;
-  const { targetState, reason } = req.body;
+/**
+ * Sends a standardized error envelope for state-machine validation failures.
+ *
+ * @param {import('express').Response} res - Express response object.
+ * @param {Error & {code?: string, allowedTransitions?: string[], statusCode?: number}} error - The thrown error.
+ * @param {string} [correlationId] - Correlation ID for traceability.
+ * @returns {import('express').Response} The error response.
+ */
+function sendTransitionError(res, error, correlationId) {
+  const status = error.statusCode || 400;
+  const details = error.allowedTransitions ? { allowedTransitions: error.allowedTransitions } : null;
 
+  return res.status(status).json({
+    ...responseHelper.error(error.message, error.code, details),
+    correlationId: correlationId || null,
+  });
+}
+
+/**
+ * Classifies an HTTP status code into a coarse status bucket.
+ *
+ * @param {number} statusCode - HTTP status code.
+ * @returns {string} Status class label.
+ */
+router.get('/:id/state', cacheState, async (req, res, next) => {
   try {
-    // Validate request body
-    if (!targetState) {
-      return res.status(400).json({
-        error: 'Target state is required',
-        code: 'MISSING_TARGET_STATE',
-      });
-    }
+    const result = await invoiceStateService.getState(req.params.id, req.tenantId);
 
-    // Get invoice from database
-    const invoice = mockInvoices.get(id);
-
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
-
-    const currentState = invoice.status;
-    const actor = getActorFromRequest(req);
-    const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
-    const userAgent = req.get('user-agent') || 'unknown';
-
-    // Execute transition
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState,
-      actor,
-      reason,
-      ipAddress,
-      userAgent,
-      metadata: {
-        method: req.method,
-        path: req.path,
-      },
-    });
-
-    // Update invoice in database
-    invoice.status = targetState;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
-        invoiceId: id,
-        previousState: result.previousState,
-        currentState: result.newState,
-        transitionedAt: result.transitionedAt,
-        transitionedBy: result.transitionedBy,
-        reason,
-        auditLogId: result.auditLog.id,
-      },
-      message: `Invoice transitioned from ${result.previousState} to ${result.newState}`,
+    return res.json({
+      ...responseHelper.success(result),
+      correlationId: getCorrelationId(req),
+      message: 'Invoice state retrieved successfully',
     });
   } catch (error) {
-    // Handle validation errors
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error, getCorrelationId(req));
     }
+    return next(error);
+  }
+});
 
-    // Pass unexpected errors to error handler
-    next(error);
+router.post('/:id/transition', async (req, res, next) => {
+  const { targetState, reason, revision } = req.body || {};
+
+  try {
+    const context = buildContext(req, { action: 'transition', targetState });
+    const result = await invoiceStateService.transition(req.params.id, req.tenantId, targetState, reason, revision, context);
+
+    invalidateInvoiceStateCache(req.tenantId, req.params.id);
+
+    return res.status(200).json({
+      ...responseHelper.success(result),
+      correlationId: getCorrelationId(req),
+      message: `Invoice transitioned from ${result.previousState} to ${result.currentState}`,
+    });
+  } catch (error) {
+    if (error.code) {
+      return sendTransitionError(res, error, getCorrelationId(req));
+    }
+    return next(error);
   }
 });
 
 /**
  * POST /api/invoices/:id/approve
- * Convenience endpoint to approve an invoice
+ * Convenience endpoint to approve a pending invoice.
  */
-router.post('/:id/approve', async (req, res, next) => {
-  const { id } = req.params;
-  const { reason } = req.body;
+/**
+ * @swagger
+ * /api/invoices/{id}/approve:
+ *   post:
+ *     operationId: approveInvoiceState
+ *     summary: Approve a pending invoice
+ *     description: Transition a pending invoice to approved state.
+ *     tags: [InvoiceState]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Invoice ID
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Invoice approved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateApproveResponse'
+ *       400:
+ *         description: Transition error or validation error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ *       404:
+ *         description: Invoice not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ */
+router.post('/:id/approve', instrumentInvoiceState('approve', async (req, res, next) => {
+  const { reason, revision } = req.body || {};
 
   try {
-    const invoice = mockInvoices.get(id);
+    const context = buildContext(req, { action: 'approve' });
+    const result = await invoiceStateService.approve(req.params.id, req.tenantId, reason, revision, context);
 
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
+    invalidateInvoiceStateCache(req.tenantId, req.params.id);
 
-    const currentState = invoice.status;
-    const actor = getActorFromRequest(req);
-    const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
-    const userAgent = req.get('user-agent') || 'unknown';
-
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState: INVOICE_STATES.APPROVED,
-      actor,
-      reason: reason || 'Invoice approved',
-      ipAddress,
-      userAgent,
-      metadata: {
-        method: req.method,
-        path: req.path,
-        action: 'approve',
-      },
-    });
-
-    invoice.status = INVOICE_STATES.APPROVED;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
-        invoiceId: id,
-        previousState: result.previousState,
-        currentState: result.newState,
-        transitionedAt: result.transitionedAt,
-        transitionedBy: result.transitionedBy,
-        auditLogId: result.auditLog.id,
-      },
+    return res.status(200).json({
+      ...responseHelper.success(result),
+      correlationId: getCorrelationId(req),
       message: 'Invoice approved successfully',
     });
   } catch (error) {
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error, getCorrelationId(req));
     }
-    next(error);
+    return next(error);
   }
-});
+}));
 
 /**
- * POST /api/invoices/:id/link-escrow
- * Link an approved invoice to escrow.
- *
- * This is a capital-movement endpoint: it initiates the escrow funding
- * lifecycle. KYC must be verified before the link can be made.
+ * @swagger
+ * /api/invoices/{id}/link-escrow:
+ *   post:
+ *     operationId: linkInvoiceEscrow
+ *     summary: Link an approved invoice to escrow
+ *     description: Links an approved invoice to escrow state. Gated on verified/exempted KYC status.
+ *     tags: [InvoiceState]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Invoice ID
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               escrowId:
+ *                 type: string
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Invoice linked to escrow successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateLinkEscrowResponse'
+ *       400:
+ *         description: Transition error or validation error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ *       404:
+ *         description: Invoice not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
  */
-router.post('/:id/link-escrow', requireKycForFunding, async (req, res, next) => {
-  const { id } = req.params;
-  const { escrowId, reason } = req.body;
+router.post('/:id/link-escrow', requireKycForFunding, auditKycAccess, instrumentInvoiceState('link-escrow', async (req, res, next) => {
+  const { escrowId, reason, revision } = req.body || {};
 
   try {
-    const invoice = mockInvoices.get(id);
-
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
-
-    // Validate business rules
-    const linkValidation = canLinkToEscrow(invoice);
-    if (!linkValidation.canLink) {
-      return res.status(400).json({
-        error: linkValidation.reason,
-        code: 'CANNOT_LINK_TO_ESCROW',
-      });
-    }
-
-    const currentState = invoice.status;
-    const actor = getActorFromRequest(req);
-    const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
-    const userAgent = req.get('user-agent') || 'unknown';
-
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState: INVOICE_STATES.LINKED_ESCROW,
-      actor,
-      reason: reason || 'Invoice linked to escrow',
-      ipAddress,
-      userAgent,
-      metadata: {
-        method: req.method,
-        path: req.path,
-        action: 'link-escrow',
-        escrowId: escrowId || 'pending',
-      },
+    const context = buildContext(req, {
+      action: 'link-escrow',
+      escrowId: escrowId || 'pending',
     });
+    const result = await invoiceStateService.linkEscrow(req.params.id, req.tenantId, escrowId, reason, revision, context);
 
-    invoice.status = INVOICE_STATES.LINKED_ESCROW;
-    invoice.escrowId = escrowId;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
+    invalidateInvoiceStateCache(req.tenantId, req.params.id);
 
-    res.status(200).json({
-      data: {
-        invoiceId: id,
-        previousState: result.previousState,
-        currentState: result.newState,
-        escrowId: escrowId || null,
-        transitionedAt: result.transitionedAt,
-        transitionedBy: result.transitionedBy,
-        auditLogId: result.auditLog.id,
-      },
+    return res.status(200).json({
+      ...responseHelper.success(result),
+      correlationId: getCorrelationId(req),
       message: 'Invoice linked to escrow successfully',
     });
   } catch (error) {
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error, getCorrelationId(req));
     }
-    next(error);
+    return next(error);
   }
-});
+}));
 
 /**
- * GET /api/invoices/:id/history
- * Get state transition history for an invoice
+ * @swagger
+ * /api/invoices/{id}/reject:
+ *   post:
+ *     operationId: rejectInvoiceState
+ *     summary: Reject an invoice
+ *     description: Rejects an invoice with a mandatory reason.
+ *     tags: [InvoiceState]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Invoice ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [reason]
+ *             properties:
+ *               reason:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Invoice rejected successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateRejectResponse'
+ *       400:
+ *         description: Transition error or validation error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ *       404:
+ *         description: Invoice not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
  */
-router.get('/:id/history', async (req, res) => {
-  const { id } = req.params;
-
-  // Check if invoice exists
-  const invoice = mockInvoices.get(id);
-
-  if (!invoice) {
-    return res.status(404).json({
-      error: 'Invoice not found',
-      code: 'INVOICE_NOT_FOUND',
-    });
-  }
-
-  const history = await getTransitionHistory(id, getAuditLogs);
-
-  res.json({
-    data: {
-      invoiceId: id,
-      currentState: invoice.status,
-      transitions: history,
-      totalTransitions: history.length,
-    },
-    message: 'Invoice transition history retrieved successfully',
-  });
-});
-
-/**
- * POST /api/invoices/:id/reject
- * Convenience endpoint to reject an invoice
- */
-router.post('/:id/reject', async (req, res, next) => {
-  const { id } = req.params;
-  const { reason } = req.body;
+router.post('/:id/reject', instrumentInvoiceState('reject', async (req, res, next) => {
+  const { reason } = req.body || {};
 
   try {
-    if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
-      return res.status(400).json({
-        error: 'Reason is required for rejection',
-        code: 'MISSING_TRANSITION_REASON',
-      });
-    }
+    const context = buildContext(req, { action: 'reject' });
+    const result = await invoiceStateService.reject(req.params.id, req.tenantId, reason, context);
 
-    const invoice = mockInvoices.get(id);
+    invalidateInvoiceStateCache(req.tenantId, req.params.id);
 
-    if (!invoice) {
-      return res.status(404).json({
-        error: 'Invoice not found',
-        code: 'INVOICE_NOT_FOUND',
-      });
-    }
-
-    const currentState = invoice.status;
-    const actor = getActorFromRequest(req);
-    const ipAddress = req.ip || req.socket.remoteAddress || 'unknown';
-    const userAgent = req.get('user-agent') || 'unknown';
-
-    const result = await executeTransition({
-      invoiceId: id,
-      currentState,
-      targetState: INVOICE_STATES.REJECTED,
-      actor,
-      reason,
-      ipAddress,
-      userAgent,
-      metadata: {
-        method: req.method,
-        path: req.path,
-        action: 'reject',
-      },
-    });
-
-    invoice.status = INVOICE_STATES.REJECTED;
-    invoice.updatedAt = new Date().toISOString();
-    invoice.updatedBy = actor;
-
-    res.status(200).json({
-      data: {
-        invoiceId: id,
-        previousState: result.previousState,
-        currentState: result.newState,
-        reason,
-        transitionedAt: result.transitionedAt,
-        transitionedBy: result.transitionedBy,
-        auditLogId: result.auditLog.id,
-      },
+    return res.status(200).json({
+      ...responseHelper.success(result),
+      correlationId: getCorrelationId(req),
       message: 'Invoice rejected successfully',
     });
   } catch (error) {
     if (error.code) {
-      return res.status(400).json({
-        error: error.message,
-        code: error.code,
-        allowedTransitions: error.allowedTransitions,
-      });
+      return sendTransitionError(res, error, getCorrelationId(req));
     }
-    next(error);
+    return next(error);
   }
-});
+}));
+
+/**
+ * @swagger
+ * /api/invoices/{id}/history:
+ *   get:
+ *     operationId: getInvoiceStateHistory
+ *     summary: Get invoice transition history
+ *     description: Returns the state transition history log for an invoice.
+ *     tags: [InvoiceState]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Invoice ID
+ *     responses:
+ *       200:
+ *         description: Invoice transition history retrieved successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateHistoryResponse'
+ *       400:
+ *         description: Transition error or validation error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ *       404:
+ *         description: Invoice not found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ */
+router.get('/:id/history', instrumentInvoiceState('history', async (req, res, next) => {
+  try {
+    const result = await invoiceStateService.getHistory(req.params.id, req.tenantId);
+
+    return res.json({
+      ...responseHelper.success(result),
+      correlationId: getCorrelationId(req),
+      message: 'Invoice transition history retrieved successfully',
+    });
+  } catch (error) {
+    if (error.code) {
+      return sendTransitionError(res, error, getCorrelationId(req));
+    }
+    return next(error);
+  }
+}));
+
+/**
+ * POST /api/invoices/bulk
+ * Thin HTTP wrapper: parses/shape-validates the body, delegates batch-size
+ * validation, per-item validation, and action dispatch to
+ * `invoiceStateService.processBulkOperations` (#1113), then translates the
+ * result (or a thrown `StateTransitionError`) into a response.
+ */
+/**
+ * @swagger
+ * /api/invoices/bulk:
+ *   post:
+ *     operationId: bulkInvoiceStateOperations
+ *     summary: Bulk invoice-state operations
+ *     description: Processes a bounded array of invoice-state operations and returns per-item success/error without failing the whole batch.
+ *     tags: [InvoiceState]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: array
+ *             maxItems: 25
+ *             items:
+ *               type: object
+ *               required: [invoiceId, action]
+ *               properties:
+ *                 invoiceId:
+ *                   type: string
+ *                   description: Invoice identifier
+ *                 action:
+ *                   type: string
+ *                   enum: [approve, reject, link-escrow, transition]
+ *                   description: The state-transition action to perform
+ *                 reason:
+ *                   type: string
+ *                   description: Optional rationale for the action (required for reject)
+ *                 escrowId:
+ *                   type: string
+ *                   description: Escrow contract identifier (required for link-escrow)
+ *                 targetState:
+ *                   type: string
+ *                   description: Target lifecycle state (required for transition)
+ *     responses:
+ *       200:
+ *         description: Bulk operation results with per-item status
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateBulkResponse'
+ *       400:
+ *         description: Validation error (empty batch, over-cap, or invalid body)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
+ */
+router.post('/bulk', instrumentInvoiceState('bulk', async (req, res, _next) => {
+  const items = req.body;
+
+  if (!Array.isArray(items)) {
+    return res.status(400).json({
+      ...responseHelper.error('Request body must be a JSON array of invoice-state operations', 'INVALID_BATCH_TYPE'),
+      correlationId: getCorrelationId(req),
+    });
+  }
+
+  try {
+    const baseContext = buildContext(req);
+    const { results, summary } = await invoiceStateService.processBulkOperations(items, req.tenantId, baseContext);
+
+    return res.status(200).json({
+      ...responseHelper.success({ results, summary }),
+      correlationId: getCorrelationId(req),
+      message: 'Bulk invoice-state operation completed',
+    });
+  } catch (error) {
+    // Delegate EMPTY_BATCH / BATCH_OVER_CAP and other StateTransitionErrors
+    // to the shared invoiceStateErrorHandler mounted below (issue #1113).
+    return _next(error);
+  }
+}));
+
+// Mount the shared invoice-state error middleware after all route
+// handlers so StateTransitionErrors from any handler receive a
+// consistent response envelope (issue #968).
+router.use(invoiceStateErrorHandler);
 
 module.exports = router;
-module.exports.mockInvoices = mockInvoices; // Export for testing

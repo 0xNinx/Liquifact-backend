@@ -9,12 +9,18 @@
  * there so all callers continue to work without modification.
  */
 
+const { ALL_INVOICE_STATUSES } = require('../services/invoiceStateMachine');
 // ── Zod-backed invoice payload validator (re-export) ─────────────────────────
 
 const {
   validateInvoicePayload,
   SUPPORTED_CURRENCIES,
 } = require('../schemas/invoice');
+const {
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+  isValidStellarAddress,
+} = require('./stellarAddress');
 
 /**
  * Supported ISO 4217 currency codes (Set for O(1) look-up).
@@ -29,20 +35,30 @@ const VALID_CURRENCIES = new Set(SUPPORTED_CURRENCIES);
  * Validates `GET /api/invoices` query parameters.
  *
  * @param {Object} query - The Express `req.query` object.
- * @returns {{ isValid: boolean, errors: string[], validatedParams: Object }}
+ * @returns {{ isValid: boolean, fieldErrors: Object.<string, string>, validatedParams: Object }}
+ */
+/**
+ * Validates `GET /api/invoices` query parameters.
+ *
+ * Supports both cursor-based pagination (`cursor` + `limit`) and offset-based
+ * (`page` + `limit`).  When `cursor` is supplied, `page` is ignored.
+ * Bounded default page size: 10, max: 100.
+ *
+ * @param {Object} query - The Express `req.query` object.
+ * @returns {{ isValid: boolean, fieldErrors: Object.<string, string>, validatedParams: Object }}
  */
 function validateInvoiceQueryParams(query) {
-  const errors = [];
-  const validatedParams = { filters: {}, sorting: {} };
+  const fieldErrors = {};
+  const validatedParams = { filters: {}, sorting: {}, pagination: {} };
 
-  const { status, smeId, buyerId, dateFrom, dateTo, sortBy, order } = query;
+  const { status, smeId, buyerId, dateFrom, dateTo, sortBy, order, cursor, limit, page } = query;
 
   if (status !== undefined) {
-    const validStatuses = ['paid', 'pending', 'overdue'];
+    const validStatuses = ALL_INVOICE_STATUSES;
     if (validStatuses.includes(status)) {
       validatedParams.filters.status = status;
     } else {
-      errors.push(`Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+      fieldErrors.status = `Invalid status. Must be one of: ${validStatuses.join(', ')}`;
     }
   }
 
@@ -50,7 +66,7 @@ function validateInvoiceQueryParams(query) {
     if (typeof smeId === 'string' && smeId.trim().length > 0) {
       validatedParams.filters.smeId = smeId;
     } else {
-      errors.push('Invalid smeId format');
+      fieldErrors.smeId = 'Invalid smeId format';
     }
   }
 
@@ -58,7 +74,7 @@ function validateInvoiceQueryParams(query) {
     if (typeof buyerId === 'string' && buyerId.trim().length > 0) {
       validatedParams.filters.buyerId = buyerId;
     } else {
-      errors.push('Invalid buyerId format');
+      fieldErrors.buyerId = 'Invalid buyerId format';
     }
   }
 
@@ -67,7 +83,7 @@ function validateInvoiceQueryParams(query) {
     if (dateRegex.test(dateFrom) && !isNaN(Date.parse(dateFrom))) {
       validatedParams.filters.dateFrom = dateFrom;
     } else {
-      errors.push('Invalid dateFrom format. Use YYYY-MM-DD');
+      fieldErrors.dateFrom = 'Invalid dateFrom format. Use YYYY-MM-DD';
     }
   }
 
@@ -75,16 +91,16 @@ function validateInvoiceQueryParams(query) {
     if (dateRegex.test(dateTo) && !isNaN(Date.parse(dateTo))) {
       validatedParams.filters.dateTo = dateTo;
     } else {
-      errors.push('Invalid dateTo format. Use YYYY-MM-DD');
+      fieldErrors.dateTo = 'Invalid dateTo format. Use YYYY-MM-DD';
     }
   }
 
   if (sortBy !== undefined) {
-    const validSortFields = ['amount', 'date'];
+    const validSortFields = ['amount', 'date', 'created_at'];
     if (validSortFields.includes(sortBy)) {
       validatedParams.sorting.sortBy = sortBy;
     } else {
-      errors.push(`Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`);
+      fieldErrors.sortBy = `Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`;
     }
   }
 
@@ -93,11 +109,42 @@ function validateInvoiceQueryParams(query) {
     if (['asc', 'desc'].includes(lowerOrder)) {
       validatedParams.sorting.order = lowerOrder;
     } else {
-      errors.push('Invalid order. Must be "asc" or "desc"');
+      fieldErrors.order = 'Invalid order. Must be "asc" or "desc"';
     }
   }
 
-  return { isValid: errors.length === 0, errors, validatedParams };
+  // ── Cursor-based pagination ────────────────────────────────────────────────
+  if (cursor !== undefined) {
+    if (typeof cursor === 'string' && cursor.length > 0 && cursor.length <= 2048) {
+      validatedParams.pagination.cursor = cursor;
+    } else {
+      fieldErrors.cursor = 'cursor must be a non-empty string (max 2048 chars)';
+    }
+  }
+
+  // ── Offset pagination (ignored when cursor is supplied) ───────────────────
+  if (cursor === undefined && page !== undefined) {
+    const val = parseInt(page, 10);
+    if (!isNaN(val) && val >= 1) {
+      validatedParams.pagination.page = val;
+    } else {
+      fieldErrors.page = 'page must be an integer >= 1';
+    }
+  }
+
+  // ── Limit (applies to both modes) ──────────────────────────────────────────
+  if (limit !== undefined) {
+    const val = parseInt(limit, 10);
+    if (!isNaN(val) && val >= 1) {
+      // Invoice list pagination clamps rather than rejects an oversized page.
+      // The service repeats this bound for non-HTTP callers.
+      validatedParams.pagination.limit = Math.min(val, 100);
+    } else {
+      fieldErrors.limit = 'limit must be an integer between 1 and 100';
+    }
+  }
+
+  return { isValid: Object.keys(fieldErrors).length === 0, fieldErrors, validatedParams };
 }
 
 // ── Marketplace query-param validator ────────────────────────────────────────
@@ -115,10 +162,10 @@ function validateInvoiceQueryParams(query) {
  * from the route layer.
  *
  * @param {Object} query - The Express query object.
- * @returns {{ isValid: boolean, errors: string[], validatedParams: Object }}
+ * @returns {{ isValid: boolean, fieldErrors: Object.<string, string>, validatedParams: Object }}
  */
 function validateMarketplaceQueryParams(query) {
-  const errors = [];
+  const fieldErrors = {};
   const validatedParams = { filters: {}, sorting: {}, pagination: {} };
 
   const {
@@ -137,23 +184,23 @@ function validateMarketplaceQueryParams(query) {
   } = query;
 
   if (status !== undefined) {
-    const validStatuses = ['pending_verification', 'verified', 'funded', 'partially_funded', 'completed', 'defaulted'];
+    const validStatuses = ALL_INVOICE_STATUSES;
     if (validStatuses.includes(status)) {
       validatedParams.filters.status = status;
     } else {
-      errors.push(`Invalid status. Must be one of: ${validStatuses.join(', ')}`);
+      fieldErrors.status = `Invalid status. Must be one of: ${validStatuses.join(', ')}`;
     }
   }
 
   if (yieldBpsMin !== undefined) {
     const val = parseInt(yieldBpsMin, 10);
     if (!isNaN(val) && val >= 0) { validatedParams.filters.yieldBpsMin = val; }
-    else { errors.push('yieldBpsMin must be a non-negative integer'); }
+    else { fieldErrors.yieldBpsMin = 'yieldBpsMin must be a non-negative integer'; }
   }
   if (yieldBpsMax !== undefined) {
     const val = parseInt(yieldBpsMax, 10);
     if (!isNaN(val) && val >= 0) { validatedParams.filters.yieldBpsMax = val; }
-    else { errors.push('yieldBpsMax must be a non-negative integer'); }
+    else { fieldErrors.yieldBpsMax = 'yieldBpsMax must be a non-negative integer'; }
   }
 
   const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
@@ -161,38 +208,38 @@ function validateMarketplaceQueryParams(query) {
     if (dateRegex.test(maturityDateFrom) && !isNaN(Date.parse(maturityDateFrom))) {
       validatedParams.filters.maturityDateFrom = maturityDateFrom;
     } else {
-      errors.push('Invalid maturityDateFrom format. Use YYYY-MM-DD');
+      fieldErrors.maturityDateFrom = 'Invalid maturityDateFrom format. Use YYYY-MM-DD';
     }
   }
   if (maturityDateTo !== undefined) {
     if (dateRegex.test(maturityDateTo) && !isNaN(Date.parse(maturityDateTo))) {
       validatedParams.filters.maturityDateTo = maturityDateTo;
     } else {
-      errors.push('Invalid maturityDateTo format. Use YYYY-MM-DD');
+      fieldErrors.maturityDateTo = 'Invalid maturityDateTo format. Use YYYY-MM-DD';
     }
   }
 
   if (fundedRatioMin !== undefined) {
     const val = parseFloat(fundedRatioMin);
     if (!isNaN(val) && val >= 0 && val <= 100) { validatedParams.filters.fundedRatioMin = val; }
-    else { errors.push('fundedRatioMin must be a number between 0 and 100'); }
+    else { fieldErrors.fundedRatioMin = 'fundedRatioMin must be a number between 0 and 100'; }
   }
   if (fundedRatioMax !== undefined) {
     const val = parseFloat(fundedRatioMax);
     if (!isNaN(val) && val >= 0 && val <= 100) { validatedParams.filters.fundedRatioMax = val; }
-    else { errors.push('fundedRatioMax must be a number between 0 and 100'); }
+    else { fieldErrors.fundedRatioMax = 'fundedRatioMax must be a number between 0 and 100'; }
   }
 
   if (sortBy !== undefined) {
     const validSortFields = ['yield_bps', 'maturity_date', 'funded_ratio', 'amount', 'created_at'];
     if (validSortFields.includes(sortBy)) { validatedParams.sorting.sortBy = sortBy; }
-    else { errors.push(`Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`); }
+    else { fieldErrors.sortBy = `Invalid sortBy. Must be one of: ${validSortFields.join(', ')}`; }
   }
 
   if (order !== undefined) {
     const lowerOrder = order.toLowerCase();
     if (['asc', 'desc'].includes(lowerOrder)) { validatedParams.sorting.order = lowerOrder; }
-    else { errors.push('Invalid order. Must be "asc" or "desc"'); }
+    else { fieldErrors.order = 'Invalid order. Must be "asc" or "desc"'; }
   }
 
   // Validate cursor (opaque base64url.signature string)
@@ -200,7 +247,7 @@ function validateMarketplaceQueryParams(query) {
     if (typeof cursor === 'string' && cursor.length > 0 && cursor.length <= 2048) {
       validatedParams.pagination.cursor = cursor;
     } else {
-      errors.push('cursor must be a non-empty string (max 2048 chars)');
+      fieldErrors.cursor = 'cursor must be a non-empty string (max 2048 chars)';
     }
   }
 
@@ -210,16 +257,16 @@ function validateMarketplaceQueryParams(query) {
     if (!isNaN(val) && val >= 1) {
       validatedParams.pagination.page = val;
     } else {
-      errors.push('page must be an integer >= 1');
+      fieldErrors.page = 'page must be an integer >= 1';
     }
   }
   if (limit !== undefined) {
     const val = parseInt(limit, 10);
     if (!isNaN(val) && val >= 1 && val <= 100) { validatedParams.pagination.limit = val; }
-    else { errors.push('limit must be an integer between 1 and 100'); }
+    else { fieldErrors.limit = 'limit must be an integer between 1 and 100'; }
   }
 
-  return { isValid: errors.length === 0, errors, validatedParams };
+  return { isValid: Object.keys(fieldErrors).length === 0, fieldErrors, validatedParams };
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
@@ -229,4 +276,7 @@ module.exports = {
   validateMarketplaceQueryParams,
   validateInvoicePayload,
   VALID_CURRENCIES,
+  isValidStellarAccountAddress,
+  isValidStellarContractAddress,
+  isValidStellarAddress,
 };

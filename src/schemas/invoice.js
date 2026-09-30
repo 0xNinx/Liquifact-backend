@@ -15,6 +15,7 @@
  */
 
 const { z } = require('zod');
+const { normalizeMonetaryInput, MonetaryValidationError } = require('../utils/monetary');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -61,16 +62,36 @@ const currencySchema = z
  *  - String length bounds prevent oversized inputs.
  *  - `amount` must be a positive, finite number.
  *  - `currency` is normalised to upper-case and allowlisted.
+ *  - `amount` is validated for monetary precision (max 2 decimal places).
  *
  * @type {import('zod').ZodObject}
  */
 const invoiceCreateSchema = z
   .object({
-    /** Positive invoice amount. */
+    /** Positive invoice amount with monetary precision validation. */
     amount: z
-      .number({ invalid_type_error: 'amount must be a number', required_error: 'amount is required' })
-      .positive({ message: 'amount must be a positive number' })
-      .finite({ message: 'amount must be a finite number' }),
+      .union([
+        z.number({ invalid_type_error: 'amount must be a number', required_error: 'amount is required' })
+          .positive({ message: 'amount must be a positive number' })
+          .finite({ message: 'amount must be a finite number' }),
+        z.string({ invalid_type_error: 'amount must be a number or string' })
+          .min(1, { message: 'amount must not be empty' }),
+      ])
+      .transform((val) => {
+        // Normalize to canonical decimal string
+        try {
+          return normalizeMonetaryInput(val, 'amount');
+        } catch (err) {
+          if (err instanceof MonetaryValidationError) {
+            throw new z.ZodError([{
+              code: z.ZodIssueCode.custom,
+              message: err.message,
+              path: ['amount'],
+            }]);
+          }
+          throw err;
+        }
+      }),
 
     /** Due date in YYYY-MM-DD format. */
     dueDate: dateSchema.optional(),
@@ -111,7 +132,10 @@ const invoiceCreateSchema = z
     /** Optional invoice reference number (max 100 chars). */
     invoiceNumber: z
       .string({ invalid_type_error: 'invoiceNumber must be a string' })
+      .trim()
+      .min(1, { message: 'invoiceNumber must be a non-empty string' })
       .max(100, { message: 'invoiceNumber must not exceed 100 characters' })
+      .transform((v) => v.toLowerCase())
       .optional(),
   })
   .strict() // ← reject unknown keys
@@ -160,10 +184,33 @@ const invoiceCreateSchema = z
  */
 const invoiceUpdateSchema = z
   .object({
+    version: z
+      .number({ invalid_type_error: 'version must be a number' })
+      .int({ message: 'version must be an integer' })
+      .positive({ message: 'version must be positive' })
+      .safe({ message: 'version must be a safe integer' }),
     amount: z
-      .number({ invalid_type_error: 'amount must be a number' })
-      .positive({ message: 'amount must be a positive number' })
-      .finite({ message: 'amount must be a finite number' })
+      .union([
+        z.number({ invalid_type_error: 'amount must be a number' })
+          .positive({ message: 'amount must be a positive number' })
+          .finite({ message: 'amount must be a finite number' }),
+        z.string({ invalid_type_error: 'amount must be a number or string' })
+          .min(1, { message: 'amount must not be empty' }),
+      ])
+      .transform((val) => {
+        try {
+          return normalizeMonetaryInput(val, 'amount');
+        } catch (err) {
+          if (err instanceof MonetaryValidationError) {
+            throw new z.ZodError([{
+              code: z.ZodIssueCode.custom,
+              message: err.message,
+              path: ['amount'],
+            }]);
+          }
+          throw err;
+        }
+      })
       .optional(),
 
     dueDate: dateSchema.optional(),
@@ -191,6 +238,11 @@ const invoiceUpdateSchema = z
 
     currency: currencySchema.optional(),
 
+    notes: z
+      .string({ invalid_type_error: 'notes must be a string' })
+      .max(2000, { message: 'notes must not exceed 2000 characters' })
+      .optional(),
+
     description: z
       .string()
       .max(1000, { message: 'description must not exceed 1000 characters' })
@@ -198,7 +250,10 @@ const invoiceUpdateSchema = z
 
     invoiceNumber: z
       .string()
+      .trim()
+      .min(1, { message: 'invoiceNumber must be a non-empty string' })
       .max(100, { message: 'invoiceNumber must not exceed 100 characters' })
+      .transform((v) => v.toLowerCase())
       .optional(),
 
     status: z
@@ -256,21 +311,19 @@ const paginationQuerySchema = z.object({
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+const validationHelper = require('./validationHelper');
+
 /**
  * Flattens a ZodError into a `{ [fieldPath]: firstMessage }` object.
+ *
+ * This is a re-export from the shared validation helper module,
+ * preserving backward compatibility for existing callers.
  *
  * @param {import('zod').ZodError} zodError
  * @returns {Record<string, string>}
  */
 function parseValidationErrors(zodError) {
-  const fieldErrors = {};
-  for (const issue of zodError.issues ?? zodError.errors ?? []) {
-    const path = issue.path.join('.') || '_root';
-    if (!fieldErrors[path]) {
-      fieldErrors[path] = issue.message;
-    }
-  }
-  return fieldErrors;
+  return validationHelper.parseValidationErrors(zodError);
 }
 
 // ── validateInvoicePayload adapter ───────────────────────────────────────────
@@ -323,27 +376,15 @@ function validateInvoicePayload(body) {
  *
  * On success, attaches the parsed (and transformed) value to `req.validated`.
  *
+ * This is a thin wrapper around `createBodyValidator` from the shared
+ * validation helper module, preserving the original API for backward
+ * compatibility.
+ *
  * @param {import('zod').ZodTypeAny} schema
  * @returns {import('express').RequestHandler}
  */
 function validateBody(schema) {
-  return (req, res, next) => {
-    const result = schema.safeParse(req.body);
-    if (result.success) {
-      req.validated = result.data;
-      return next();
-    }
-
-    const fieldErrors = parseValidationErrors(result.error);
-
-    return res.status(400).json({
-      type: 'https://liquifact.io/problems/validation-error',
-      title: 'Validation Error',
-      status: 400,
-      detail: 'Request body contains invalid or missing fields.',
-      fieldErrors,
-    });
-  };
+  return validationHelper.createBodyValidator(schema);
 }
 
 /**
@@ -352,27 +393,15 @@ function validateBody(schema) {
  *
  * On success, attaches the parsed value to `req.validatedQuery`.
  *
+ * This is a thin wrapper around `createQueryValidator` from the shared
+ * validation helper module, preserving the original API for backward
+ * compatibility.
+ *
  * @param {import('zod').ZodTypeAny} schema
  * @returns {import('express').RequestHandler}
  */
 function validateQuery(schema) {
-  return (req, res, next) => {
-    const result = schema.safeParse(req.query);
-    if (result.success) {
-      req.validatedQuery = result.data;
-      return next();
-    }
-
-    const fieldErrors = parseValidationErrors(result.error);
-
-    return res.status(400).json({
-      type: 'https://liquifact.io/problems/validation-error',
-      title: 'Validation Error',
-      status: 400,
-      detail: 'Query parameters contain invalid values.',
-      fieldErrors,
-    });
-  };
+  return validationHelper.createQueryValidator(schema);
 }
 
 // ── Exports ──────────────────────────────────────────────────────────────────

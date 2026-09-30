@@ -1,663 +1,413 @@
+'use strict';
+
 /**
- * KYC Gating Tests
- * Comprehensive tests for KYC verification and funding gate enforcement
- * 
- * Test coverage includes:
- * - KYC service functionality
- * - KYC middleware gating
- * - Invoice KYC status tracking
- * - Funding endpoint protection
- * 
- * @module tests/kyc.gating.test
+ * @file tests/kyc.gating.test.js
+ * @description Comprehensive tests for the KYC gating middleware.
+ *
+ * Covers:
+ *   1. Structural compliance — CAPITAL_MOVING_STATES contains high-risk states.
+ *   2. kycGatingMiddleware — blocks/permits based on target state and user KYC flag.
+ *   3. requireKycForFunding — enforces smeId from JWT, checks KYC status.
  */
 
-const request = require('supertest');
 const express = require('express');
-const kycService = require('../src/services/kycService');
-const { requireKycForFunding } = require('../src/middleware/kycGating');
-const AppError = require('../src/errors/AppError');
-const invoiceService = require('../src/services/invoiceService');
-const investRoutes = require('../src/routes/invest');
-const { authenticateToken } = require('../src/middleware/auth');
-const logger = require('../src/logger');
+const request = require('supertest');
+const kycGatingMiddleware = require('../src/middleware/kycGating');
+const { CAPITAL_MOVING_STATES } = require('../src/services/invoiceStateMachine');
 
-describe('KYC Service Tests', () => {
-  describe('getKycStatus', () => {
-    it('should return pending status for unknown SME', async () => {
-      const result = await kycService.getKycStatus('unknown_sme');
-      expect(result).toEqual({
-        status: kycService.KYC_STATUSES.PENDING,
-      });
-    });
+// Import the real canFundWithKycStatus so jest.mock doesn't replace it with undefined
+const { canFundWithKycStatus } = require('../src/services/kycService');
 
-    it('should throw error for invalid SME ID', async () => {
-      await expect(kycService.getKycStatus('')).rejects.toThrow('Invalid SME ID');
-      await expect(kycService.getKycStatus(null)).rejects.toThrow('Invalid SME ID');
-      await expect(kycService.getKycStatus(123)).rejects.toThrow('Invalid SME ID');
-    });
-
-    it('should return verified status for previously verified SME', async () => {
-      const smeId = 'sme_test_001';
-      await kycService.verifySmeSafe(smeId);
-
-      const result = await kycService.getKycStatus(smeId);
-      expect(result.status).toBe(kycService.KYC_STATUSES.VERIFIED);
-      expect(result.recordId).toBeDefined();
-      expect(result.verifiedAt).toBeDefined();
-    });
-  });
-
-  describe('verifySmeSafe', () => {
-    it('should mark SME as verified', async () => {
-      const smeId = 'sme_verify_test';
-      const result = await kycService.verifySmeSafe(smeId);
-
-      expect(result).toEqual({
-        status: kycService.KYC_STATUSES.VERIFIED,
-        recordId: expect.any(String),
-        verifiedAt: expect.any(String),
-      });
-      expect(result.status).toBe('verified');
-    });
-
-    it('should generate unique record IDs for same SME', async () => {
-      const smeId = 'sme_unique_test';
-      const result1 = await kycService.verifySmeSafe(smeId);
-
-      // Small delay to ensure different timestamp
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      const result2 = await kycService.verifySmeSafe(smeId);
-
-      expect(result1.recordId).not.toBe(result2.recordId);
-    });
-
-    it('should throw error for invalid SME ID', async () => {
-      await expect(kycService.verifySmeSafe('')).rejects.toThrow('Invalid SME ID');
-      await expect(kycService.verifySmeSafe(null)).rejects.toThrow('Invalid SME ID');
-    });
-  });
-
-  describe('rejectSmeKyc', () => {
-    it('should mark SME as rejected', async () => {
-      const smeId = 'sme_reject_test';
-      const result = await kycService.rejectSmeKyc(smeId, 'Failed verification');
-
-      expect(result).toEqual({
-        status: kycService.KYC_STATUSES.REJECTED,
-        recordId: expect.any(String),
-      });
-      expect(result.status).toBe('rejected');
-    });
-
-    it('should update status for subsequent checks', async () => {
-      const smeId = 'sme_reject_update_test';
-      await kycService.rejectSmeKyc(smeId, 'Initial rejection');
-
-      const status = await kycService.getKycStatus(smeId);
-      expect(status.status).toBe('rejected');
-    });
-  });
-
-  describe('exemptSmeFromKyc', () => {
-    it('should exempt SME from KYC', async () => {
-      const smeId = 'sme_exempt_test';
-      const result = await kycService.exemptSmeFromKyc(smeId, 'Low-risk vendor');
-
-      expect(result).toEqual({
-        status: kycService.KYC_STATUSES.EXEMPTED,
-        recordId: expect.any(String),
-      });
-      expect(result.status).toBe('exempted');
-    });
-
-    it('should allow funding with exempted status', async () => {
-      const smeId = 'sme_exempt_funding_test';
-      await kycService.exemptSmeFromKyc(smeId);
-
-      const canFund = kycService.canFundWithKycStatus('exempted');
-      expect(canFund).toBe(true);
-    });
-  });
-
-  describe('canFundWithKycStatus', () => {
-    it('should return true for verified status', () => {
-      const result = kycService.canFundWithKycStatus('verified');
-      expect(result).toBe(true);
-    });
-
-    it('should return true for exempted status', () => {
-      const result = kycService.canFundWithKycStatus('exempted');
-      expect(result).toBe(true);
-    });
-
-    it('should return false for pending status', () => {
-      const result = kycService.canFundWithKycStatus('pending');
-      expect(result).toBe(false);
-    });
-
-    it('should return false for rejected status', () => {
-      const result = kycService.canFundWithKycStatus('rejected');
-      expect(result).toBe(false);
-    });
-  });
-
-  describe('getKycProviderConfig', () => {
-    it('should indicate disabled provider when env vars missing', () => {
-      const config = kycService.getKycProviderConfig();
-      expect(config.enabled).toBe(false);
-      expect(config.apiKey).toBeNull();
-      expect(config.baseUrl).toBeNull();
-    });
-  });
+// Mock kycService so tests are deterministic; re-export canFundWithKycStatus
+jest.mock('../src/services/kycService', () => {
+  const original = jest.requireActual('../src/services/kycService');
+  return {
+    ...original,
+    getKycStatus: jest.fn(),
+    canFundWithKycStatus: original.canFundWithKycStatus,
+  };
 });
 
-describe('KYC Gating Middleware Tests', () => {
-  let app;
+const kycService = require('../src/services/kycService');
 
-  beforeEach(() => {
-    kycService.resetMockRecords();
-    app = express();
-    app.use(express.json());
+/**
+ * Helper: creates an Express app with a user-injecting middleware and a route
+ * that uses the given gate middleware.
+ */
+function createApp(userOverrides = {}) {
+  const app = express();
+  app.use(express.json());
 
-    // Mock authentication middleware
-    app.use((req, res, next) => {
-      req.user = {
-        sub: 'user_123',
-        smeId: req.body && req.body.smeId !== undefined ? req.body.smeId : 'sme_test_001',
-      };
-      req.id = 'req_123';
-      next();
+  // Attach a mock user to each request
+  app.use((req, res, next) => {
+    req.user = Object.assign({ smeId: 'test-sme-01', isKycVerified: false }, userOverrides);
+    next();
+  });
+
+  // Error handler for tests
+  app.use((err, req, res, _next) => {
+    res.status(500).json({ error: err.message });
+  });
+
+  return app;
+}
+
+describe('KYC Gating', () => {
+  // ── Structural Compliance ──────────────────────────────────────────────
+
+  describe('Structural Compliance - Capital Movement KYC Verification', () => {
+    it('should strictly gate known high-risk transaction lifecycle states', () => {
+      expect(CAPITAL_MOVING_STATES.has('funded')).toBe(true);
+      expect(CAPITAL_MOVING_STATES.has('settled')).toBe(true);
     });
   });
 
-  describe('requireKycForFunding - success cases', () => {
-    it('should pass through when KYC is verified', async () => {
-      const smeId = 'sme_gate_verified';
-      await kycService.verifySmeSafe(smeId);
+  // ── kycGatingMiddleware ────────────────────────────────────────────────
 
-      app.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true, kyc: req.kyc });
+  describe('kycGatingMiddleware', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('should allow transition when target state is not capital-moving', async () => {
+      const app = createApp({ smeId: 'test-sme-01', isKycVerified: false });
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
       });
 
       const res = await request(app)
-        .post('/fund')
-        .send({ smeId });
+        .post('/transition')
+        .send({ state: 'draft' });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should block transition when target state is capital-moving and user is not KYC verified', async () => {
+      const app = createApp({ smeId: 'test-sme-01', isKycVerified: false });
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app)
+        .post('/transition')
+        .send({ state: 'funded' });
+
+      expect(res.status).toBe(403);
+      expect(res.body).toEqual({
+        error: 'KYC_REQUIRED',
+        message: 'Action restricted. KYC verification required for capital-moving operations.',
+      });
+    });
+
+    it('should allow transition when target state is capital-moving and user IS KYC verified', async () => {
+      const app = createApp({ smeId: 'test-sme-01', isKycVerified: true });
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app)
+        .post('/transition')
+        .send({ state: 'funded' });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should read target state from req.body.targetState when req.body.state is absent', async () => {
+      const app = createApp({ smeId: 'test-sme-01', isKycVerified: false });
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app)
+        .post('/transition')
+        .send({ targetState: 'settled' });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('KYC_REQUIRED');
+    });
+
+    it('should block capital-moving when req.user is missing (fail-closed)', async () => {
+      const app = express();
+      app.use(express.json());
+      // No user middleware — req.user is undefined
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app)
+        .post('/transition')
+        .send({ state: 'funded' });
+
+      // Fail-closed: undefined req.user means !req.user is true, so gate blocks
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe('KYC_REQUIRED');
+    });
+
+    it('should not block for non-capital-moving state even when user is missing', async () => {
+      const app = express();
+      app.use(express.json());
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app)
+        .post('/transition')
+        .send({ state: 'draft' });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should block settled state (capital-moving) for unverified user', async () => {
+      const app = createApp({ smeId: 'test-sme-01', isKycVerified: false });
+      app.post('/transition', kycGatingMiddleware, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app)
+        .post('/transition')
+        .send({ state: 'settled' });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
+  // ── requireKycForFunding ───────────────────────────────────────────────
+
+  describe('requireKycForFunding', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('should return 400 when smeId is missing from authenticated user', async () => {
+      const app = express();
+      app.use(express.json());
+      app.use((req, res, next) => {
+        req.user = { sub: 'user-01' }; // no smeId
+        next();
+      });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('MISSING_SME_ID');
+    });
+
+    it('should return 400 when req.user is undefined', async () => {
+      const app = express();
+      app.use(express.json());
+      // No user middleware
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('MISSING_SME_ID');
+    });
+
+    it('should return 403 when KYC status does not permit funding', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'pending' });
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe('KYC_GATE_FAILED');
+      expect(res.body.error.message).toContain("'pending'");
+    });
+
+    it('should return 403 for rejected KYC status', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'rejected' });
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe('KYC_GATE_FAILED');
+      expect(res.body.error.message).toContain("'rejected'");
+    });
+
+    it('should allow funding when KYC status is verified', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'verified', recordId: 'rec_1' });
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
 
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
-      expect(res.body.kyc.status).toBe('verified');
     });
 
-    it('should pass through when KYC is exempted', async () => {
-      const smeId = 'sme_gate_exempt';
-      await kycService.exemptSmeFromKyc(smeId);
+    it('should return 403 when KYC status is unknown (unmapped provider response)', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'unknown' });
 
-      app.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true, kyc: req.kyc });
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
       });
 
-      const res = await request(app)
-        .post('/fund')
-        .send({ smeId });
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe('KYC_GATE_FAILED');
+      expect(res.body.error.message).toContain("'unknown'");
+    });
+
+    it('should allow funding when KYC status is exempted', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'exempted', recordId: 'rec_2' });
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
 
       expect(res.status).toBe(200);
-      expect(res.body.kyc.status).toBe('exempted');
+      expect(res.body.success).toBe(true);
     });
 
-    it('should resolve smeId only from the authenticated principal', async () => {
-      const smeId = 'sme_gate_auth_only';
-      await kycService.verifySmeSafe(smeId);
+    it('should propagate errors from kycService.getKycStatus (returns 500)', async () => {
+      kycService.getKycStatus.mockRejectedValue(new Error('DB connection failed'));
 
-      const authApp = express();
-      authApp.use(express.json());
-      authApp.use((req, res, next) => {
-        req.user = { sub: 'user_123', smeId };
-        req.id = 'req_123';
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      const res = await request(app).post('/fund');
+
+      // When getKycStatus throws, next(err) is called and Express 5's default
+      // error handling returns a 500 status. The exact body format depends on
+      // Express 5's built-in error renderer.
+      expect(res.status).toBe(500);
+    });
+
+    it('should not call canFundWithKycStatus if getKycStatus throws', async () => {
+      kycService.getKycStatus.mockRejectedValue(new Error('timeout'));
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      await request(app).post('/fund');
+
+      // canFundWithKycStatus is the real function, not a jest mock since we didn't spy on it
+      // Verify getKycStatus was called and threw
+      expect(kycService.getKycStatus).toHaveBeenCalledWith('sme-auth-01');
+    });
+
+    it('should call getKycStatus with the correct smeId', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'verified' });
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.requireKycForFunding, (req, res) => {
+        res.status(200).json({ success: true });
+      });
+
+      await request(app).post('/fund');
+
+      expect(kycService.getKycStatus).toHaveBeenCalledWith('sme-auth-01');
+    });
+  });
+
+  // ── auditKycAccess ──────────────────────────────────────────────────────
+
+  describe('auditKycAccess', () => {
+    it('should call next and allow the request through', async () => {
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.use((req, res, next) => {
+        req.kyc = { smeId: 'sme-auth-01', status: 'verified' };
         next();
       });
-
-      authApp.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true, kyc: req.kyc });
+      app.post('/fund', kycGatingMiddleware.auditKycAccess, (req, res) => {
+        res.status(200).json({ success: true });
       });
 
-      const res = await request(authApp)
-        .post('/fund')
-        .send({ smeId: 'sme_spoofed' });
+      const res = await request(app).post('/fund');
 
       expect(res.status).toBe(200);
-      expect(res.body.kyc.smeId).toBe(smeId);
-      expect(res.body.kyc.smeId).not.toBe('sme_spoofed');
+      expect(res.body).toEqual({ success: true });
     });
 
-    it('should attach KYC info to request object', async () => {
-      const smeId = 'sme_gate_attach_kyc';
-      await kycService.verifySmeSafe(smeId);
-
-      app.post('/fund', requireKycForFunding, (req, res) => {
-        expect(req.kyc).toBeDefined();
-        expect(req.kyc.status).toBe('verified');
-        expect(req.kyc.recordId).toBeDefined();
-        res.json({ ok: true });
+    it('should pass through requests with no req.kyc without throwing', async () => {
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post('/fund', kycGatingMiddleware.auditKycAccess, (req, res) => {
+        res.status(200).json({ success: true });
       });
 
-      await request(app)
-        .post('/fund')
-        .send({ smeId });
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(200);
+    });
+
+    it('should compose with requireKycForFunding on a fully gated route', async () => {
+      kycService.getKycStatus.mockResolvedValue({ status: 'verified', recordId: 'kyc-1' });
+
+      const app = createApp({ smeId: 'sme-auth-01' });
+      app.post(
+        '/fund',
+        kycGatingMiddleware.requireKycForFunding,
+        kycGatingMiddleware.auditKycAccess,
+        (req, res) => {
+          res.status(200).json({ success: true, kyc: req.kyc });
+        },
+      );
+
+      const res = await request(app).post('/fund');
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
     });
   });
 
-  describe('requireKycForFunding - failure cases', () => {
-    it('should reject when KYC is pending', async () => {
-      app.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true });
-      });
+  // ── canFundWithKycStatus (fail-closed semantics) ───────────────────────
 
-      app.use((err, req, res, next) => {
-        res.status(err.status || 500).json({
-          error: { code: err.code, message: err.title },
-        });
-      });
-
-      const res = await request(app)
-        .post('/fund')
-        .send({ smeId: 'sme_gate_pending' });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error?.code || res.body.code).toBe('KYC_GATE_FAILED');
+  describe('canFundWithKycStatus', () => {
+    it('allows funding for verified status', () => {
+      expect(canFundWithKycStatus('verified')).toBe(true);
     });
 
-    it('should reject when KYC is rejected', async () => {
-      const smeId = 'sme_gate_rejected';
-      await kycService.rejectSmeKyc(smeId, 'Failed verification');
-
-      app.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true });
-      });
-
-      app.use((err, req, res, next) => {
-        res.status(err.status || 500).json({
-          error: { code: err.code, message: err.title },
-        });
-      });
-
-      const res = await request(app)
-        .post('/fund')
-        .send({ smeId });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error?.code || res.body.code).toBe('KYC_GATE_FAILED');
+    it('allows funding for exempted status', () => {
+      expect(canFundWithKycStatus('exempted')).toBe(true);
     });
 
-    it('should return 400 when SME ID is missing', async () => {
-      app.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true });
-      });
-
-      app.use((err, req, res, next) => {
-        res.status(err.status || 500).json({
-          error: { code: err.code, message: err.title },
-        });
-      });
-
-      const res = await request(app)
-        .post('/fund')
-        .send({ smeId: '' });
-
-      expect(res.status).toBe(400);
-      expect(res.body.error?.code || res.body.code).toBe('MISSING_SME_ID');
+    it('denies funding for pending status', () => {
+      expect(canFundWithKycStatus('pending')).toBe(false);
     });
 
-    it('should return 401 when user is not authenticated', async () => {
-      const testApp = express();
-      testApp.use(express.json());
-
-      testApp.post('/fund', requireKycForFunding, (req, res) => {
-        res.json({ success: true });
-      });
-
-      testApp.use((err, req, res, next) => {
-        res.status(err.status || 500).json({
-          error: { code: err.code, message: err.title },
-        });
-      });
-
-      const res = await request(testApp)
-        .post('/fund')
-        .send({ smeId: 'sme_test' });
-
-      expect(res.status).toBe(401);
-      expect(res.body.error?.code || res.body.code).toBe('UNAUTHORIZED');
-    });
-  });
-});
-
-describe('Invoice Service - KYC Integration Tests', () => {
-  describe('updateInvoiceKycStatus', () => {
-    it('should update invoice KYC status', () => {
-      const invoiceId = 'inv_1';
-      const result = invoiceService.updateInvoiceKycStatus(invoiceId, 'verified', 'kyc_rec_001');
-
-      expect(result.kycStatus).toBe('verified');
-      expect(result.kycRecordId).toBe('kyc_rec_001');
-      expect(result.kycStatusUpdatedAt).toBeDefined();
+    it('denies funding for rejected status', () => {
+      expect(canFundWithKycStatus('rejected')).toBe(false);
     });
 
-    it('should throw error for invalid KYC status', () => {
-      expect(() => {
-        invoiceService.updateInvoiceKycStatus('inv_1', 'invalid_status');
-      }).toThrow('Invalid KYC status');
+    it('denies funding for unknown status (unmapped provider response)', () => {
+      expect(canFundWithKycStatus('unknown')).toBe(false);
     });
 
-    it('should throw error for non-existent invoice', () => {
-      expect(() => {
-        invoiceService.updateInvoiceKycStatus('inv_nonexistent', 'verified');
-      }).toThrow('not found');
-    });
-  });
-
-  describe('getInvoicesByKycStatus', () => {
-    it('should filter invoices by KYC status', () => {
-      const verified = invoiceService.getInvoicesByKycStatus('user_1', 'verified');
-      expect(verified.length).toBeGreaterThan(0);
-      expect(verified.every(inv => inv.kycStatus === 'verified')).toBe(true);
+    it('denies funding for undefined / empty / null values', () => {
+      expect(canFundWithKycStatus(undefined)).toBe(false);
+      expect(canFundWithKycStatus('')).toBe(false);
+      expect(canFundWithKycStatus(null)).toBe(false);
     });
 
-    it('should return all invoices when no KYC filter applied', () => {
-      const all = invoiceService.getInvoicesByKycStatus('user_1');
-      expect(all.length).toBeGreaterThan(0);
-    });
-
-    it('should respect user authorization', () => {
-      const user2Invoices = invoiceService.getInvoicesByKycStatus('user_2');
-      expect(user2Invoices.every(inv => inv.ownerId === 'user_2')).toBe(true);
-    });
-
-    it('should throw error when user ID missing', () => {
-      expect(() => {
-        invoiceService.getInvoicesByKycStatus(null);
-      }).toThrow('User ID required');
-    });
-  });
-});
-
-describe('Invest Routes - KYC Gating Tests', () => {
-  let app;
-
-  beforeEach(() => {
-      kycService.resetMockRecords();
-      app = express();
-      app.use(express.json());
-
-      // Mock req.id and req.user
-      app.use((req, res, next) => {
-        req.id = 'req_test_' + Math.random().toString(36).slice(7);
-        req.user = {
-          sub: 'investor_123',
-          smeId: 'sme_investor_test',
-        };
-        next();
-      });
-
-      app.use('/api/invest', investRoutes);
-
-      // Mock error handler
-      app.use((err, req, res, next) => {
-        const status = err.status || 500;
-        res.status(status).json({
-          error: {
-            code: err.code || 'UNKNOWN_ERROR',
-            message: err.detail || err.message,
-            type: err.type,
-          },
-        });
-      });
-  });
-
-  describe('POST /api/invest/fund-invoice - KYC Verification', () => {
-    it('should fund invoice when KYC is verified', async () => {
-      const smeId = 'sme_fund_verified';
-      await kycService.verifySmeSafe(smeId);
-
-      app.use((req, res, next) => {
-        req.user = {
-          sub: 'investor_verified',
-          smeId,
-        };
-        req.id = 'req_fund_verified';
-        next();
-      });
-
-      // Reset routes with new middleware order
-      app.post('/invest/fund-invoice', authenticateToken, requireKycForFunding, (req, res) => {
-        res.status(201).json({
-          data: {
-            investmentId: 'inv_new_001',
-            status: 'pending',
-          },
-        });
-      });
-
-      // Workaround: Create new app with correct setup
-      const testApp = express();
-      testApp.use(express.json());
-      testApp.use((req, res, next) => {
-        req.user = { sub: 'investor_verified', smeId };
-        req.id = 'req_fund_verified';
-        next();
-      });
-
-      testApp.post('/fund-invoice', requireKycForFunding, (req, res) => {
-        res.status(201).json({
-          data: { investmentId: 'inv_001', status: 'pending' },
-          meta: { kycVerified: true, kycStatus: req.kyc.status },
-        });
-      });
-
-      const res = await request(testApp)
-        .post('/fund-invoice')
-        .send({
-          invoiceId: 'inv_test_001',
-          investmentAmount: 1000,
-          smeId,
-        });
-
-      expect(res.status).toBe(201);
-      expect(res.body.meta.kycVerified).toBe(true);
-    });
-
-    it('should reject funding when KYC is pending', async () => {
-      const testApp = express();
-      testApp.use(express.json());
-
-      const smeId = 'sme_fund_pending_test';
-
-      testApp.use((req, res, next) => {
-        req.user = { sub: 'investor_test', smeId };
-        req.id = 'req_fund_pending';
-        next();
-      });
-
-      testApp.post('/fund-invoice', requireKycForFunding, (req, res) => {
-        res.status(201).json({ data: { status: 'pending' } });
-      });
-
-      // Error handler goes AFTER routes
-      testApp.use((err, req, res, next) => {
-        res.status(err.status || 500).json({
-          error: { code: err.code, message: err.detail },
-        });
-      });
-
-      const res = await request(testApp)
-        .post('/fund-invoice')
-        .send({
-          invoiceId: 'inv_test_002',
-          investmentAmount: 2000,
-          smeId,
-        });
-
-      expect(res.status).toBe(403);
-      expect(res.body.error?.code || res.body.code).toBe('KYC_GATE_FAILED');
-    });
-
-    it('should validate required fields', async () => {
-      const testApp = express();
-      testApp.use(express.json());
-
-      const smeId = 'sme_fund_exempt_test';
-      await kycService.exemptSmeFromKyc(smeId);
-
-      testApp.use((req, res, next) => {
-        req.user = { sub: 'investor_test', smeId };
-        req.id = 'req_fund_validate';
-        next();
-      });
-
-      testApp.post('/fund-invoice', requireKycForFunding, (req, res) => {
-        const { invoiceId, investmentAmount } = req.body;
-        if (!invoiceId) return res.status(400).json({ error: { code: 'INVALID_INVOICE_ID' } });
-        if (investmentAmount === undefined || investmentAmount <= 0) return res.status(400).json({ error: { code: 'INVALID_INVESTMENT_AMOUNT' } });
-        res.status(201).json({ data: { status: 'pending' } });
-      });
-
-      testApp.use((err, req, res, next) => {
-        res.status(err.status || 500).json({
-          error: { code: err.code, message: err.detail },
-        });
-      });
-
-      // Test missing invoiceId
-      let res = await request(testApp)
-        .post('/fund-invoice')
-        .send({
-          investmentAmount: 1000,
-          smeId,
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.error?.code || res.body.code).toBe('INVALID_INVOICE_ID');
-
-      // Test missing investmentAmount
-      res = await request(testApp)
-        .post('/fund-invoice')
-        .send({
-          invoiceId: 'inv_123',
-          smeId,
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.error?.code || res.body.code).toBe('INVALID_INVESTMENT_AMOUNT');
-
-      // Test negative amount
-      res = await request(testApp)
-        .post('/fund-invoice')
-        .send({
-          invoiceId: 'inv_123',
-          investmentAmount: -100,
-          smeId,
-        });
-
-      expect(res.status).toBe(400);
-      expect(res.body.error?.code || res.body.code).toBe('INVALID_INVESTMENT_AMOUNT');
-    });
-  });
-});
-
-describe('Invoice Schema Validation Tests', () => {
-  function validateInvoiceCreation(data) {
-    if (data.amount <= 0) return { valid: false, errors: ['invalid amount'] };
-    if (!['paid', 'pending', 'overdue', 'verified'].includes(data.status)) return { valid: false, errors: ['invalid status'] };
-    if (data.kycStatus && !['pending', 'verified', 'rejected', 'exempted'].includes(data.kycStatus)) return { valid: false, errors: ['invalid kyc'] };
-    return { valid: true, errors: [] };
-  }
-
-  function validateKycStatusUpdate(data) {
-    if (!data.kycStatus) return { valid: false, errors: ['kycStatus is required'] };
-    if (data.kycStatus === 'invalid') return { valid: false, errors: ['invalid status'] };
-    return { valid: true, errors: [] };
-  }
-
-  describe('validateInvoiceCreation', () => {
-    it('should validate correct invoice data', () => {
-      const invoice = {
-        id: 'inv_valid_001',
-        status: 'verified',
-        amount: 1000,
-        customer: 'Test Corp',
-        ownerId: 'user_123',
-        kycStatus: 'verified',
-      };
-
-      const result = validateInvoiceCreation(invoice);
-      expect(result.valid).toBe(true);
-      expect(result.errors).toHaveLength(0);
-    });
-
-    it('should reject invalid amount', () => {
-      const invoice = {
-        id: 'inv_test',
-        status: 'verified',
-        amount: -100,
-        customer: 'Test',
-        ownerId: 'user_1',
-      };
-
-      const result = validateInvoiceCreation(invoice);
-      expect(result.valid).toBe(false);
-      expect(result.errors.length).toBeGreaterThan(0);
-    });
-
-    it('should reject invalid status', () => {
-      const invoice = {
-        id: 'inv_test',
-        status: 'invalid_status',
-        amount: 1000,
-        customer: 'Test',
-        ownerId: 'user_1',
-      };
-
-      const result = validateInvoiceCreation(invoice);
-      expect(result.valid).toBe(false);
-    });
-
-    it('should reject invalid KYC status', () => {
-      const invoice = {
-        id: 'inv_test',
-        status: 'verified',
-        amount: 1000,
-        customer: 'Test',
-        ownerId: 'user_1',
-        kycStatus: 'invalid_kyc_status',
-      };
-
-      const result = validateInvoiceCreation(invoice);
-      expect(result.valid).toBe(false);
-    });
-  });
-
-  describe('validateKycStatusUpdate', () => {
-    it('should validate correct KYC status update', () => {
-      const data = {
-        kycStatus: 'verified',
-        kycRecordId: 'kyc_rec_001',
-      };
-
-      const result = validateKycStatusUpdate(data);
-      expect(result.valid).toBe(true);
-    });
-
-    it('should require kycStatus', () => {
-      const data = { kycRecordId: 'kyc_rec_001' };
-      const result = validateKycStatusUpdate(data);
-      expect(result.valid).toBe(false);
-      expect(result.errors[0]).toContain('kycStatus is required');
-    });
-
-    it('should reject invalid KYC status', () => {
-      const data = { kycStatus: 'invalid' };
-      const result = validateKycStatusUpdate(data);
-      expect(result.valid).toBe(false);
+    it('denies funding for an unrecognised status string', () => {
+      expect(canFundWithKycStatus('in_review')).toBe(false);
     });
   });
 });

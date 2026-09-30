@@ -138,6 +138,76 @@ describe('escrowIndexer metrics and health', () => {
       expect(newSkipped).toBe(baselineSkipped + 1);
     });
 
+    test('contract-only events resolved via reverse lookup increment processed counter', async () => {
+      const actualEscrowMap = jest.requireActual('../../src/config/escrowMap');
+      const ADDR = 'C' + 'M'.repeat(55);
+      const originalFetch = global.fetch;
+      const processedIncSpy = jest.spyOn(escrowIndexerEventsProcessedTotal, 'inc');
+      const skippedIncSpy = jest.spyOn(escrowIndexerEventsSkippedTotal, 'inc');
+
+      process.env.ESCROW_ADDR_BY_INVOICE = JSON.stringify({
+        mappings: [
+          { invoiceId: 'inv_metrics', escrowAddress: ADDR, environment: 'test', isActive: true },
+        ],
+        defaultEnvironment: 'test',
+        allowlistEnabled: true,
+      });
+      process.env.NODE_ENV = 'test';
+      actualEscrowMap._resetCache();
+
+      global.fetch = jest.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          _embedded: {
+            records: [
+              {
+                id: 'evt_contract_only',
+                contract_id: ADDR,
+                type: 'contract',
+                ledger: 100,
+                paging_token: '100-1',
+              },
+            ],
+          },
+        }),
+      }));
+
+      const mockStore = {
+        loadCursor: jest.fn().mockResolvedValue(null),
+        saveCursor: jest.fn(),
+        findProjection: jest.fn(),
+        upsertEvent: jest.fn(),
+        upsertProjection: jest.fn(),
+      };
+
+      const mockTransactionRunner = async (handler) => handler({ fn: { now: () => new Date() } });
+
+      const { fetchEscrowEventsFromHorizon } = require('../../src/jobs/escrowIndexer');
+
+      const indexer = createEscrowIndexer({
+        store: mockStore,
+        fetchEscrowEvents: (params) =>
+          fetchEscrowEventsFromHorizon({
+            baseUrl: 'https://horizon.example',
+            cursor: params.cursor,
+            limit: params.limit,
+          }),
+        transactionRunner: mockTransactionRunner,
+        log: { info: jest.fn(), error: jest.fn(), warn: jest.fn() },
+      });
+
+      await indexer.runCycle();
+
+      expect(processedIncSpy).toHaveBeenCalledWith(1);
+      expect(skippedIncSpy).toHaveBeenCalledWith(0);
+
+      processedIncSpy.mockRestore();
+      skippedIncSpy.mockRestore();
+      global.fetch = originalFetch;
+      delete process.env.ESCROW_ADDR_BY_INVOICE;
+      actualEscrowMap._resetCache();
+    });
+
     test('last-advance gauge is updated when cursor advances', async () => {
       jest.setSystemTime(new Date('2026-05-29T12:00:00Z'));
       const expectedTimestamp = Math.floor(Date.now() / 1000); // 1748610000

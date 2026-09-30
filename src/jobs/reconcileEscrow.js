@@ -24,9 +24,16 @@
 const logger = require('../logger');
 const db = require('../db/knex');
 const { readFundedAmount } = require('../services/escrowRead');
-const { escrowReconciliationMismatches } = require('../metrics');
+const {
+  escrowReconciliationMismatches,
+  escrowReconciliationMismatchedInvoicesGauge,
+  escrowReconciliationDriftMagnitudeGauge,
+  escrowReconciliationDriftAlertsTotal,
+} = require('../metrics');
 const JobQueue = require('../workers/jobQueue');
 const BackgroundWorker = require('../workers/worker');
+const sentry = require('../observability/sentry');
+
 
 /**
  * Reconciliation result status.
@@ -50,6 +57,151 @@ const RECONCILABLE_STATUSES = ['linked_escrow', 'funded', 'partially_funded'];
 
 /** Default page size for the paginated DB scan. */
 const DEFAULT_PAGE_SIZE = 100;
+
+/**
+ * Number of mismatches in a single run that constitutes a "drift alert".
+ * Reads from `RECONCILIATION_DRIFT_THRESHOLD` env var at call time so that
+ * tests can override it via `process.env` without module re-loading.
+ * Defaults to 1 (any mismatch triggers an alert).
+ *
+ * @returns {number}
+ */
+function getDriftThreshold() {
+  return Math.max(1, parseInt(process.env.RECONCILIATION_DRIFT_THRESHOLD, 10) || 1);
+}
+
+/**
+ * Stable export for documentation / tests that need to inspect the default.
+ * @constant {number}
+ */
+const DRIFT_THRESHOLD = getDriftThreshold();
+
+
+/**
+ * Reads the mismatch alert threshold for per-invoice mismatch alerts.
+
+ * Defaults to 1 so any mismatch triggers an alert.
+ *
+ * @returns {number}
+ */
+function getMismatchAlertThreshold() {
+  return Math.max(
+    1,
+    parseInt(process.env.RECONCILIATION_MISMATCH_ALERT_THRESHOLD, 10) || 1,
+  );
+}
+
+/**
+ * Returns the configured alert channel.
+ *
+ * @returns {'log'|'sentry'|'sentry+log'}
+ */
+function getMismatchAlertChannel() {
+  const raw = process.env.RECONCILIATION_MISMATCH_ALERT_CHANNEL || 'sentry+log';
+  if (raw === 'log') { return 'log'; }
+  if (raw === 'sentry') { return 'sentry'; }
+  if (raw === 'sentry+log') { return 'sentry+log'; }
+  return 'sentry+log';
+}
+
+/**
+ * Raises a structured per-invoice alert when an escrow reconciliation mismatch
+ * is detected. Called once for every invoice whose DB `fundedTotal` diverges
+ * from the on-chain `funded_amount`.
+ *
+ * Alert behaviour is governed by two environment variables:
+ *
+ * - `RECONCILIATION_MISMATCH_ALERT_CHANNEL` (`'log'` | `'sentry'` |
+ *   `'sentry+log'`, default `'sentry+log'`) — controls which channels receive
+ *   the per-invoice alert.
+ * - `RECONCILIATION_MISMATCH_ALERT_THRESHOLD` (integer ≥ 1, default `1`) —
+ *   minimum per-run mismatch count before per-invoice alerts are emitted.
+ *   Raising this above `1` suppresses noisy single-mismatch escalations in
+ *   environments where some drift is expected.
+ *
+ * Security: only non-sensitive, minimal fields are forwarded to external
+ * channels. Raw invoice body, contract addresses, XDR, and private keys are
+ * never included. Sentry capture goes through {@link module:observability/sentry}
+ * `beforeSend` which applies an additional scrub pass before transmission.
+ *
+ * @param {object} params
+ * @param {string} params.invoiceId    - Invoice identifier (non-secret).
+ * @param {number} params.expected     - Expected funded amount from the DB.
+ * @param {number} params.actual       - Actual funded amount from the chain.
+ * @param {number} params.driftMagnitude - `|expected − actual|`.
+ * @param {number} [params.runMismatches=1] - Total mismatches in this run
+ *   (used to apply the per-run threshold gate before firing per-invoice alerts).
+ * @returns {void}
+ */
+function raiseReconciliationMismatchAlert({
+  invoiceId,
+  expected,
+  actual,
+  driftMagnitude,
+  runMismatches = 1,
+}) {
+  const channel = getMismatchAlertChannel();
+  const threshold = getMismatchAlertThreshold();
+
+  // Per-run threshold gate: suppress per-invoice escalation when the total
+  // number of mismatches in this run is below the configured threshold.
+  // This prevents alert fatigue in environments where occasional single-invoice
+  // drift is expected and only large-scale drift should trigger escalation.
+  if (runMismatches < threshold) { return; }
+
+  if (channel === 'log' || channel === 'sentry+log') {
+    logger.warn(
+      {
+        alert: 'reconciliation_mismatch',
+        invoiceId,
+        expected,
+        actual,
+        driftMagnitude,
+        runMismatches,
+        threshold,
+      },
+      'Escrow mismatch alert: funded-amount drift detected',
+    );
+  }
+
+  if (channel === 'sentry' || channel === 'sentry+log') {
+    if (sentry && typeof sentry.isEnabled === 'function' && sentry.isEnabled()) {
+      const error = new Error('Escrow reconciliation mismatch');
+      // captureException(error, req) in sentry.js treats the second arg as an
+      // Express request. For background jobs there is no request, so we use
+      // Sentry.withScope directly if available, otherwise fall back to the
+      // standard captureException path which will still fire the beforeSend
+      // scrubber registered at init time.
+      try {
+        const SentryLib = require('@sentry/node');
+        if (SentryLib && typeof SentryLib.withScope === 'function') {
+          SentryLib.withScope((scope) => {
+            scope.setTag('alert_type', 'reconciliation_mismatch');
+            scope.setTag('invoice_id', invoiceId);
+            scope.setExtra('expected', expected);
+            scope.setExtra('actual', actual);
+            scope.setExtra('drift_magnitude', driftMagnitude);
+            scope.setExtra('run_mismatches', runMismatches);
+            scope.setExtra('threshold', threshold);
+            SentryLib.captureException(error);
+          });
+        } else {
+          // Sentry not fully initialized — fall back to the wrapper which is
+          // a no-op when not enabled.
+          sentry.captureException(error);
+        }
+      } catch (_sentryErr) {
+        // Sentry itself is unavailable (e.g. @sentry/node not installed).
+        // This is non-fatal; the log channel already fired above.
+      }
+    }
+  }
+}
+
+
+
+
+
 
 /**
  * Coerces a DB-sourced funded total into a finite number.
@@ -78,6 +230,7 @@ function toFundedTotal(value) {
  * @yields {{ id: string, fundedTotal: number }} One invoice per iteration.
  */
 async function* iterateInvoicesFromDb(options = {}) {
+
   const dbClient = options.dbClient || db;
   const rawSize = Number(options.pageSize) || DEFAULT_PAGE_SIZE;
   const pageSize = Math.min(Math.max(1, Math.trunc(rawSize)), 1000);
@@ -126,7 +279,9 @@ async function* iterateInvoicesFromDb(options = {}) {
  * @returns {Promise<Object>} Reconciliation result (status MATCH | MISMATCH | ERROR).
  */
 async function reconcileInvoice(invoiceId, dbFundedTotal, options = {}) {
+
   try {
+
     const onChainAmount = await readFundedAmount(invoiceId, {
       escrowAdapter: options.escrowAdapter,
     });
@@ -140,6 +295,7 @@ async function reconcileInvoice(invoiceId, dbFundedTotal, options = {}) {
         { invoiceId, dbFundedTotal, onChainAmount },
         `Escrow mismatch for invoice ${invoiceId}: DB=${dbFundedTotal}, OnChain=${onChainAmount}`,
       );
+
       escrowReconciliationMismatches.inc();
     }
 
@@ -148,9 +304,11 @@ async function reconcileInvoice(invoiceId, dbFundedTotal, options = {}) {
       status,
       dbFundedTotal,
       onChainAmount,
+      driftMagnitude: matches ? 0 : Math.abs(dbFundedTotal - onChainAmount),
       reconciledAt: new Date().toISOString(),
     };
   } catch (error) {
+
     logger.error(
       { invoiceId, dbFundedTotal, err: error?.message },
       `Error reconciling invoice ${invoiceId}: ${error.message}`,
@@ -231,6 +389,45 @@ async function performReconciliation(options = {}) {
   logger.info(
     `Escrow reconciliation completed: ${summary.matches} matches, ${summary.mismatches} mismatches, ${summary.errors} errors`,
   );
+
+  // ── Post-run metrics ──────────────────────────────────────────────────────
+
+  // Gauge: mismatched invoice count for this run.
+  escrowReconciliationMismatchedInvoicesGauge.set(summary.mismatches);
+
+  // Gauge: total drift magnitude (sum of |DB − on-chain|) for this run.
+  const totalDrift = results.reduce((acc, r) => acc + (r.driftMagnitude || 0), 0);
+  escrowReconciliationDriftMagnitudeGauge.set(totalDrift);
+
+  // Alert counter: increment when this run's mismatch count breaches the threshold.
+  if (summary.mismatches >= getDriftThreshold()) {
+    escrowReconciliationDriftAlertsTotal.inc();
+    logger.error(
+      {
+        mismatches: summary.mismatches,
+        threshold: getDriftThreshold(),
+        totalDrift,
+        reconciledAt: summary.reconciledAt,
+      },
+      `Reconciliation drift alert: ${summary.mismatches} mismatches exceed threshold of ${getDriftThreshold()}`,
+    );
+
+    // Raise a structured per-invoice alert for each mismatch in this run,
+    // now that we know the full run mismatch count. This fires the configured
+    // alert channel (log / sentry / sentry+log) with the final runMismatches
+    // count so consumers can correlate individual invoices to the run alert.
+    for (const r of results) {
+      if (r.status === RECONCILE_STATUS.MISMATCH) {
+        raiseReconciliationMismatchAlert({
+          invoiceId: r.invoiceId,
+          expected: r.dbFundedTotal,
+          actual: r.onChainAmount,
+          driftMagnitude: r.driftMagnitude,
+          runMismatches: summary.mismatches,
+        });
+      }
+    }
+  }
 
   await persistReconciliationSummary(summary, dbClient);
 
@@ -319,6 +516,11 @@ module.exports = {
   handleReconciliationJob,
   scheduleNightlyReconciliation,
   getReconciliationSummary,
+  raiseReconciliationMismatchAlert,
+  getMismatchAlertChannel,
+  getMismatchAlertThreshold,
+  getDriftThreshold,
   RECONCILE_STATUS,
   RECONCILABLE_STATUSES,
+  DRIFT_THRESHOLD,
 };

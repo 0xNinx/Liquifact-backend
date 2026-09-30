@@ -132,4 +132,52 @@ describe('Audit log append-only DB triggers (Postgres)', () => {
       expect(isAppendOnlyTriggerError(error)).toBe(true);
     }
   });
+
+  test('retention policy and legal-hold mutations persist as append-only events', async () => {
+    if (!pg) {
+      return;
+    }
+
+    const retentionEvent = {
+      eventType: 'retention_mutation',
+      action: 'retention.legal_hold.release',
+      actorType: 'user',
+      actorId: 'admin-retention-1',
+      targetType: 'legal_hold',
+      targetId: 'hold_123',
+      requestId: 'req_retention_hold_release',
+      route: '/api/retention/legal-holds/hold_123/release',
+      method: 'POST',
+      statusCode: 200,
+      ipAddress: '127.0.0.1',
+      userAgent: 'jest',
+      metadata: {
+        tenantId: 'tenant-alpha',
+        invoiceId: 'inv_123',
+        releaseReason: 'Investigation closed',
+        before: { status: 'active' },
+        after: { status: 'released', release_reason: 'Investigation closed' },
+      },
+    };
+
+    await appendAuditEvent(retentionEvent, { db: pg });
+
+    const inserted = await pg('audit_log_events')
+      .select(['id', 'event_type', 'action', 'metadata'])
+      .where({ request_id: 'req_retention_hold_release' })
+      .first();
+
+    expect(inserted).toBeTruthy();
+    expect(inserted.event_type).toBe('retention_mutation');
+    expect(inserted.action).toBe('retention.legal_hold.release');
+    expect(inserted.metadata.tenantId).toBe('tenant-alpha');
+    expect(inserted.metadata.after.status).toBe('released');
+
+    try {
+      await pg('audit_log_events').where({ id: inserted.id }).update({ action: 'mutated' });
+      throw new Error('Expected UPDATE to be rejected by append-only trigger.');
+    } catch (error) {
+      expect(isAppendOnlyTriggerError(error)).toBe(true);
+    }
+  });
 });

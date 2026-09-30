@@ -26,8 +26,8 @@
 // integration tests talk to a real in-memory SQLite database.
 // ---------------------------------------------------------------------------
 jest.mock('../src/db/knex', () => {
-  const knex = require('knex');
-  const config = require('../knexfile')['test'];
+  const knex = jest.requireActual('knex');
+  const config = jest.requireActual('../knexfile')['test'];
   return knex(config);
 });
 
@@ -109,6 +109,9 @@ function postInvoice(tenantId, overrides = {}) {
   const body = {
     amount: 500,
     customer: 'Acme Corp',
+    seller: 'Seller Corp',
+    currency: 'USD',
+    dueDate: '2026-12-31',
     ...overrides,
   };
   return request(app)
@@ -128,6 +131,28 @@ function getInvoices(tenantId, query = {}) {
     .get('/v1/invoices')
     .set('x-tenant-id', tenantId)
     .query(query);
+}
+
+/**
+ * PATCHs an invoice for the given tenant with the provided body.
+ * @param {string} tenantId
+ * @param {string} invoiceId
+ * @param {object} body
+ */
+function patchInvoice(tenantId, invoiceId, body) {
+  return request(app)
+    .patch(`/v1/invoices/${invoiceId}`)
+    .set('x-tenant-id', tenantId)
+    .send(body);
+}
+
+/**
+ * DELETEs an invoice for the given tenant.
+ */
+function deleteInvoiceRequest(tenantId, invoiceId) {
+  return request(app)
+    .delete(`/v1/invoices/${invoiceId}`)
+    .set('x-tenant-id', tenantId);
 }
 
 // ===========================================================================
@@ -155,7 +180,13 @@ describe('POST /v1/invoices — creation', () => {
     const res = await request(app)
       .post('/v1/invoices')
       .set('x-tenant-id', TENANT_A)
-      .send({ amount: 200, buyer: 'Buyer Name Ltd' });
+      .send({
+        amount: 200,
+        buyer: 'Buyer Name Ltd',
+        seller: 'Seller Corp',
+        currency: 'USD',
+        dueDate: '2026-12-31'
+      });
 
     expect(res.status).toBe(201);
     expect(res.body.data.customer).toBe('Buyer Name Ltd');
@@ -171,6 +202,43 @@ describe('POST /v1/invoices — creation', () => {
     });
 
     expect(res.status).toBe(201);
+  });
+
+  it('rejects duplicate invoice references within the same tenant', async () => {
+    const first = await postInvoice(TENANT_A, { invoiceNumber: 'INV-1001' });
+    expect(first.status).toBe(201);
+
+    const second = await postInvoice(TENANT_A, { invoiceNumber: 'INV-1001' });
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe('INVOICE_REFERENCE_CONFLICT');
+  });
+
+  it('allows the same invoice reference in different tenants', async () => {
+    const first = await postInvoice(TENANT_A, { invoiceNumber: 'INV-2002' });
+    const second = await postInvoice(TENANT_B, { invoiceNumber: 'INV-2002' });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+  });
+
+  it('normalizes invoice references case-insensitively within a tenant', async () => {
+    const first = await postInvoice(TENANT_A, { invoiceNumber: 'INV-3003' });
+    const second = await postInvoice(TENANT_A, { invoiceNumber: 'inv-3003' });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(409);
+    expect(second.body.code).toBe('INVOICE_REFERENCE_CONFLICT');
+  });
+
+  it('rejects concurrent creates with the same tenant-scoped invoice reference', async () => {
+    const [first, second] = await Promise.all([
+      postInvoice(TENANT_A, { invoiceNumber: 'INV-4004' }),
+      postInvoice(TENANT_A, { invoiceNumber: 'inv-4004' }),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([201, 409]);
+    const conflict = [first, second].find((res) => res.status === 409);
+    expect(conflict.body.code).toBe('INVOICE_REFERENCE_CONFLICT');
   });
 
   it('returns 422 RFC 7807 when amount is missing', async () => {
@@ -472,5 +540,103 @@ describe('RFC 7807 error response format', () => {
     // Tenant middleware returns a plain JSON error (not RFC 7807), consistent
     // with the existing middleware contract
     expect(res.body).toHaveProperty('error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /v1/invoices/:id — partial updates
+// ---------------------------------------------------------------------------
+
+describe('PATCH /v1/invoices/:id — partial updates', () => {
+  it('updates allowed fields and returns 200', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 400, customer: 'Updatable Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    const res = await patchInvoice(TENANT_A, invoiceId, { amount: 450, customer: 'Updated Co' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.amount).toBeDefined();
+    expect(Number(res.body.data.amount)).toBeCloseTo(450, 1);
+    expect(res.body.data.customer).toBe('Updated Co');
+  });
+
+  it('returns 422 when payload fails validation', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 300, customer: 'BadPatch Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    const res = await patchInvoice(TENANT_A, invoiceId, { amount: 'not-a-number' });
+    expect(res.status).toBe(422);
+    expect(res.headers['content-type']).toMatch(/application\/problem\+json/);
+  });
+
+  it('returns 404 for unknown invoice', async () => {
+    const res = await patchInvoice(TENANT_A, 'inv_does_not_exist', { amount: 100 });
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 404 when cross-tenant patch attempted', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 120, customer: 'CrossTenant Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    const res = await patchInvoice(TENANT_B, invoiceId, { amount: 130 });
+    expect(res.status).toBe(404);
+  });
+
+  it('rejects locked-field edits with 422', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 600, customer: 'Locked Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    // Mark invoice as verified in DB directly
+    await db('invoices').where({ invoice_id: invoiceId }).update({ status: 'verified' });
+
+    const res = await patchInvoice(TENANT_A, invoiceId, { amount: 700 });
+    expect(res.status).toBe(422);
+    // AppError passes through problemJsonHandler which renders the RFC 7807
+    // envelope; fieldErrors is available on the error code/detail fields.
+    expect(res.body.code).toBe('LOCKED_FIELD');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /v1/invoices/:id — soft delete
+// ---------------------------------------------------------------------------
+
+describe('DELETE /v1/invoices/:id — soft delete', () => {
+  it('soft-deletes the invoice and it no longer appears in default list', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 250, customer: 'Delete API Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    const res = await deleteInvoiceRequest(TENANT_A, invoiceId);
+    expect(res.status).toBe(200);
+
+    const list = await getInvoices(TENANT_A);
+    expect(list.body.data.find((i) => i.invoice_id === invoiceId)).toBeUndefined();
+
+    const listAll = await getInvoices(TENANT_A, { includeDeleted: 'true' });
+    expect(listAll.body.data.find((i) => i.invoice_id === invoiceId)).toBeDefined();
+  });
+
+  it('returns 404 when deleting an invoice from another tenant', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 350, customer: 'NoDelete Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    const res = await deleteInvoiceRequest(TENANT_B, invoiceId);
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 404 when deleting non-existent invoice', async () => {
+    const res = await deleteInvoiceRequest(TENANT_A, 'inv_not_here');
+    expect(res.status).toBe(404);
+  });
+
+  it('rejects deletion of invoices in locked statuses with 422', async () => {
+    const created = await postInvoice(TENANT_A, { amount: 420, customer: 'Locked Delete Co' });
+    const invoiceId = created.body.data.invoice_id;
+
+    // Mark invoice as settled in DB directly
+    await db('invoices').where({ invoice_id: invoiceId }).update({ status: 'settled' });
+
+    const res = await deleteInvoiceRequest(TENANT_A, invoiceId);
+    expect(res.status).toBe(422);
   });
 });

@@ -2,35 +2,221 @@
 
 const { v4: uuidv4 } = require('uuid');
 
+// Distributed per-invoice lock (issue #1213) — mocked to a pass-through so
+// this suite's assertions about purge/audit behavior aren't gated on a real
+// or fake Redis connection. Lock-contention behavior itself is covered by
+// tests/redisLock.test.js and tests/retentionPurge.lock.test.js.
+jest.mock('../src/services/redisLock');
+
 // Mock database before importing modules
 jest.mock('../src/db/knex', () => {
-  const mockQuery = {
-    where: jest.fn().mockReturnThis(),
-    whereNotIn: jest.fn().mockReturnThis(),
-    whereNull: jest.fn().mockReturnThis(),
-    whereIn: jest.fn().mockReturnThis(),
-    whereRaw: jest.fn().mockReturnThis(),
-    leftJoin: jest.fn().mockReturnThis(),
-    orderBy: jest.fn().mockReturnThis(),
-    limit: jest.fn().mockReturnThis(),
-    del: jest.fn().mockResolvedValue(1),
-    select: jest.fn().mockResolvedValue([]),
-    insert: jest.fn().mockReturnThis(),
-    update: jest.fn().mockReturnThis(),
-    delete: jest.fn().mockResolvedValue(1),
-    first: jest.fn().mockResolvedValue(null),
-    andWhere: jest.fn().mockReturnThis(),
-    orWhere: jest.fn().mockReturnThis(),
-    returning: jest.fn().mockReturnThis(),
+  const store = {
+    tenants: [],
+    users: [],
+    retention_policies: [],
+    invoices: [],
+    legal_holds: [],
+    retention_audit_log: [],
+    retention_job_executions: []
   };
 
-  // Make returning resolve to data
-  mockQuery.returning.mockReturnThis();
-  mockQuery.insert.mockResolvedValue([{ id: 'mock-id', created_at: new Date() }]);
-  mockQuery.first.mockResolvedValue(null);
-  mockQuery.select.mockResolvedValue([]);
+  const builders = {};
+  const db = jest.fn((table) => {
+    if (!builders[table]) {
+      const b = {
+        _filters: {},
+        _updateData: null,
+        _isDelete: false,
+        _isFirst: false,
+        _isInsert: false,
+        _insertedData: [],
+        _limitValue: null,
+        _orderByField: null,
+        _orderByDirection: null,
+      };
+      
+      b.where = jest.fn(function(cond, op, val) {
+        if (typeof cond === 'function') {
+          cond.call(this);
+        } else if (typeof cond === 'object') {
+          this._filters = { ...this._filters, ...cond };
+        } else if (typeof cond === 'string') {
+          if (val !== undefined) {
+            this._filters[cond] = { operator: op, value: val };
+          } else {
+            this._filters[cond] = op;
+          }
+        }
+        return this;
+      });
+      
+      b.whereNotIn = jest.fn(function(field, values) {
+        return this;
+      });
+      b.whereNull = jest.fn(function(field) {
+        this._filters[field] = null;
+        return this;
+      });
+      b.whereIn = jest.fn(function(field, values) {
+        return this;
+      });
+      b.whereRaw = jest.fn().mockReturnThis();
+      b.leftJoin = jest.fn().mockReturnThis();
+      b.orderBy = jest.fn(function(field, dir) {
+        this._orderByField = field;
+        this._orderByDirection = dir;
+        return this;
+      });
+      b.limit = jest.fn(function(val) {
+        this._limitValue = val;
+        return this;
+      });
+      b.select = jest.fn(function() {
+        return this;
+      });
+      b.first = jest.fn(function() {
+        this._isFirst = true;
+        return this;
+      });
+      b.insert = jest.fn(function(data) {
+        this._isInsert = true;
+        const rows = Array.isArray(data) ? data : [data];
+        this._insertedData = rows.map(r => ({
+          id: r.id || require('uuid').v4(),
+          created_at: new Date(),
+          ...r
+        }));
+        if (table && store[table]) {
+          store[table].push(...this._insertedData);
+        }
+        return this;
+      });
+      b.update = jest.fn(function(data) {
+        this._updateData = data;
+        return this;
+      });
+      b.del = jest.fn(function() {
+        this._isDelete = true;
+        return this;
+      });
+      b.delete = jest.fn(function() {
+        this._isDelete = true;
+        return this;
+      });
+      b.andWhere = jest.fn(function(cond, op, val) {
+        return this.where(cond, op, val);
+      });
+      b.orWhere = jest.fn().mockReturnThis();
+      b.returning = jest.fn(function() {
+        return this;
+      });
+      b.then = jest.fn(function(resolve, reject) {
+        let result;
+        if (this._isInsert) {
+          result = this._insertedData;
+        } else if (this._isDelete) {
+          if (table && store[table]) {
+            store[table] = [];
+          }
+          result = 1;
+        } else if (this._updateData) {
+          const rows = store[table] || [];
+          let updatedCount = 0;
+          rows.forEach(row => {
+            const matches = Object.keys(this._filters).every(key => {
+              const filterVal = this._filters[key];
+              if (filterVal === null) {
+                return row[key] === null || row[key] === undefined;
+              }
+              if (typeof filterVal === 'object' && filterVal.operator) {
+                const { operator, value } = filterVal;
+                if (operator === '<') return new Date(row[key]) < new Date(value);
+                if (operator === '>') return new Date(row[key]) > new Date(value);
+              }
+              return row[key] === filterVal;
+            });
+            if (matches) {
+              Object.assign(row, this._updateData);
+              updatedCount++;
+            }
+          });
+          result = updatedCount;
+        } else {
+          let data = store[table] || [];
+          let filtered = data.filter(row => {
+            const standardMatch = Object.keys(this._filters).every(key => {
+              const filterVal = this._filters[key];
+              if (filterVal === null) {
+                return row[key] === null || row[key] === undefined;
+              }
+              if (typeof filterVal === 'object' && filterVal.operator) {
+                const { operator, value } = filterVal;
+                if (operator === '<') return new Date(row[key]) < new Date(value);
+                if (operator === '>') return new Date(row[key]) > new Date(value);
+              }
+              return row[key] === filterVal;
+            });
+            
+            if (!standardMatch) return false;
+            
+            if (table === 'legal_holds') {
+              if (row.status !== 'active') return false;
+              if (row.expires_at) {
+                const expiry = new Date(row.expires_at);
+                if (expiry <= new Date()) return false;
+              }
+            }
+            
+            if (table === 'invoices') {
+              const holds = store.legal_holds || [];
+              const hasActiveHold = holds.some(h => {
+                if (h.invoice_id !== row.id || h.status !== 'active') return false;
+                if (h.expires_at) {
+                  const expiry = new Date(h.expires_at);
+                  if (expiry <= new Date()) return false;
+                }
+                return true;
+              });
+              if (hasActiveHold) return false;
+            }
+            
+            return true;
+          });
 
-  const db = jest.fn(() => mockQuery);
+          if (this._orderByField) {
+            filtered.sort((a, b) => {
+              const valA = a[this._orderByField];
+              const valB = b[this._orderByField];
+              if (valA < valB) return this._orderByDirection === 'desc' ? 1 : -1;
+              if (valA > valB) return this._orderByDirection === 'desc' ? -1 : 1;
+              return 0;
+            });
+          }
+
+          if (this._limitValue !== null) {
+            filtered = filtered.slice(0, this._limitValue);
+          }
+
+          result = this._isFirst ? (filtered[0] || null) : filtered;
+        }
+        return Promise.resolve(result).then(resolve, reject);
+      });
+      
+      builders[table] = b;
+    }
+    
+    const b = builders[table];
+    b._filters = {};
+    b._updateData = null;
+    b._isDelete = false;
+    b._isFirst = false;
+    b._isInsert = false;
+    b._insertedData = [];
+    b._limitValue = null;
+    b._orderByField = null;
+    b._orderByDirection = null;
+    return b;
+  });
   db.raw = jest.fn();
   return db;
 });
@@ -55,6 +241,9 @@ describe('Retention Purge Job - Dry Run Tests', () => {
   beforeAll(async () => {
     oldEnvNodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'test';
+    
+    // Speed up worker polling in tests
+    retentionJob.retentionWorker.pollIntervalMs = 50;
     
     // Start retention worker for tests
     retentionJob.startQueueProcessing();
@@ -165,6 +354,7 @@ describe('Retention Purge Job - Dry Run Tests', () => {
 
       expect(auditLogs).toHaveLength(1);
       expect(auditLogs[0].pii_fields).toEqual(['customer_name', 'customer_email']);
+      expect(auditLogs[0].old_values).toEqual({});
 
       // Verify job execution record
       const executions = await db('retention_job_executions')
@@ -625,6 +815,78 @@ describe('Retention Purge Job - Dry Run Tests', () => {
       const executions = await retentionJob.getRecentExecutions(testTenantId, 2);
       expect(executions).toHaveLength(2);
       expect(executions[0].dry_run).toBe(true); // Most recent
+    });
+  });
+
+  describe('Salted Hash Snapshots (Non-Dry Run Purges)', () => {
+    test('should perform real purge, nullify PII, and store salted hashes in audit log', async () => {
+      const createdDate = new Date();
+      createdDate.setDate(createdDate.getDate() - 40);
+
+      const [invoice] = await db('invoices')
+        .insert({
+          tenant_id: testTenantId,
+          invoice_number: 'INV-HASH-001',
+          amount: 150.00,
+          currency: 'USD',
+          customer_name: 'Jane Doe',
+          customer_email: 'jane@example.com',
+          customer_tax_id: 'TAX-999',
+          due_date: new Date(),
+          issue_date: new Date(),
+          status: 'completed',
+          sme_id: uuidv4(),
+          created_at: createdDate
+        })
+        .returning('*');
+
+      // Schedule real (destructive) purge job
+      const jobId = retentionJob.scheduleRetentionPurge({
+        tenantId: testTenantId,
+        policyId: testPolicyId,
+        dryRun: false,
+        performedBy: testUserId
+      });
+
+      // Wait for job completion
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Verify invoice PII data was nullified in database
+      const purgedInvoice = await db('invoices')
+        .where('id', invoice.id)
+        .first();
+
+      expect(purgedInvoice.customer_name).toBeNull();
+      expect(purgedInvoice.customer_email).toBeNull();
+      // customer_tax_id was not in the policy PII fields (only name/email), so it should remain
+      expect(purgedInvoice.customer_tax_id).toBe('TAX-999');
+
+      // Verify audit log has the correct entry with salted hashes
+      const auditLogs = await db('retention_audit_log')
+        .where({
+          tenant_id: testTenantId,
+          invoice_id: invoice.id,
+          operation: 'pii_purged'
+        });
+
+      expect(auditLogs).toHaveLength(1);
+      const auditEntry = auditLogs[0];
+      expect(auditEntry.pii_fields).toEqual(['customer_name', 'customer_email']);
+
+      // Calculate expected hashes
+      const expectedNameHash = retentionJob.hashPiiValue('Jane Doe', invoice.id);
+      const expectedEmailHash = retentionJob.hashPiiValue('jane@example.com', invoice.id);
+
+      // Verify hashes (not clear text) were stored
+      expect(auditEntry.old_values.customer_name).toBe(expectedNameHash);
+      expect(auditEntry.old_values.customer_email).toBe(expectedEmailHash);
+      expect(auditEntry.old_values.customer_name).not.toBe('Jane Doe');
+      expect(auditEntry.old_values.customer_email).not.toBe('jane@example.com');
+
+      // Verify counts in metadata
+      expect(auditEntry.metadata.purgedFieldsCount).toBe(2);
+      expect(auditEntry.metadata.policyId).toBe(testPolicyId);
+      expect(auditEntry.performed_by).toBe(testUserId);
     });
   });
 });

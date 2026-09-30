@@ -11,7 +11,11 @@
 
 exports.up = function up(knex) {
   return knex.schema.createTable('reconciliation_runs', (table) => {
-    table.uuid('id').primary().defaultTo(knex.raw('uuid_generate_v4()'));
+    if (knex.client.config.client === 'sqlite3' || knex.client.config.client === 'better-sqlite3') {
+      table.uuid('id').primary().defaultTo(knex.fn.uuid());
+    } else {
+      table.uuid('id').primary().defaultTo(knex.raw('uuid_generate_v4()'));
+    }
     table.integer('total').notNullable().defaultTo(0);
     table.integer('matches').notNullable().defaultTo(0);
     table.integer('mismatches').notNullable().defaultTo(0);

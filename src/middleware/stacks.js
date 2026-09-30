@@ -11,7 +11,9 @@
 
 const { authenticateToken } = require('./auth');
 const { extractTenant } = require('./tenant');
-const { apiKeyAuth } = require('./apiKey');
+const { authenticateApiKey } = require('./apiKeyAuth');
+
+const _adminApiKeyMiddleware = authenticateApiKey({ requiredScope: 'admin' });
 
 /**
  * Accepts either a valid admin JWT or a valid API key.
@@ -23,8 +25,10 @@ const { apiKeyAuth } = require('./apiKey');
  * @returns {void}
  */
 function adminAuth(req, res, next) {
-  if (req.headers['x-api-key']) {
-    return apiKeyAuth(req, res, next);
+  const apiKeyHeaderPresent = Object.prototype.hasOwnProperty.call(req.headers, 'x-api-key');
+
+  if (apiKeyHeaderPresent) {
+    return _adminApiKeyMiddleware(req, res, next);
   }
   return authenticateToken(req, res, next);
 }

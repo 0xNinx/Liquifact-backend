@@ -18,7 +18,7 @@
  */
 
 const request = require('supertest');
-const { createApp } = require('../src/index');
+const { createApp, resetStore } = require('../src/index');
 const jwt = require('jsonwebtoken');
 const db = require('../src/db/knex');
 const { encodeCursor, decodeCursor, CursorError } = require('../src/utils/cursorPagination');
@@ -99,6 +99,7 @@ describe('Marketplace API', () => {
   });
 
   beforeEach(() => {
+    resetStore();
     jest.clearAllMocks();
     // Default: count returns 1, data returns one sample row
     mockQuery.first.mockResolvedValue({ total: 1 });
@@ -191,7 +192,8 @@ describe('Marketplace API', () => {
         .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(400);
-      expect(res.body.errors).toBeDefined();
+      expect(res.body.fieldErrors).toBeDefined();
+      expect(res.body.fieldErrors.status).toBeDefined();
     });
   });
 
@@ -323,8 +325,8 @@ describe('Marketplace API', () => {
         .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(400);
-      expect(res.body.errors).toBeDefined();
-      expect(res.body.errors.length).toBeGreaterThan(0);
+      expect(res.body.fieldErrors).toBeDefined();
+      expect(res.body.fieldErrors.cursor).toBeDefined();
     });
 
     it('returns 400 for a base64-valid but tampered cursor', async () => {
@@ -337,7 +339,7 @@ describe('Marketplace API', () => {
         .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(400);
-      expect(res.body.errors[0]).toMatch(/signature/i);
+      expect(res.body.fieldErrors.cursor).toMatch(/signature/i);
     });
 
     it('returns 400 when cursor sort field does not match requested sortBy', async () => {
@@ -349,7 +351,7 @@ describe('Marketplace API', () => {
         .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(400);
-      expect(res.body.errors[0]).toMatch(/sort field/i);
+      expect(res.body.fieldErrors.cursor).toMatch(/sort field/i);
     });
 
     it('data length equals limit when hasMore=true', async () => {
@@ -376,8 +378,8 @@ describe('Marketplace API', () => {
         .set('Authorization', `Bearer ${tokenA}`);
 
       expect(res.status).toBe(400);
-      expect(res.body.errors).toBeDefined();
-      expect(res.body.errors.length).toBeGreaterThan(0);
+      expect(res.body.fieldErrors).toBeDefined();
+      expect(res.body.fieldErrors.yieldBpsMin).toBeDefined();
     });
 
     it('returns 400 for fundedRatioMin > 100', async () => {
@@ -543,23 +545,23 @@ describe('validateMarketplaceQueryParams – cursor support', () => {
   });
 
   it('rejects an empty cursor string', () => {
-    const { isValid, errors } = validateMarketplaceQueryParams({ cursor: '' });
+    const { isValid, fieldErrors } = validateMarketplaceQueryParams({ cursor: '' });
     expect(isValid).toBe(false);
-    expect(errors[0]).toMatch(/cursor/i);
+    expect(fieldErrors.cursor).toMatch(/cursor/i);
   });
 
   it('rejects a cursor over 2048 characters', () => {
-    const { isValid, errors } = validateMarketplaceQueryParams({
+    const { isValid, fieldErrors } = validateMarketplaceQueryParams({
       cursor: 'a'.repeat(2049),
     });
     expect(isValid).toBe(false);
-    expect(errors[0]).toMatch(/cursor/i);
+    expect(fieldErrors.cursor).toMatch(/cursor/i);
   });
 
   it('still validates page when no cursor', () => {
-    const { isValid, errors } = validateMarketplaceQueryParams({ page: '0' });
+    const { isValid, fieldErrors } = validateMarketplaceQueryParams({ page: '0' });
     expect(isValid).toBe(false);
-    expect(errors[0]).toMatch(/page/i);
+    expect(fieldErrors.page).toMatch(/page/i);
   });
 
   it('accepts all valid sort fields', () => {
@@ -568,5 +570,91 @@ describe('validateMarketplaceQueryParams – cursor support', () => {
       const { isValid } = validateMarketplaceQueryParams({ sortBy: f });
       expect(isValid).toBe(true);
     }
+  });
+});
+
+// ── Unit tests: status vocabulary alignment ──────────────────────────────────
+
+describe('Status vocabulary alignment – state machine vs marketplace', () => {
+  /**
+   * These tests enforce the contract that the marketplace visibility set is
+   * always a proper subset of the authoritative ALL_INVOICE_STATUSES from
+   * invoiceStateMachine.  If either constant drifts the suite fails
+   * immediately, making the misalignment impossible to ship silently.
+   */
+  const {
+    ALL_INVOICE_STATUSES,
+    INVESTABLE_STATUSES,
+  } = require('../src/services/invoiceStateMachine');
+  const { PUBLIC_INVESTABLE_INVOICE_STATUSES } = require('../src/services/marketplaceService');
+
+  it('ALL_INVOICE_STATUSES contains at least the legacy funding-progress vocabulary', () => {
+    // These are the statuses that existed in the validator before this change.
+    // Removing any of them from the state machine would be a breaking regression.
+    const requiredStatuses = [
+      'pending_verification',
+      'verified',
+      'partially_funded',
+      'funded',
+      'completed',
+      'defaulted',
+    ];
+    for (const s of requiredStatuses) {
+      expect(ALL_INVOICE_STATUSES).toContain(s);
+    }
+  });
+
+  it('ALL_INVOICE_STATUSES contains all lifecycle states from INVOICE_STATES', () => {
+    const { INVOICE_STATES } = require('../src/services/invoiceStateMachine');
+    for (const s of Object.values(INVOICE_STATES)) {
+      expect(ALL_INVOICE_STATUSES).toContain(s);
+    }
+  });
+
+  it('INVESTABLE_STATUSES is a non-empty frozen array', () => {
+    expect(Array.isArray(INVESTABLE_STATUSES)).toBe(true);
+    expect(INVESTABLE_STATUSES.length).toBeGreaterThan(0);
+    // Object.isFrozen checks the freeze applied in invoiceStateMachine
+    expect(Object.isFrozen(INVESTABLE_STATUSES)).toBe(true);
+  });
+
+  it('every status in INVESTABLE_STATUSES is a recognized state (subset of ALL_INVOICE_STATUSES)', () => {
+    for (const s of INVESTABLE_STATUSES) {
+      expect(ALL_INVOICE_STATUSES).toContain(s);
+    }
+  });
+
+  it('PUBLIC_INVESTABLE_INVOICE_STATUSES is the same reference as INVESTABLE_STATUSES (single source)', () => {
+    // The marketplace constant must be derived from — not a copy of — the
+    // state machine constant.  A value equality check is the minimum bar;
+    // identity equality (===) confirms no accidental re-freeze with new array.
+    expect(PUBLIC_INVESTABLE_INVOICE_STATUSES).toBe(INVESTABLE_STATUSES);
+  });
+
+  it('no terminal lifecycle state is investable', () => {
+    const { TERMINAL_STATES } = require('../src/services/invoiceStateMachine');
+    for (const s of TERMINAL_STATES) {
+      expect(INVESTABLE_STATUSES).not.toContain(s);
+    }
+  });
+
+  it('no non-public state (pending, approved, rejected, cancelled) is in INVESTABLE_STATUSES', () => {
+    const nonPublicStates = ['pending', 'approved', 'linked_escrow', 'rejected', 'cancelled', 'pending_verification', 'defaulted'];
+    for (const s of nonPublicStates) {
+      expect(INVESTABLE_STATUSES).not.toContain(s);
+    }
+  });
+
+  it('verified is in INVESTABLE_STATUSES', () => {
+    expect(INVESTABLE_STATUSES).toContain('verified');
+  });
+
+  it('partially_funded is in INVESTABLE_STATUSES', () => {
+    expect(INVESTABLE_STATUSES).toContain('partially_funded');
+  });
+
+  it('funded is NOT in INVESTABLE_STATUSES (fully funded invoices are no longer accepting commitments)', () => {
+    // Once fully funded, no additional investor commitments can be accepted.
+    expect(INVESTABLE_STATUSES).not.toContain('funded');
   });
 });

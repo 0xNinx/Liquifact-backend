@@ -56,6 +56,23 @@ describe('audit log middleware', () => {
         return next(error);
       }
     });
+
+    app.post('/api/retention/policies/test-policy/audit', async (req, res, next) => {
+      try {
+        req.tenantId = 'tenant-alpha';
+        await req.audit.logRetentionMutation('retention.policy.update', {
+          targetType: 'retention_policy',
+          targetId: 'policy-123',
+          statusCode: 200,
+          before: { name: 'Old Policy' },
+          after: { name: 'New Policy', apiKey: req.body.apiKey },
+          metadata: { tenantId: 'tenant-alpha' },
+        });
+        return res.status(202).json({ accepted: true });
+      } catch (error) {
+        return next(error);
+      }
+    });
   });
 
   it('auto-logs successful admin actions as append-only inserts', async () => {
@@ -106,5 +123,25 @@ describe('audit log middleware', () => {
     expect(metadata.responseBody.token).toBe(REDACTED);
     expect(metadata.endpoint).toBe('https://example.com/hooks/kyc');
     expect(metadata.deliveryId).toBe('del_001');
+  });
+
+  it('logs retention mutations with tenant metadata and redaction', async () => {
+    const response = await request(app)
+      .post('/api/retention/policies/test-policy/audit')
+      .send({ apiKey: 'super-secret-key' });
+
+    expect(response.status).toBe(202);
+    expect(insertMock).toHaveBeenCalledTimes(1);
+
+    const inserted = insertMock.mock.calls[0][0];
+    expect(inserted.event_type).toBe('retention_mutation');
+    expect(inserted.action).toBe('retention.policy.update');
+    expect(inserted.target_type).toBe('retention_policy');
+    expect(inserted.target_id).toBe('policy-123');
+
+    const metadata = JSON.parse(inserted.metadata);
+    expect(metadata.tenantId).toBe('tenant-alpha');
+    expect(metadata.before.name).toBe('Old Policy');
+    expect(metadata.after.apiKey).toBe(REDACTED);
   });
 });

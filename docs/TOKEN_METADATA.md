@@ -18,6 +18,12 @@ For any financial calculations (e.g., computing principal, interest, fees), alwa
 2. Use the on-chain decimals value
 3. Do not rely on cached values
 
+## Stampede Protection
+
+The token metadata service implements **single-flight** cache stampede protection. If multiple concurrent requests arrive for the exact same token before it has been cached (e.g., during a large batch render of marketplace items), they will all share a single in-flight RPC promise. This avoids flooding Horizon or Soroban RPC with duplicate calls.
+
+The batched resolver, `resolveMany`, extends that protection by deduplicating identical inputs by cache key and using a bounded worker pool (default concurrency: 5) so large batches do not fan out unbounded RPC traffic.
+
 ## TTL Strategy
 
 ### Default TTL
@@ -178,7 +184,7 @@ const freshMetadata = await getFreshTokenMetadata({
 
 ### `batchGetTokenMetadata(assets, options)`
 
-Fetches metadata for multiple assets concurrently.
+Fetches metadata for multiple assets concurrently without single-flight protection for the entire batch. (Consider using `resolveMany` instead).
 
 #### Example
 
@@ -191,6 +197,23 @@ const assets = [
 
 const results = await batchGetTokenMetadata(assets);
 // Array of metadata in same order as input
+```
+
+### `resolveMany(assets, options)`
+
+Resolves token metadata for multiple assets with deduplication, single-flight protection, and bounded concurrency.
+
+#### Example
+
+```javascript
+const assets = [
+  { code: 'native' },
+  { code: 'USDC', issuer: 'GABC...' },
+  { code: 'USDC', issuer: 'GABC...' }, // Duplicate
+];
+
+// Deduplicates inputs and limits RPC fan-out to `concurrency` (default: 5)
+const results = await resolveMany(assets, { concurrency: 5 });
 ```
 
 ### `invalidateTokenMetadata(asset)`
