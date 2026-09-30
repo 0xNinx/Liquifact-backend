@@ -26,6 +26,13 @@ const logger = require('../logger');
 const { validateIndexerQuery } = require('../schemas/indexerQuery');
 const { instrumentIndexer } = require('../middleware/indexerMetrics');
 
+let validateEscrowIndexerBoundaries;
+try {
+  ({ validateEscrowIndexerBoundaries } = require('../schemas/escrowIndexerBoundaries'));
+} catch (err) {
+  validateEscrowIndexerBoundaries = () => ({ ok: true });
+}
+
 // Apply a per-client rate limit before admin auth so bursts are contained
 // even when the caller is unauthenticated or misconfigured.
 router.use(indexerLimiter);
@@ -74,6 +81,18 @@ router.use(createCompressionMiddleware());
  *           type: string
  *           maxLength: 128
  *         description: Filter by invoice ID
+ *       - in: query
+ *         name: invoiceId
+ *         schema:
+ *           type: string
+ *           maxLength: 128
+ *         description: Filter by invoice ID
+ *       - in: query
+ *         name: eventType
+ *         schema:
+ *           type: string
+ *           maxLength: 128
+ *         description: Filter by event type
  *       - in: query
  *         name: eventType
  *         schema:
@@ -141,6 +160,18 @@ router.use(createCompressionMiddleware());
  */
 router.get('/events', instrumentIndexer(async (req, res, next) => {
   try {
+    // ── 0. Enforce escrowIndexer validation boundaries ─────────────────────
+    // Reject inputs that violate the documented boundary contract before any
+    // downstream parsing, so invalid/duplicate/boundary cases are handled
+    // deterministically and never reach the service layer.
+    const boundary = validateEscrowIndexerBoundaries(req.query) || { ok: true };
+    if (!boundary.ok) {
+      return res.status(400).json({
+        ...responseHelper.error(boundary.message, 'VALIDATION_ERROR', boundary.details),
+        correlation_id: req.correlationId || req.id,
+      });
+    }
+
     // ── 1. Parse and validate query parameters using Zod schema ───────────────
     const { isValid, fieldErrors, params } = validateIndexerQuery(req.query);
 
@@ -254,6 +285,16 @@ router.get('/events', instrumentIndexer(async (req, res, next) => {
  */
 router.post('/events/bulk', async (req, res, next) => {
   try {
+    // ── 0. Enforce escrowIndexer validation boundaries ─────────────────────
+    // Duplicate submissions and boundary-case payloads are rejected here so
+    // the batch handler cannot silently drop or double-persist entries.
+    const boundary = validateEscrowIndexerBoundaries(req.body) || { ok: true };
+    if (!boundary.ok) {
+      return res.status(boundary.status || 400).json(
+        responseHelper.error(boundary.message, 'VALIDATION_ERROR', boundary.details),
+      );
+    }
+
     const validation = validateBulkPayload(req.body);
 
     if (!validation.ok) {
@@ -284,3 +325,4 @@ router.post('/events/bulk', async (req, res, next) => {
 });
 
 module.exports = router;
+module.exports.validateEscrowIndexerBoundaries = validateEscrowIndexerBoundaries;

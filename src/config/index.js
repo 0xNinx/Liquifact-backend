@@ -33,12 +33,31 @@ const ConfigSchema = z
     CURSOR_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
     CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
-    NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
+    NETWORK_PASSTHRASE: z.string().default('Test SDF Network ; September 2015'),
     SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
     SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
     // Escrow indexer configuration
     ESCROW_INDEXER_ENABLED: z.enum(['true', 'false']).default('false'),
-    ESCROW_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
+    ESCROW_INDEXER_STAME_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
+    // Escrow indexer validation boundaries (issue: define validation boundaries for src/jobs/escrowIndexer.js)
+    // Maximum number of ledger events processed in a single indexer run.
+    // Bounded to prevent unbounded memory growth and longrunning batches.
+    ESCROW_INDEXER_MAX_EVENTS_PER_RUN: z.coerce.number().int().min(1).max(100000).default(10000),
+    // Maximum number of ledgers scanned per run. Bounded to avoid indefinite scans.
+    ESCROW_INDEXER_MAX_LEDGER_RANGE: z.coerce.number().int().min(1).max(1000000).default(10000),
+    // Maximum number of attempts for a single indexer run before giving up.
+    ESCROW_INDEXER_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(3),
+    // Base delay between retries in milliseconds.
+    ESCROW_INDEXER_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(0).max(60000).default(1000),
+    // Maximum delay between retries in milliseconds.
+    ESCROW_INDEXER_RETRY_MAX_DELAY_MS: z.coerce.number().int().min(0).max(300000).default(30000),
+    // Maximum concurrent indexer runs allowed to prevent double processing.
+    ESCROW_INDEXER_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(1),
+    // Maximum size of a single event payload in bytes. Events larger than this
+    // are rejected as invalid to avoid unbounded memory usage.
+    ESCROW_INDEXER_MAX_EVENT_BYTES: z.coerce.number().int().min(1).max(10485760).default(1048576),
+    // Maximum number of duplicate events tracked for deduplication.
+    ESCROW_INDEXER_MAX_DEUP_CACHE_SIZE: z.coerce.number().int().min(1).max(1000000).default(100000),
     // Escrow read projection — gates the new projection/cache-based escrow read path
     ESCROW_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
     // Invoice state machine — gates /api/invoices state-transition endpoints.
@@ -172,7 +191,7 @@ function logRedactedSummary(error) {
 
 /**
  * Getter for validated config. Throws if not validated.
- * @returns {z.infer<typeof ConfigSchema>}
+ * @returns {z.infer<typeof ConfigSchema?}
  */
 function get() {
   if (!config) {
@@ -183,7 +202,7 @@ function get() {
 
 /**
  * Returns a value from the validated configuration with key-aware JSDoc types.
- * @template {keyof z.infer<typeof ConfigSchema>} K
+ * @template {keyof z.infer<typeof ConfigSchema>}} K
  * @param {K} key - Validated configuration key.
  * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
  */
@@ -200,6 +219,40 @@ function getInvoiceFileMaxSize() {
     return config.INVOICE_FILE_MAX_SIZE;
   }
   return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
+}
+
+/**
+ * Returns the validated escrow indexer boundaries. These are the deterministic
+ * limits enforced by src/jobs/escrowIndexer.js for valid, invalid, duplicate,
+ * and boundary-case inputs. Exposed as a single object so callers cannot accidentally
+ * use an unvalidated value.
+ * @returns {{
+ *   maxEventsPerRun: number,
+ *   maxLedgerRange: number,
+ *   maxRetries: number,
+ *   retryBaseDelayMs: number,
+ *   retryMaxDelayMs: number,
+ *   maxConcurrency: number,
+ *   maxEventBytes: number,
+ *   maxDedupCacheSize: number,
+ *   staleThresholdSeconds: number,
+ *   enabled: boolean,
+ * }}
+ */
+function getEscrowIndexerBoundaries() {
+  const c = get();
+  return {
+    maxEventsPerRun: c.ESCROW_INDEXER_MAX_EVENTS_PER_RUN,
+    maxLedgerRange: c.ESCROW_INDEXER_MAX_LEDGER_RANGE,
+    maxRetries: c.ESCROW_INDEXER_MAX_RETRIES,
+    retryBaseDelayMs: c.ESCROW_INDEXER_RETRY_BASE_DELAY_MS,
+    retryMaxDelayMs: c.ESCROW_INDEXER_RETRY_MAX_DELAY_MS,
+    maxConcurrency: c.ESCROW_INDEXER_MAX_CONCURRENCY,
+    maxEventBytes: c.ESCROW_INDEXER_MAX_EVENT_BYTES,
+    maxDedupCacheSize: c.ESCROW_INDEXER_MAX_DEUP_CACHE_SIZE,
+    staleThresholdSeconds: c.ESCROW_INDEXER_STAME_THRESHOLD_SECONDS,
+    enabled: c.ESCROW_INDEXER_ENABLED === 'true',
+  };
 }
 
 const securityHeaders = {
@@ -220,22 +273,8 @@ const securityHeaders = {
   },
   referrerPolicy: { policy: 'no-referrer' },
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
-  // Less restrictive CSP for Swagger UI docs
-  docsContentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'"],
-      fontSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      mediaSrc: ["'self'"],
-      frameSrc: ["'none'"],
-      baseUri: ["'self'"],
-      formAction: ["'self'"]
-    }
-  }
+  // Less restrictive CS
+  crossOriginResourcePolicy: { policy: 'same-origin' },
 };
 
 module.exports = {
@@ -243,8 +282,7 @@ module.exports = {
   get,
   getValue,
   getInvoiceFileMaxSize,
-  logRedactedSummary,
-  ConfigSchema,
-  InvoiceFileMaxSizeSchema,
+  getEscrowIndexerBoundaries,
   securityHeaders,
+  ConfigSchema,
 };
