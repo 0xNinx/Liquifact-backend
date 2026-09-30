@@ -8,6 +8,24 @@
  */
 
 /**
+ * Normalise an environment name into a stable lookup key.
+ *
+ * The key is trimmed and lowercased so that callers passing
+ * `"production "`, `"PRODUCTION"`, or `undefined` get deterministic
+ * behaviour. Non-string inputs are treated as an empty string so the
+ * default development block is selected instead of throwing a TypeError.
+ *
+ * @param {*} environment - Raw NODE_ENV value.
+ * @returns {string} Normalised lookup key.
+ */
+function normaliseEnvironment(environment) {
+  if (typeof environment !== 'string') {
+    return '';
+  }
+  return environment.trim().toLowerCase();
+}
+
+/**
  * Load the knexfile config block that corresponds to `environment`.
  *
  * Throws an explicit error when NODE_ENV=test but the `test` block is missing,
@@ -18,8 +36,9 @@
  */
 function resolveConfig(environment) {
   const allConfigs = require('../../knexfile');
+  const key = normaliseEnvironment(environment);
 
-  if (environment === 'test') {
+  if (key === 'test') {
     const testConfig = allConfigs.test;
     if (!testConfig) {
       throw new Error(
@@ -30,7 +49,7 @@ function resolveConfig(environment) {
     return testConfig;
   }
 
-  if (environment === 'production') {
+  if (key === 'production') {
     if (!process.env.DATABASE_URL) {
       throw new Error(
         '[db] DATABASE_URL must be set when NODE_ENV=production.'
@@ -43,13 +62,19 @@ function resolveConfig(environment) {
     return prodConfig;
   }
 
-  const devConfig = allConfigs[environment] || allConfigs.development;
+  // Preserve the historical contract: any non-test, non-production
+  // environment falls back to the development block when no exact match
+  // exists. This keeps `development`, `staging`, `ci`, and any future
+  // custom NODE_ENV values working without a key change.
+  const devConfig = allConfigs[key] || allConfigs.development;
   if (!devConfig) {
     throw new Error(
-      `[db] No config block found for NODE_ENV="${environment}" in knexfile.js.`
+      `[db] No config block found for NODE_ENV="${key}" in knexfile.js.`
     );
   }
   return devConfig;
 }
+
+resolveConfig.normaliseEnvironment = normaliseEnvironment;
 
 module.exports = resolveConfig;

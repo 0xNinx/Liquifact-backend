@@ -1,3 +1,4 @@
+
 'use strict';
 
 /**
@@ -11,6 +12,7 @@
  * @issue #977
  */
 
+
 process.env.NODE_ENV = 'test';
 process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long-string-for-jest';
 
@@ -19,6 +21,7 @@ jest.mock('../logger', () => ({
   error: jest.fn(),
   info: jest.fn(),
 }));
+
 
 const { validateBody } = require('../schemas/config');
 const { runtimeConfigSchema } = require('../schemas/config');

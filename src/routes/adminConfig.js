@@ -45,7 +45,13 @@ const optionalIdempotency = require('../middleware/optionalIdempotency');
 const { instrumentConfig } = require('../middleware/configMetrics');
 const { toAdminConfigRequestDto, fromAdminConfigRequestDto } = require('../dto/config');
 const { applyConfig, getConfigSections } = require('../services/configService');
-const { SOFT_DELETE_ERRORS } = require('../services/configSoftDelete');
+const {
+  SOFT_DELETE_ERRORS,
+  softDeleteConfig,
+  restoreConfig,
+  getConfigDeletionState,
+  purgeExpiredConfigSoftDeletes,
+} = require('../services/configSoftDelete');
 const AppError = require('../errors/AppError');
 const logger = require('../logger');
 
@@ -106,10 +112,10 @@ function _mapSoftDeleteError(err, req) {
 
 // ── POST /api/admin/config ────────────────────────────────────────────────────
 router.post('/', optionalIdempotency, validateBody(runtimeConfigSchema), async (req, res, next) => {
-  const validatedDto = toAdminConfigRequestDto(req.validated);
-  const { section, config: validatedConfig } = fromAdminConfigRequestDto(validatedDto);
-
   try {
+    const validatedDto = toAdminConfigRequestDto(req.validated);
+    const { section, config: validatedConfig } = fromAdminConfigRequestDto(validatedDto);
+
     const result = await applyConfig(section, validatedConfig, {
       tenantId: req.tenantId,
       adminClient: req.apiClient?.clientId || req.user?.sub,
@@ -247,19 +253,31 @@ router.get('/sections', (req, res) => {
  *       409:
  *         description: Record is already soft-deleted
  */
-router.post('/', optionalIdempotency, validateBody(runtimeConfigSchema), async (req, res, next) => {
+// ── DELETE /api/admin/config/:id ───────────────────────────────────────────────
+router.delete('/:id', async (req, res, next) => {
   try {
-    const validatedDto = toAdminConfigRequestDto(req.validated);
-    const { section, config: validatedConfig } = fromAdminConfigRequestDto(validatedDto);
-
-    const result = await applyConfig(section, validatedConfig, {
+    const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason : undefined;
+    const result = await softDeleteConfig(req.params.id, {
       tenantId: req.tenantId,
-      adminClient: req.apiClient?.clientId || req.user?.sub,
+      deletedBy: req.apiClient?.clientId || req.user?.sub,
+      reason,
     });
-
     return res.status(200).json(result);
-  } catch (error) {
-    return next(error);
+  } catch (err) {
+    return next(_mapSoftDeleteError(err, req));
+  }
+});
+
+// ── POST /api/admin/config/:id/restore ─────────────────────────────────────────
+router.post('/:id/restore', async (req, res, next) => {
+  try {
+    const result = await restoreConfig(req.params.id, {
+      tenantId: req.tenantId,
+      restoredBy: req.apiClient?.clientId || req.user?.sub,
+    });
+    return res.status(200).json(result);
+  } catch (err) {
+    return next(_mapSoftDeleteError(err, req));
   }
 });
 
@@ -294,7 +312,9 @@ router.post('/', optionalIdempotency, validateBody(runtimeConfigSchema), async (
  */
 router.get('/:id/deletion-state', async (req, res, next) => {
   try {
-    const result = await getConfigDeletionState(req.params.id);
+    const result = await getConfigDeletionState(req.params.id, {
+      tenantId: req.tenantId,
+    });
     return res.json(result);
   } catch (err) {
     return next(_mapSoftDeleteError(err, req));
@@ -335,7 +355,7 @@ router.get('/:id/deletion-state', async (req, res, next) => {
  */
 router.post('/purge', async (req, res, next) => {
   try {
-    const summary = await purgeExpiredConfigSoftDeletes();
+    const summary = await purgeExpiredConfigSoftDeletes({ tenantId: req.tenantId });
     logger.info(
       { purged: summary.purged, cutoff: summary.cutoff, requestId: req.id },
       'Admin triggered config retention purge'

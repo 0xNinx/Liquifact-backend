@@ -2,6 +2,9 @@
  * Centralized typed configuration module with runtime validation.
  * Uses Zod for schema validation and type safety.
  * @module config
+ *
+ * Compatibility contract: `validate()` is idempotent and safe to call
+ * multiple times; `get()` throws until `validate()` succeeds.
  */
 
 const z = require('zod');
@@ -137,6 +140,9 @@ const ConfigSchema = z
  */
 let config;
 
+/** Frozen snapshot of the last successfully validated config. @type {Readonly<z.infer<typeof ConfigSchema>>|null} */
+let frozenConfig = null;
+
 /**
  * Validates environment variables against schema and returns typed config.
  * Throws ZodError on validation failure.
@@ -148,8 +154,19 @@ function validate() {
   if (!parsed.success) {
     throw parsed.error;
   }
-  config = parsed.data;
+  // Freeze the validated snapshot so callers cannot mutate shared state and
+  // so repeated validate() calls produce a deterministic, stable object.
+  frozenConfig = Object.freeze({ ...parsed.data });
+  config = frozenConfig;
   return config;
+}
+
+/**
+ * Returns true when validate() has completed successfully at least once.
+ * @returns {boolean}
+ */
+function isInitialized() {
+  return config !== null && config !== undefined;
 }
 
 /**
@@ -182,6 +199,16 @@ function get() {
 }
 
 /**
+ * Reset the in-memory config snapshot. Intended for tests only; production
+ * code must not call this because it invalidates the validated contract.
+ * @returns {void}
+ */
+function resetForTests() {
+  config = null;
+  frozenConfig = null;
+}
+
+/**
  * Returns a value from the validated configuration with key-aware JSDoc types.
  * @template {keyof z.infer<typeof ConfigSchema>} K
  * @param {K} key - Validated configuration key.
@@ -199,7 +226,10 @@ function getInvoiceFileMaxSize() {
   if (config) {
     return config.INVOICE_FILE_MAX_SIZE;
   }
-  return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
+  // Fall back to parsing the raw env var without mutating module state so
+  // callers that run before validate() still get a deterministic value.
+  const raw = process.env.INVOICE_FILE_MAX_SIZE;
+  return InvoiceFileMaxSizeSchema.parse(raw === undefined ? undefined : raw);
 }
 
 const securityHeaders = {
@@ -241,6 +271,8 @@ const securityHeaders = {
 module.exports = {
   validate,
   get,
+  isInitialized,
+  resetForTests,
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
