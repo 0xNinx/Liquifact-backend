@@ -127,6 +127,15 @@ const KYC_WEBHOOK_METRICS = Object.freeze({
   CAUSE_NONE: 'none',
 });
 
+/** Deterministic failure recovery and delivery configuration. */
+const KYC_WEBHOOK_RETRY = Object.freeze({
+  MAX_RETRIES: 3,
+  BASE_DELAY_MS: 500,
+  MAX_DELAY_MS: 10000,
+  TIMEOUT_MS: 5000,
+  MAX_PAYLOAD_BYTES: 65536, // 64 KB
+});
+
 const constants = Object.freeze({
   HTTP_HEADERS,
   KYC_WEBHOOK_ROUTES,
@@ -137,6 +146,7 @@ const constants = Object.freeze({
   KYC_WEBHOOK_DB,
   KYC_WEBHOOK_PAGINATION,
   KYC_WEBHOOK_METRICS,
+  KYC_WEBHOOK_RETRY,
 });
 
 module.exports = Object.freeze({
