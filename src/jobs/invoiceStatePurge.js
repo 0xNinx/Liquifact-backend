@@ -135,6 +135,7 @@ const purgeWorker = new BackgroundWorker({
 });
 
 purgeWorker.registerHandler(JOB_TYPE, (job) => runInvoiceStatePurge(job));
+let startPromise = null;
 
 /**
  * Enqueues a purge run.
@@ -153,17 +154,40 @@ function schedulePurge(options = {}) {
 /**
  * Starts the worker and schedules the first run. Safe to call twice.
  *
- * @returns {void}
+ * @returns {Promise<void>}
  */
 function startPurgeWorker() {
-  if (!purgeWorker.isRunning) {
-    purgeWorker.start();
-    schedulePurge();
-    logger.info(
-      { retentionDays: getRetentionDays(), intervalMs: getIntervalMs() },
-      'invoiceStatePurge: worker started'
-    );
+  if (startPromise) {
+    return startPromise;
   }
+  if (purgeWorker.isRunning) {
+    return Promise.resolve();
+  }
+
+  startPromise = (async () => {
+    try {
+      await purgeWorker.start();
+      schedulePurge();
+      logger.info(
+        { retentionDays: getRetentionDays(), intervalMs: getIntervalMs() },
+        'invoiceStatePurge: worker started'
+      );
+    } catch (error) {
+      try {
+        await purgeWorker.stop();
+      } catch (stopError) {
+        logger.error(
+          { component: JOB_TYPE, errorName: stopError && stopError.name },
+          'invoiceStatePurge: worker failed to stop after startup failure'
+        );
+      }
+      throw error;
+    } finally {
+      startPromise = null;
+    }
+  })();
+
+  return startPromise;
 }
 
 /**

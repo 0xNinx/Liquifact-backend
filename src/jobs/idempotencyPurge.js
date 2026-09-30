@@ -229,6 +229,7 @@ const purgeWorker = new BackgroundWorker({
 
 // Register the purge job handler
 purgeWorker.registerHandler('idempotency_purge', purgeExpiredKeys);
+let startPromise = null;
 
 /**
  * Schedules the next idempotency purge job.
@@ -259,16 +260,37 @@ function schedulePurge(options = {}) {
  * This should be called once at application startup to begin the periodic
  * cleanup process.
  *
- * @returns {void}
+ * @returns {Promise<void>}
  */
 function startPurgeWorker() {
-  if (!purgeWorker.isRunning) {
-    purgeWorker.start();
-    logger.info('Idempotency purge worker started');
-
-    // Schedule the first purge job
-    schedulePurge();
+  if (startPromise) {
+    return startPromise;
   }
+  if (purgeWorker.isRunning) {
+    return Promise.resolve();
+  }
+
+  startPromise = (async () => {
+    try {
+      await purgeWorker.start();
+      schedulePurge();
+      logger.info('Idempotency purge worker started');
+    } catch (error) {
+      try {
+        await purgeWorker.stop();
+      } catch (stopError) {
+        logger.error(
+          { component: 'idempotency_purge', errorName: stopError && stopError.name },
+          'Idempotency purge worker failed to stop after startup failure'
+        );
+      }
+      throw error;
+    } finally {
+      startPromise = null;
+    }
+  })();
+
+  return startPromise;
 }
 
 /**

@@ -12,10 +12,10 @@
 
 require('dotenv').config();
 
-const crypto = require('crypto');
 const app = require('./app');
 const { validate, logRedactedSummary } = require('./config');
 const shutdownCoordinator = require('./utils/shutdownCoordinator');
+const logger = require('./logger');
 
 /**
  * Runs the S3 connectivity probe at startup. Failures are logged but never
@@ -28,8 +28,11 @@ async function scheduleStartupStorageProbe() {
   try {
     const storage = require('./services/storage');
     await storage.runStartupStorageProbe();
-  } catch (_err) {
-    // Best-effort: a probe failure must not abort startup.
+  } catch (error) {
+    logger.warn(
+      { component: 's3-healthcheck', event: 'startup_probe', errorName: error && error.name },
+      'S3 startup probe could not complete; readiness checks will report storage status'
+    );
   }
 }
 
@@ -60,8 +63,7 @@ function runBootConfigValidation() {
  *
  * @returns {$import('http').Server} The HTTP server instance.
  */
-function startServer() {
-  runBootConfigValidation();
+function listenServer() {
   const port = process.env.PORT || 3001;
   // Fire-and-forget probe -- do not await, so startup is not blocked.
   scheduleStartupStorageProbe();
@@ -69,6 +71,94 @@ function startServer() {
   shutdownCoordinator.register({ server });
   shutdownCoordinator.setupSignalListeners();
   return server;
+}
+
+function startServer() {
+  runBootConfigValidation();
+  return listenServer();
+}
+
+let backgroundWorkersStartPromise = null;
+
+/**
+ * Starts all process-owned workers as one startup operation.
+ * Successful starts are rolled back in reverse order if a later worker fails.
+ *
+ * @returns {Promise<void>}
+ */
+function startBackgroundWorkers() {
+  if (!backgroundWorkersStartPromise) {
+    backgroundWorkersStartPromise = startBackgroundWorkersOnce().catch((error) => {
+      backgroundWorkersStartPromise = null;
+      throw error;
+    });
+  }
+  return backgroundWorkersStartPromise;
+}
+
+async function startBackgroundWorkersOnce() {
+  const startedWorkers = [];
+  try {
+    const idempotencyPurge = require('./jobs/idempotencyPurge');
+    await idempotencyPurge.startPurgeWorker();
+    startedWorkers.push(idempotencyPurge);
+
+    const invoiceStatePurge = require('./jobs/invoiceStatePurge');
+    await invoiceStatePurge.startPurgeWorker();
+    startedWorkers.push(invoiceStatePurge);
+
+    for (const job of startedWorkers) {
+      shutdownCoordinator.register({ worker: job.purgeWorker });
+    }
+  } catch (error) {
+    for (const job of startedWorkers.reverse()) {
+      try {
+        await job.stopPurgeWorker();
+      } catch (stopError) {
+        logger.error(
+          { component: job.JOB_TYPE || 'idempotency_purge', errorName: stopError && stopError.name },
+          'Background worker rollback failed'
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+async function stopBackgroundWorkers() {
+  const jobs = [
+    require('./jobs/invoiceStatePurge'),
+    require('./jobs/idempotencyPurge'),
+  ];
+  for (const job of jobs) {
+    try {
+      await job.stopPurgeWorker();
+    } catch (error) {
+      logger.error(
+        { component: job.JOB_TYPE || 'idempotency_purge', errorName: error && error.name },
+        'Background worker shutdown failed during startup recovery'
+      );
+    }
+  }
+}
+
+async function startApplication() {
+  runBootConfigValidation();
+  let workersStarted = false;
+  try {
+    await startBackgroundWorkers();
+    workersStarted = true;
+    listenServer();
+  } catch (error) {
+    if (workersStarted) {
+      await stopBackgroundWorkers();
+    }
+    logger.error(
+      { component: 'startup', errorName: error && error.name, errorCode: error && error.code },
+      'Application startup failed'
+    );
+    process.exitCode = 1;
+  }
 }
 
 /**
@@ -105,20 +195,11 @@ function createApp() {
 
 // Start background workers when running as main module (not in tests)
 if (process.env.NODE_ENV !== 'test' && require.main === module) {
-  // Start the idempotency purge worker with a fresh fencing token so that stale
-  // workers from a previous process can no longer write after lease loss.
-  const { startPurgeWorker } = require('./jobs/idempotencyPurge');
-  startPurgeWorker({ fencingToken: crypto.randomUUID() });
-
-  // Start the invoice-state retention purge worker (issue #866) with its own
-  // fencing token, isolated from the idempotency worker's token.
-  const { startPurgeWorker: startInvoiceStatePurgeWorker } = require('./jobs/invoiceStatePurge');
-  startInvoiceStatePurgeWorker({ fencingToken: crypto.randomUUID() });
-
-  startServer();
+  startApplication();
 }
 
 module.exports = app;
 module.exports.createApp = createApp;
 module.exports.startServer = startServer;
+module.exports.startBackgroundWorkers = startBackgroundWorkers;
 module.exports.resetStore = resetStore;
