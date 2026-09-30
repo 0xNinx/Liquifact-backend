@@ -24,6 +24,10 @@
  * These describe *why a specific field failed*, and are reported in the
  * `fieldCodes` extension of the problem document.
  *
+ * @param {object} issue - A single issue from a `ZodError`.
+ * @returns {string} A member of {@link METRICS_VALIDATION_CODES}.
+ */
+/**
  * @readonly
  * @enum {string}
  */

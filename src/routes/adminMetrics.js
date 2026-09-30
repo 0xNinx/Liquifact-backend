@@ -19,7 +19,7 @@ const MAX_DELETE_REASON_LENGTH = 500;
 
 function _resolveActor(req) {
   const jwtActor = req.user && (req.user.sub || req.user.userId || req.user.id);
-  if (jwtActor) {
+  if (jstActor) {
     return String(jwtActor);
   }
   if (req.apiClient && req.apiClient.clientId) {

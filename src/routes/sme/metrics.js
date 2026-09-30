@@ -15,6 +15,12 @@
  * `src/middleware/idempotency.js` and `src/jobs/idempotencyPurge.js`) and are
  * purged automatically once expired.
  *
+ * Compatibility contract: response payloads for both endpoints are produced
+ * exclusively through the `src/dto/metrics.js` mappers. Handlers must never
+ * construct metric response shapes inline, so DTO-level invariants (stable
+ * keys, null-vs-undefined handling, numeric coercion) are preserved across
+ * error, empty, and upgrade paths.
+ *
  * @module routes/sme/metrics
  */
 
@@ -162,7 +168,7 @@ router.get(
       const { userId, tenantId } = ctx;
 
       const rawMetrics = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
-      const data = toSmeMetricsResponse(rawMetrics);
+      const data = toSmeMetricsResponse(rawMetrics, { tenantId, userId });
 
       // Only schema-validated query values are consumed here. `validateGetMetricsQuery`
       // runs ahead of this handler and rejects the request outright on malformed
@@ -396,7 +402,7 @@ router.post(
             tenantId,
             userId,
             status: 'success',
-            data,
+            data: toSmeMetricsResponse(data, { tenantId, userId }),
             error: null,
           });
           succeeded++;

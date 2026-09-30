@@ -101,6 +101,8 @@
  * @property {number}                   statusCode      - Final HTTP status code.
  * @property {number}                   durationSeconds - Request wall-clock duration in seconds.
  * @property {PersistenceCause}         cause           - Normalised error cause label.
+ * @property {boolean}                  success         - Whether the request completed without error.
+ * @property {number}                   errorCount      - 1 when the request failed, 0 otherwise.
  * @property {import('express').Request} [req]          - Express request (for scoped logging).
  */
 
@@ -119,11 +121,18 @@
  */
 function toSmeMetricsResponse(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const toCount = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) {
+      return 0;
+    }
+    return Math.floor(n);
+  };
   return {
-    open: Number(obj.open) || 0,
-    funded: Number(obj.funded) || 0,
-    settled: Number(obj.settled) || 0,
-    defaulted: Number(obj.defaulted) || 0,
+    open: toCount(obj.open),
+    funded: toCount(obj.funded),
+    settled: toCount(obj.settled),
+    defaulted: toCount(obj.defaulted),
   };
 }
 
@@ -204,17 +213,33 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  * @param {number} raw.statusCode               - HTTP status code.
  * @param {number} raw.durationSeconds          - Wall-clock duration in seconds.
  * @param {string} [raw.cause='none']           - Error cause label (already normalised).
+ * @param {boolean} [raw.success]               - Whether the request succeeded.
+ * @param {number} [raw.errorCount]             - Error count (0 or 1).
  * @param {import('express').Request} [raw.req] - Express request for scoped logging.
  * @returns {PersistenceRecordParams} Normalised DTO.
  */
 function toPersistenceRecordParams(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
 
+  const statusCode = Number(obj.statusCode);
+  const safeStatusCode = Number.isFinite(statusCode) && statusCode >= 100 && statusCode <= 599
+    ? Math.floor(statusCode)
+    : 200;
+
+  const duration = Number(obj.durationSeconds);
+  const safeDuration = Number.isFinite(duration) && duration >= 0 ? duration : 0;
+
+  const cause = String(obj.cause || 'none');
+  const success = typeof obj.success === 'boolean' ? obj.success : safeStatusCode < 400;
+  const errorCount = Number.isFinite(Number(obj.errorCount)) && Number(obj.errorCount) > 0 ? 1 : (success ? 0 : 1);
+
   return {
     endpoint: String(obj.endpoint || 'unknown'),
-    statusCode: Number(obj.statusCode) || 200,
-    durationSeconds: Number(obj.durationSeconds) || 0,
-    cause: /** @type {PersistenceCause} */ (String(obj.cause || 'none')),
+    statusCode: safeStatusCode,
+    durationSeconds: safeDuration,
+    cause: /** @type {PersistenceCause} */ (cause),
+    success,
+    errorCount,
     req: obj.req || undefined,
   };
 }
@@ -255,7 +280,9 @@ function isValidPersistenceRecordParams(value) {
     typeof value.endpoint === 'string' &&
     typeof value.statusCode === 'number' &&
     typeof value.durationSeconds === 'number' &&
-    typeof value.cause === 'string'
+    typeof value.cause === 'string' &&
+    typeof value.success === 'boolean' &&
+    typeof value.errorCount === 'number'
   );
 }
 
