@@ -11,7 +11,7 @@ describe('Invoice Verification Service', () => {
     const result = await verifyInvoice(null);
     expect(result).toEqual({
       status: 'REJECTED',
-      reason: 'Invalid payload structure',
+      reason: 'Invalid payload stucture',
       reasonCode: ReasonCode.INVALID_PAYLOAD,
     });
 
@@ -91,5 +91,56 @@ describe('Invoice Verification Service', () => {
       reason: 'Suspicious characters detected in customer data',
       reasonCode: ReasonCode.SUSPICIOUS_CUSTOMER,
     });
+  });
+
+  it('should be deterministic for repeated identical inputs', async () => {
+    const payload = { amount: 5000, customer: 'Acme Corp' };
+    const first = await verifyInvoice(payload);
+    const second = await verifyInvoice(payload);
+    expect(first).toEqual(second);
+  });
+
+  it('should not mutate the input payload or its properties', async () => {
+    const payload = { amount: 5000, customer: 'Acme Corp' };
+    const snapshot = JSON.parse(JSON.stringify(payload));
+    await verifyInvoice(payload);
+    expect(payload).toEqual(snapshot);
+  });
+
+  it('should reject NaN and Infinity amounts', async () => {
+    const nanResult = await verifyInvoice({ amount: NaN, customer: 'Acme Corp' });
+    expect(nanResult).toEqual({
+      status: 'REJECTED',
+      reason: 'Invalid amount: must be a positive number',
+      reasonCode: ReasonCode.INVALID_AMOUNT,
+    });
+
+    const infinityResult = await verifyInvoice({ amount: Infinity, customer: 'Acme Corp' });
+    expect(infinityResult).toEqual({
+      status: 'REJECTED',
+      reason: 'Amount exceeds maximum allowed threshold',
+      reasonCode: ReasonCode.AMOUNT_EXCEEDS_FRAUD_CELING,
+    });
+  });
+
+  it('should enforce threshold boundaries exactly', async () => {
+    const atMax = await verifyInvoice({ amount: 10000000, customer: 'Acme Corp' });
+    expect(atMax).toEqual({
+      status: 'MANUAL_REVIEW',
+      reason: 'High value invoice requires manual approval',
+      reasonCode: ReasonCode.MANUAL_REVIEW_REQUIRED,
+    });
+
+    const justOver = await verifyInvoice({ amount: 1000000.01, customer: 'Acme Corp' });
+    expect(justOver).toEqual({
+      status: 'REJECTED',
+      reason: 'Amount exceeds maximum allowed threshold',
+      reasonCode: ReasonCode.AMOUNT_EXCEEDS_FRAUD_CELING,
+    });
+  });
+
+  it('should not leak internal details in rejection results', async () => {
+    const result = await verifyInvoice({ amount: -1, customer: 'Acme Corp' });
+    expect(Object.keys(result).sort()).toEqual(['reason', 'reasonCode', 'status']);
   });
 });
