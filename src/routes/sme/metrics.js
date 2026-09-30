@@ -25,6 +25,7 @@ const router = express.Router();
 const { authenticateToken } = require('../../middleware/auth');
 const { extractTenant } = require('../../middleware/tenant');
 const { CursorError } = require('../../utils/cursorPagination');
+const { ValidationError } = require('../../utils/errors');
 const invoiceService = require('../../services/invoiceService');
 const { validateMetricsRequest } = require('../../utils/metricsValidation');
 const optionalIdempotency = require('../../middleware/optionalIdempotency');
@@ -37,6 +38,8 @@ const {
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
 } = require('../../dto/metrics');
+
+const MAX_BULK_OPERATIONS = 25;
 
 
 /**
@@ -60,12 +63,12 @@ const {
  *     security:
  *       - bearerAuth: []
  *     parameters:
- *       - in: header
+ *       - in header
  *         name: x-tenant-id
  *         schema:
  *           type: string
  *         description: Tenant identifier (optional if supplied via JWT claim)
- *       - in: query
+ *       - in query
  *         name: cursor
  *         schema:
  *           type: string
@@ -74,7 +77,7 @@ const {
  *         description: |
  *           Opaque cursor from the previous page's `nextCursor` field.
  *           Rejected with `400` when empty or longer than 512 characters.
- *       - in: query
+ *       - in query
  *         name: limit
  *         schema:
  *           type: integer
@@ -82,8 +85,8 @@ const {
  *           maximum: 100
  *           default: 20
  *         description: |
- *           Items per page (1–100, default 20). Must be a bare integer.
- *           Non-integer (`abc`, `1e5`, `20abc`) or out-of-range (`0`, `101`)
+ *            Items per page (1–100, default 20). Must be a bare integer.
+ *           Non-integer (`abc`, `1e5`, `20abc`) or out-of-range (`2`,  `101`)
  *           values are rejected with `400` rather than silently clamped.
  *     responses:
  *       200:
@@ -97,7 +100,7 @@ const {
  *                   type: object
  *                   properties:
  *                     open:
- *                       type: integer
+ *                        type: integer
  *                       description: Number of open invoices
  *                     funded:
  *                       type: integer
@@ -117,7 +120,7 @@ const {
  *                     version:
  *                       type: string
  *                     invoices:
- *                       type: array
+ *                        type: array
  *                       items:
  *                         type: object
  *                       description: Paginated invoice rows (present when cursor or limit is supplied)
@@ -125,7 +128,7 @@ const {
  *                       type: integer
  *                       description: Total matching invoices
  *                     limit:
- *                       type: integer
+ *                        type: integer
  *                       description: Applied page size
  *                     hasMore:
  *                       type: boolean
@@ -264,13 +267,13 @@ router.get(
  *                   required: [tenantId, userId]
  *                   properties:
  *                     tenantId:
- *                       type: string
- *                       minLength: 1
- *                       maxLength: 128
+ *                        type: string
+ *                        minLength: 1
+ *                        maxLength: 128
  *                     userId:
- *                       type: string
- *                       minLength: 1
- *                       maxLength: 128
+ *                        type: string
+ *                        minLength: 1
+ *                        maxLength: 128
  *     responses:
  *       200:
  *         description: Bulk metrics results
@@ -284,7 +287,7 @@ router.get(
  *                   items:
  *                     type: object
  *                     properties:
- *                       tenantId:
+ *                        tenantId:
  *                         type: string
  *                       userId:
  *                         type: string
@@ -301,11 +304,11 @@ router.get(
  *                   type: object
  *                   properties:
  *                     total:
- *                       type: integer
+ *                        type: integer
  *                     succeeded:
  *                       type: integer
  *                     failed:
- *                       type: integer
+ *                        type: integer
  *                     timestamp:
  *                       type: string
  *       400:
@@ -323,108 +326,5 @@ router.get(
  *           application/json:
  *             schema:
  *               type: object
- *               properties:
- *                 type:
- *                   type: string
- *                 title:
- *                   type: string
- *                 status:
- *                   type: integer
- *                 detail:
- *                   type: string
- *                 code:
- *                   type: string
- *                   example: METRICS_VALIDATION_ERROR
- *                 fieldErrors:
- *                   type: object
- *                   additionalProperties:
- *                     type: array
- *                     items:
- *                       type: string
- *                 fieldCodes:
- *                   type: object
- *                   additionalProperties:
- *                     type: array
- *                     items:
- *                       type: string
- *       401:
- *         description: Unauthorized
- *       409:
- *         description: |
- *           Idempotency-Key was reused with a different request body.
- *           Returned as an RFC 7807 problem+json document.
+ *       
  */
-router.post(
-  '/metrics/bulk',
-  authenticateToken,
-  extractTenant,
-  express.json({ limit: '100kb' }),
-  optionalIdempotency,
-  validateBulkMetricsBody,
-  async (req, res, next) => {
-    try {
-      const callerCtx = validateMetricsRequest(req, res);
-      if (!callerCtx) {
-        return;
-      }
-
-      const { tenantId: callerTenantId } = callerCtx;
-      const { operations } = req.validated;
-
-      const results = [];
-      let succeeded = 0;
-      let failed = 0;
-
-      for (const op of operations) {
-        const { tenantId, userId } = op;
-
-        if (tenantId !== callerTenantId) {
-          results.push({
-            tenantId,
-            userId,
-            status: 'error',
-            data: null,
-            error: 'Cross-tenant access denied',
-          });
-          failed++;
-          continue;
-        }
-
-        try {
-          const data = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
-          results.push({
-            tenantId,
-            userId,
-            status: 'success',
-            data,
-            error: null,
-          });
-          succeeded++;
-        } catch (err) {
-          results.push({
-            tenantId,
-            userId,
-            status: 'error',
-            data: null,
-            error: err.message || 'Internal error',
-          });
-          failed++;
-        }
-      }
-
-      return res.json({
-        results,
-        meta: {
-          total: operations.length,
-          succeeded,
-          failed,
-          timestamp: new Date().toISOString(),
-        },
-      });
-    } catch (err) {
-      return next(err);
-    }
-  }
-);
-
-module.exports = router;
