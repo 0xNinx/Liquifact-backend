@@ -142,12 +142,17 @@ function validateEntry(entry, index) {
     );
   }
 
+  const uniqueScopes = new Set();
   for (const scope of scopes) {
     if (!VALID_SCOPES.includes(scope)) {
       throw new Error(
         `API_KEYS[${index}]: unknown scope "${scope}". Valid scopes: ${VALID_SCOPES.join(', ')}`
       );
     }
+    if (uniqueScopes.has(scope)) {
+      throw new Error(`API_KEYS[${index}]: duplicate scope "${scope}"`);
+    }
+    uniqueScopes.add(scope);
   }
 
   if (revoked !== undefined && typeof revoked !== 'boolean') {
