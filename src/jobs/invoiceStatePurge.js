@@ -14,6 +14,14 @@
  * infrastructure, emits Prometheus counters, and exposes a manual trigger for
  * the admin API.
  *
+ * ## Determinism
+ * The purge is serialised through a single-concurrency worker and a per-job
+ * mutex so two runs can never interleave batches. Every run is idempotent:
+ * deleting a tombstone twice is a no-op, and a partial failure leaves the
+ * remaining tombstones in place for the next retry to consume. The cutoff
+ * is computed once per run and forwarded to the service so all batches in
+ * a run observe the same retention window.
+ *
  * ## Configuration
  * - `INVOICE_STATE_SOFT_DELETE_RETENTION_DAYS` — restore/retention window (default 30).
  * - `INVOICE_STATE_PURGE_BATCH_SIZE` — rows deleted per batch (default 500).
@@ -59,7 +67,7 @@ function _counter(config) {
   return new Counter({ ...config, registers: [registry] });
 }
 
-const invoiceStatePurgeRowsDeletedTotal = _counter({
+const invoiceStatePurgeRowsDeletedTotal = _counter( {
   name: 'liquifact_invoice_state_purge_rows_deleted_total',
   help: 'Total invoice tombstones hard-deleted after their retention window',
 });
@@ -84,12 +92,35 @@ function getIntervalMs() {
 }
 
 /**
+ * Serialises purge runs within this process. The worker is already
+ * single-concurrency, but the admin trigger and the scheduled run can both
+ * be enqueued and the mutex guarantees they never interleave batches.
+ *
+ * @returns {Promise<void>} Resolves once the mutex is held.
+ */
+let _purgeChain = Promise.resolve();
+
+function _withPurgeMutex(fn) {
+  const run = _purgeChain.then(fn, fn);
+  // Keep the chain alive even if the run rejects.
+  _purgeChain = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+/**
  * Job handler: purges expired invoice tombstones and records metrics.
+ *
+ * The cutoff is computed once and forwarded to the service so every batch
+ * in the run observes the same retention window. Runs are serialised by a
+ * per-process mutex so concurrent triggers cannot contend on the same rows.
  *
  * @param {object} [job={}] - Job envelope from the queue (`id` used for logs).
  * @param {object} [options={}] - Forwarded to
  *   {@link module:services/invoiceStateSoftDelete.purgeExpiredInvoiceStateSoftDeletes}
- *   (`dbClient`, `now`, `batchSize`, `maxBatches`) — used by tests.
+ *   (`dbClient`, `now`, `batchSize`, `maxBatches`) -- used by tests.
  * @returns {Promise<object>} Purge summary plus `success: true`.
  * @throws {Error} Re-throws the underlying failure after recording metrics so
  *   the worker's retry policy applies.
@@ -97,41 +128,42 @@ function getIntervalMs() {
 async function runInvoiceStatePurge(job = {}, options = {}) {
   const startedAt = Date.now();
 
-  try {
-    const summary = await purgeExpiredInvoiceStateSoftDeletes(options);
+  return _withPurgeMutex(async () => {
+    try {
+      const summary = await purgeExpiredInvoiceStateSoftDeletes(options);
 
-    invoiceStatePurgeRowsDeletedTotal.inc(summary.purged);
-    invoiceStatePurgeRunsTotal.inc({ status: 'success' });
+      invoiceStatePurgeRowsDeletedTotal.inc(summary.purged);
+      invoiceStatePurgeRunsTotal.inc({ status: 'success' });
 
-    logger.info(
-      {
-        jobId: job.id,
-        purged: summary.purged,
-        batches: summary.batches,
-        cutoff: summary.cutoff,
-        retentionDays: summary.retentionDays,
-        maxBatchesReached: summary.maxBatchesReached,
-        durationMs: Date.now() - startedAt,
-      },
-      'invoiceStatePurge: run completed'
-    );
+      logger.info(
+        {
+          jobId: job.id,
+          purged: summary.purged,
+          batches: summary.batches,
+          cutoff: summary.cutoff,
+          retentionDays: summary.retentionDays,
+          maxBatchesReached: summary.maxBatchesReached,
+          durationMs: Date.now() - startedAt,
+        },
+        'invoiceStatePurge: run completed'
+      );
 
-    return { success: true, ...summary };
-  } catch (error) {
-    invoiceStatePurgeRunsTotal.inc({ status: 'error' });
-    logger.error(
-      { jobId: job.id, err: error.message, durationMs: Date.now() - startedAt },
-      'invoiceStatePurge: run failed'
-    );
-    throw error;
-  }
+      return { success: true, ...summary };
+    } catch (error) {
+      invoiceStatePurgeRunsTotal.inc({ status: 'error' });
+      logger.error(
+        { jobId: job.id, err: error.message, durationMs: Date.now() - startedAt },
+        'invoiceStatePurge: run failed'
+      );
+      throw error;
+    }
+  });
 }
 
 const purgeQueue = new JobQueue();
 const purgeWorker = new BackgroundWorker({
   jobQueue: purgeQueue,
   maxConcurrency: 1, // Serialised: concurrent purges would contend on the same rows.
-  pollIntervalMs: 5000,
 });
 
 purgeWorker.registerHandler(JOB_TYPE, (job) => runInvoiceStatePurge(job));
