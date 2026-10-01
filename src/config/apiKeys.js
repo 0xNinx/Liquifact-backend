@@ -482,6 +482,7 @@ function validateEntry(entry, index) {
     throw entryError(`"scopes" must not exceed ${MAX_SCOPES_COUNT} entries`, index);
   }
 
+  const uniqueScopes = new Set();
   for (const scope of scopes) {
     if (!VALID_SCOPES.includes(scope)) {
       throw entryError(
@@ -489,6 +490,10 @@ function validateEntry(entry, index) {
         index,
       );
     }
+    if (uniqueScopes.has(scope)) {
+      throw new Error(`API_KEYS[${index}]: duplicate scope "${scope}"`);
+    }
+    uniqueScopes.add(scope);
   }
 
   if (revoked !== undefined && typeof revoked !== 'boolean') {
