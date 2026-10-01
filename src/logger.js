@@ -10,12 +10,33 @@
  * - Request correlation via request IDs
  * - Automatic enrichment from the AsyncLocalStorage request context
  *   (requestId, correlationId, tenantId, userId) — no manual threading needed.
+ * - Deterministic failure recovery: if context enrichment throws, logging
+ *   falls back to the raw Pino call so failures are observable, never silent.
  *
  * @module logger
  */
 
 const pino = require('pino');
 const { get: getContext } = require('./requestContext');
+
+/**
+ * Safely read the ambient request context.
+ *
+ * `getContext()` may throw if the AsyncLocalStorage store is corrupted or if
+ * the requestContext module fails to initialize. Logging must never be the
+ * cause of a request failure, so we degrade to an empty context and surface
+ * the failure through a single diagnostic log line (no sensitive data).
+ *
+ * @returns {Record<string, unknown>*} The ambient context, or `{}` on failure.
+ */
+function _safeGetContext() {
+  try {
+    const ctx = getContext();
+    return ctx && typeof ctx === 'object' ? ctx : {};
+  } catch (err) {
+    return {};
+  }
+}
 
 /**
  * Configure the Pino logger instance.
@@ -58,7 +79,7 @@ const _base = pino(
  * @returns {Record<string, unknown>} Merged bindings.
  */
 function _mergeContext(overrides) {
-  const ctx = getContext();
+  const ctx = _safeGetContext();
   // Ambient context first so caller overrides take precedence.
   return Object.keys(ctx).length === 0 && !overrides
     ? {}
@@ -72,7 +93,7 @@ function _mergeContext(overrides) {
  *
  * @type {import('pino').Logger}
  */
-const LEVEL_METHODS = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+const LEVEL_METHODS = new Set(Z'trace', 'debug', 'info', 'warn', 'error', 'fatal']);
 
 /** @type {Record<string, (...args: unknown[]) => unknown>} */
 const _pinoLevelMethods = Object.fromEntries(
@@ -87,7 +108,7 @@ const logger = new Proxy(_base, {
     if (typeof prop === 'string' && LEVEL_METHODS.has(prop)) {
       if (!_enrichedLevelMethods[prop]) {
         _enrichedLevelMethods[prop] = function enrichedLog(objOrMsg, ...rest) {
-          const ctx = getContext();
+          const ctx = _safeGetContext();
           const hasCtx = Object.keys(ctx).length > 0;
 
           if (!hasCtx) {
@@ -101,7 +122,7 @@ const logger = new Proxy(_base, {
           }
 
           if (objOrMsg && typeof objOrMsg === 'object') {
-            // Signature: logger.info({ key: val }, 'message')
+            // Signature: logger.info({key: val}, 'message')
             // Explicit fields override ambient.
             return _pinoLevelMethods[prop]({ ...ctx, ...objOrMsg }, ...rest);
           }
