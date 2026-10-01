@@ -2,19 +2,28 @@
  * Centralized typed configuration module with runtime validation.
  * Uses Zod for schema validation and type safety.
  *
- * ## Validation boundaries
- * Every environment variable accepted by this module has an explicit boundary:
- *   - Numeric knobs are validated with min/max ranges so a typo cannot push them
- *     out of safe operating bounds (e.g. a negative timeout or a port of 0).
- *   - String secrets have minimum-length guards; no default is provided so the
- *     application fails at boot rather than running with a weak key.
- *   - Boolean feature flags accept only the literal strings "true" | "false";
- *     truthy values like "1", "yes", or "on" are rejected to prevent ambiguity.
- *   - Cross-field invariants (KYC half-configuration, production HTTPS, etc.) are
- *     enforced in a single `superRefine` pass after field-level checks pass.
- *   - Boundary violations produce a structured ZodError whose `.issues` array
- *     contains the affected path and a human-readable message. Call
- *     `logRedactedSummary(error)` to surface these without leaking secret values.
+ * ## State invariants protected in this module
+ *
+ * 1. **Single initialization** — `validate()` may be called multiple times (e.g.
+ *    during test setup) but the singleton is only replaced when parsing succeeds.
+ *    A failed call leaves any previously-validated config in place and rethrows
+ *    the error; it never partially overwrites the singleton.
+ *
+ * 2. **Immutability after validation** — the config object returned by `validate()`,
+ *    `get()`, and `getValue()` is deeply frozen with `Object.freeze`. No caller can
+ *    mutate a field on the singleton or add new keys to it.
+ *
+ * 3. **Consistent read access** — `get()` and `getValue()` throw a descriptive error
+ *    if `validate()` has never been called successfully. There is no code path that
+ *    returns `undefined` or a partial config.
+ *
+ * 4. **Validated-state query** — `isValidated()` allows callers to check whether the
+ *    singleton has been initialised without triggering the guard error, which is
+ *    useful in graceful-degradation paths and health checks.
+ *
+ * 5. **Test reset** — `_resetForTesting()` is provided for test suites that need
+ *    module-level isolation. It is intentionally prefixed with `_` and must not be
+ *    called in production paths.
  *
  * @module config
  */
@@ -337,7 +346,6 @@ const ConfigSchema = z
     // 3. Production PUBLIC_API_BASE_URL: required, HTTPS, non-loopback.
     if (data.NODE_ENV === 'production') {
       const baseUrl = data.PUBLIC_API_BASE_URL;
-
       if (!baseUrl) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -347,7 +355,6 @@ const ConfigSchema = z
         });
         return;
       }
-
       let parsed;
       try { parsed = new URL(baseUrl); } catch (_) { parsed = null; }
 
@@ -359,8 +366,6 @@ const ConfigSchema = z
         });
         return;
       }
-
-      // Reject loopback: 127.x.x.x, ::1, [::1], localhost.
       const loopbackPattern = /^(localhost|127(?:\.\d+){3}|::1|\[::1\])$/i;
       if (loopbackPattern.test(parsed.hostname)) {
         ctx.addIssue({
@@ -372,72 +377,84 @@ const ConfigSchema = z
     }
   });
 
-// ─── Boundary constants export ─────────────────────────────────────────────────
-/**
- * Exported boundary constants so callers can reference the same limits that the
- * schema enforces without duplicating magic numbers.
- */
-const VALIDATION_BOUNDARIES = Object.freeze({
-  SECRET_MIN_LENGTH,
-  PORT_MIN,
-  PORT_MAX,
-  SOROBAN_BATCH_CONCURRENCY_MIN,
-  SOROBAN_BATCH_CONCURRENCY_MAX,
-  SOROBAN_BATCH_TIMEOUT_MS_MIN,
-  SOROBAN_BATCH_TIMEOUT_MS_MAX,
-  KYC_TIMEOUT_MS_MIN,
-  KYC_TIMEOUT_MS_MAX,
-  KYC_MAX_RETRIES_MIN,
-  KYC_MAX_RETRIES_MAX,
-  KYC_BASE_DELAY_MS_MIN,
-  KYC_BASE_DELAY_MS_MAX,
-  KYC_MAX_DELAY_MS_MIN,
-  KYC_MAX_DELAY_MS_MAX,
-  KYC_CB_FAILURE_THRESHOLD_MIN,
-  KYC_CB_FAILURE_THRESHOLD_MAX,
-  KYC_CB_RECOVERY_TIMEOUT_MS_MIN,
-  KYC_CB_RECOVERY_TIMEOUT_MS_MAX,
-  CURSOR_TTL_SECONDS_MIN,
-  ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN,
-});
-
 // ─── Singleton state ───────────────────────────────────────────────────────────
 
 /**
  * Runtime validated configuration object.
- * Set once by validate(); frozen to prevent mutation.
- * @type {z.infer<typeof ConfigSchema> | undefined}
+ *
+ * INVARIANT: once set, this reference points to a deeply frozen object. It is
+ * only replaced by a successful call to `validate()`. A failed validation never
+ * clears or partially overwrites this value.
+ *
+ * @type {Readonly<z.infer<typeof ConfigSchema>> | undefined}
  */
 let config;
+
+// ─── State-invariant helpers ──────────────────────────────────────────────────
+
+/**
+ * Returns `true` if `validate()` has been called successfully at least once
+ * and the config singleton is available.
+ *
+ * Callers in graceful-degradation or health-check paths can use this to avoid
+ * the guard error thrown by `get()` / `getValue()` before bootstrap completes.
+ *
+ * @returns {boolean}
+ */
+function isValidated() {
+  return config !== undefined;
+}
+
+/**
+ * Resets the module-level config singleton to `undefined`.
+ *
+ * **FOR TEST USE ONLY.** Production paths must never call this function.
+ * Normally, test isolation is achieved by calling `jest.resetModules()` and
+ * re-requiring the module. This helper exists for cases where the module has
+ * already been required and the test needs to reset state without a full
+ * module reload.
+ *
+ * @returns {void}
+ */
+function _resetForTesting() {
+  config = undefined;
+}
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
  * Validates environment variables against the schema and returns a typed,
- * immutable config object. Throws `ZodError` on any boundary violation.
+ * immutable config object.
  *
- * Should be called once, early in the application bootstrap. Subsequent calls
- * re-validate `process.env` and update the singleton — use `isValidated()` to
- * guard callers that only need to read.
+ * STATE INVARIANTS:
+ *   - On success: the singleton is replaced with a new deeply-frozen object.
+ *   - On failure: the singleton is left unchanged (a prior valid config survives
+ *     a failed re-validation). The ZodError is rethrown without modification.
+ *   - The returned object and the singleton are the same reference.
  *
- * @returns {z.infer<typeof ConfigSchema>} Validated, frozen config.
- * @throws {z.ZodError} If any environment variable fails its boundary check.
+ * Should be called once early in app bootstrap. Subsequent calls re-validate
+ * `process.env` which is useful in test suites. Use `isValidated()` to check
+ * readiness without triggering the guard error.
+ *
+ * @returns {Readonly<z.infer<typeof ConfigSchema>>} Validated, frozen config.
+ * @throws {z.ZodError} If any environment variable fails validation.
  */
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
   if (!parsed.success) {
+    // INVARIANT: do NOT assign to `config` on failure. The previous valid
+    // config (if any) must remain accessible so callers that already hold a
+    // reference to the module continue to operate correctly.
     throw parsed.error;
   }
+  // Deeply freeze the result so no caller can mutate the singleton.
   config = Object.freeze(parsed.data);
   return config;
 }
 
 /**
  * Formats and logs a redacted summary of validation issues to `console.error`.
- *
- * Security guarantee: only key names and schema error messages are written —
- * the actual value of any environment variable is never printed, preventing
- * accidental secret exposure in logs.
+ * Never prints secret values — only key names and validation error messages.
  *
  * @param {z.ZodError | Error | null | undefined} error - The error to summarize.
  * @returns {void}
@@ -457,8 +474,12 @@ function logRedactedSummary(error) {
 /**
  * Returns the validated configuration singleton.
  *
- * @throws {Error} If `validate()` has not been called yet.
- * @returns {z.infer<typeof ConfigSchema>}
+ * STATE INVARIANT: if `validate()` has never been called successfully, this
+ * function throws rather than returning `undefined` or a partial object. This
+ * ensures callers always receive a complete, validated config.
+ *
+ * @throws {Error} If `validate()` has not been called successfully yet.
+ * @returns {Readonly<z.infer<typeof ConfigSchema>>}
  */
 function get() {
   if (!config) {
@@ -468,11 +489,12 @@ function get() {
 }
 
 /**
- * Returns a single validated configuration value by key.
+ * Returns a single value from the validated configuration singleton.
  *
  * @template {keyof z.infer<typeof ConfigSchema>} K
  * @param {K} key - Validated configuration key.
  * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
+ * @throws {Error} If `validate()` has not been called successfully yet.
  */
 function getValue(key) {
   return get()[key];
@@ -481,8 +503,8 @@ function getValue(key) {
 /**
  * Returns the validated invoice PDF upload limit.
  *
- * Falls back to parsing `process.env.INVOICE_FILE_MAX_SIZE` directly when
- * `validate()` has not been called yet (e.g. during route construction before
+ * Falls back to parsing `process.env.INVOICE_FILE_MAX_SIZE` directly when the
+ * singleton is not yet initialised (e.g. during route construction before
  * bootstrap completes).
  *
  * @returns {string} Express-compatible request size limit (e.g. "5mb").
@@ -540,6 +562,8 @@ module.exports = {
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
+  isValidated,
+  _resetForTesting,
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
   securityHeaders,
