@@ -2,6 +2,12 @@
 
 const {
   RedisEscrowSummaryCache,
+  validateInvoiceId,
+  validateSummary,
+  validateTtlSeconds,
+  validateVersion,
+  MAX_INVOICE_ID_LENGTH,
+  MAX_TTL_SECONDS,
 } = require('../cache/redis');
 const { CircuitBreaker, CircuitBreakerState } = require('../utils/circuitBreaker');
 
@@ -112,5 +118,164 @@ describe('Escrow Cache Integration', () => {
 
     const setResult = await cache.setSummary('inv_breaker', { status: 'funded' });
     expect(setResult).toBe(false);
+  });
+});
+
+describe('Escrow Cache Validation Boundaries', () => {
+  describe('validateInvoiceId', () => {
+    it('accepts a well-formed invoice id', () => {
+      expect(validateInvoiceId('inv_100')).toEqual({ valid: true, value: 'inv_100' });
+    });
+
+    it('accepts boundary-length invoice ids', () => {
+      const max = 'a'.repeat(MAX_INVOICE_ID_LENGTH);
+      expect(validateInvoiceId(max).valid).toBe(true);
+      expect(validateInvoiceId('a').valid).toBe(true);
+    });
+
+    it('rejects non-string, empty, and whitespace-only ids', () => {
+      expect(validateInvoiceId(undefined).valid).toBe(false);
+      expect(validateInvoiceId(null).valid).toBe(false);
+      expect(validateInvoiceId(123).valid).toBe(false);
+      expect(validateInvoiceId('').valid).toBe(false);
+      expect(validateInvoiceId('   ').valid).toBe(false);
+    });
+
+    it('rejects ids exceeding the maximum length', () => {
+      const tooLong = 'a'.repeat(MAX_INVOICE_ID_LENGTH + 1);
+      const result = validateInvoiceId(tooLong);
+      expect(result.valid).toBe(false);
+      expect(result.reason).toBe('invoice_id_too_long');
+    });
+
+    it('rejects ids containing control characters', () => {
+      expect(validateInvoiceId('inv\u0000_1').valid).toBe(false);
+      expect(validateInvoiceId('inv\n_1').valid).toBe(false);
+    });
+  });
+
+  describe('validateSummary', () => {
+    it('accepts a plain object summary', () => {
+      const summary = { invoiceId: 'inv_1', status: 'funded' };
+      expect(validateSummary(summary)).toEqual({ valid: true, value: summary });
+    });
+
+    it('rejects null, arrays, and primitives', () => {
+      expect(validateSummary(null).valid).toBe(false);
+      expect(validateSummary([]).valid).toBe(false);
+      expect(validateSummary('str').valid).toBe(false);
+      expect(validateSummary(42).valid).toBe(false);
+    });
+
+    it('rejects summaries that are not JSON-serializable', () => {
+      const cyclic = {};
+      cyclic.self = cyclic;
+      const result = validateSummary(cyclic);
+      expect(result.valid).toBe(false);
+      expect(result.reason).toBe('summary_not_serializable');
+    });
+  });
+
+  describe('validateTtlSeconds', () => {
+    it('accepts positive integers within bounds', () => {
+      expect(validateTtlSeconds(1)).toEqual({ valid: true, value: 1 });
+      expect(validateTtlSeconds(MAX_TTL_SECONDS).valid).toBe(true);
+    });
+
+    it('rejects zero, negatives, non-integers, and out-of-range values', () => {
+      expect(validateTtlSeconds(0).valid).toBe(false);
+      expect(validateTtlSeconds(-5).valid).toBe(false);
+      expect(validateTtlSeconds(1.5).valid).toBe(false);
+      expect(validateTtlSeconds(MAX_TTL_SECONDS + 1).valid).toBe(false);
+      expect(validateTtlSeconds('60').valid).toBe(false);
+    });
+  });
+
+  describe('validateVersion', () => {
+    it('accepts non-negative integers and undefined', () => {
+      expect(validateVersion(undefined).valid).toBe(true);
+      expect(validateVersion(0).valid).toBe(true);
+      expect(validateVersion(42).valid).toBe(true);
+    });
+
+    it('rejects negatives and non-integers', () => {
+      expect(validateVersion(-1).valid).toBe(false);
+      expect(validateVersion(1.2).valid).toBe(false);
+      expect(validateVersion('1').valid).toBe(false);
+    });
+  });
+
+  describe('cache behavior with invalid input', () => {
+    it('getSummary rejects invalid invoice ids without touching Redis', async () => {
+      let getCalls = 0;
+      const client = {
+        get: async () => {
+          getCalls += 1;
+          return null;
+        },
+        set: async () => 'OK',
+        del: async () => 1,
+      };
+      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+
+      const result = await cache.getSummary('');
+      expect(result.hit).toBe(false);
+      expect(result.reason).toBe('invalid_invoice_id');
+      expect(getCalls).toBe(0);
+    });
+
+    it('setSummary rejects invalid invoice ids and summaries', async () => {
+      const client = new FakeRedisClient();
+      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+
+      expect(await cache.setSummary('', { status: 'funded' })).toBe(false);
+      expect(await cache.setSummary('inv_1', null)).toBe(false);
+      expect(client.map.size).toBe(false);
+    });
+
+    it('setSummary rejects invalid ttl values', async () => {
+      const client = new FakeRedisClient();
+      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+
+      expect(await cache.setSummary('inv_1', { status: 'funded' }, 0)).toBe(false);
+      expect(await cache.setSummary('inv_1', { status: 'funded' }, -1)).toBe(false);
+      expect(await cache.setSummary('inv_1', { status: 'funded' }, 1.5)).toBe(false);
+      expect(client.map.size).toBe(0);
+    });
+
+    it('getSummary rejects invalid version values', async () => {
+      const client = new FakeRedisClient();
+      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+
+      const result = await cache.getSummary('inv_1', -1);
+      expect(result.hit).toBe(false);
+      expect(result.reason).toBe('invalid_version');
+    });
+
+    it('duplicate setSummary calls are idempotent for the same payload', async () => {
+      const client = new FakeRedisClient();
+      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+      const summary = { invoiceId: 'inv_dup', status: 'funded' };
+
+      expect(await cache.setSummary('inv_dup', summary, 10)).toBe(true);
+      expect(await cache.setSummary('inv_dup', summary, 10)).toBe(true);
+
+      const hit = await cache.getSummary('inv_dup', 11);
+      expect(hit.hit).toBe(true);
+      expect(hit.value).toEqual(summary);
+    });
+
+    it('rejects a stale version read after a newer write', async () => {
+      const client = new FakeRedisClient();
+      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+
+      await cache.setSummary('inv_ver', { invoiceId: 'inv_ver', status: 'a' }, 100);
+      const stale = await cache.getSummary('inv_ver', 99);
+      expect(stale.hit).toBe(false);
+      expect(stale.reason).toBe('stale_version');
+
+      const fresh = await cache.getSummary('inv_ver', 100);
+      expect(fresh.hit).toBe(true);
+    });
   });
 });
