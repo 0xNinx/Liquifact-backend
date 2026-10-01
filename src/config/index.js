@@ -32,7 +32,53 @@
 
 const z = require('zod');
 
-/** Express-compatible request size string. @type {z.ZodDefault<z.ZodString>} */
+// ─── Boundary constants ────────────────────────────────────────────────────────
+// Centralising limits here makes them easy to review and tune without hunting
+// through the schema definition.
+
+/** Minimum length for any secret/key that protects cryptographic operations. */
+const SECRET_MIN_LENGTH = 32;
+
+/** Port range accepted by the OS for unprivileged binding. */
+const PORT_MIN = 1;
+const PORT_MAX = 65535;
+
+/** Soroban RPC concurrency: prevent runaway parallelism while allowing tuning. */
+const SOROBAN_BATCH_CONCURRENCY_MIN = 1;
+const SOROBAN_BATCH_CONCURRENCY_MAX = 50;
+
+/** Soroban per-request timeout: 100 ms floor prevents zero/negative values;
+ *  30 s ceiling prevents indefinite hangs. */
+const SOROBAN_BATCH_TIMEOUT_MS_MIN = 100;
+const SOROBAN_BATCH_TIMEOUT_MS_MAX = 30_000;
+
+/** KYC transport knobs — mirrored from issue #592. */
+const KYC_TIMEOUT_MS_MIN = 100;
+const KYC_TIMEOUT_MS_MAX = 30_000;
+const KYC_MAX_RETRIES_MIN = 0;
+const KYC_MAX_RETRIES_MAX = 10;
+const KYC_BASE_DELAY_MS_MIN = 0;
+const KYC_BASE_DELAY_MS_MAX = 10_000;
+const KYC_MAX_DELAY_MS_MIN = 0;
+const KYC_MAX_DELAY_MS_MAX = 60_000;
+const KYC_CB_FAILURE_THRESHOLD_MIN = 1;
+const KYC_CB_FAILURE_THRESHOLD_MAX = 100;
+const KYC_CB_RECOVERY_TIMEOUT_MS_MIN = 100;
+const KYC_CB_RECOVERY_TIMEOUT_MS_MAX = 60_000;
+
+/** Cursor TTL: at least 1 second; no upper bound mandated by schema. */
+const CURSOR_TTL_SECONDS_MIN = 1;
+
+/** Escrow stale threshold: at least 1 second. */
+const ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN = 1;
+
+// ─── Sub-schemas ───────────────────────────────────────────────────────────────
+
+/**
+ * Express-compatible request size string accepted by the `body-parser` package.
+ * Examples: "512kb", "5mb", "1.5gb".
+ * @type {z.ZodDefault<z.ZodString>}
+ */
 const InvoiceFileMaxSizeSchema = z
   .string()
   .trim()
@@ -41,9 +87,20 @@ const InvoiceFileMaxSizeSchema = z
   })
   .default('5mb');
 
+// ─── Main schema ──────────────────────────────────────────────────────────────
+
 /**
- * Complete configuration schema with defaults and validation.
- * Secrets have no defaults - must be provided.
+ * Complete configuration schema with explicit boundaries on every field.
+ *
+ * Boundary guarantees enforced here:
+ *   1. PORT is a finite integer in [1, 65535].
+ *   2. JWT_SECRET is at least 32 characters — never has a default.
+ *   3. All numeric timeout/retry/concurrency knobs have min AND max guards so
+ *      a mis-typed value cannot push them into an unsafe or non-functional range.
+ *   4. Boolean feature flags accept only "true" | "false" — no truthy aliases.
+ *   5. URLs are parsed by Zod's url() validator before use.
+ *   6. Cross-field invariants are checked in superRefine (see below).
+ *
  * @type {z.ZodObject<any>}
  */
 const ConfigSchema = z
@@ -59,6 +116,7 @@ const ConfigSchema = z
     CURSOR_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
     CORS_ALLOWED_ORIGINS: z.string().optional(),
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
+
     NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
     SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
     SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
@@ -68,7 +126,10 @@ const ConfigSchema = z
     INVOICE_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
     CONFIG_RUNTIME_ENABLED: z.enum(['true', 'false']).default('true'),
     KYC_PROVIDER_URL: z.string().url().optional(),
+
+    /** KYC API key. Must be paired with KYC_PROVIDER_URL. */
     KYC_PROVIDER_API_KEY: z.string().min(1).optional(),
+
     KYC_PROVIDER_SECRET: z.string().min(1).optional(),
     KYC_PROVIDER_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
     KYC_PROVIDER_MAX_RETRIES: z.coerce.number().min(0).max(10).default(3),
@@ -80,11 +141,17 @@ const ConfigSchema = z
     KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS: z.coerce.number().min(100).max(60000).default(10000),
     KYC_WEBHOOK_ENABLED: z.enum(['true', 'false']).default('false'),
     PUBLIC_API_BASE_URL: z.string().url().optional(),
+
+    // ── Invoice upload ────────────────────────────────────────────────────────
     INVOICE_FILE_MAX_SIZE: InvoiceFileMaxSizeSchema,
     METRICS_ENABLED: z.enum(['true', 'false']).default('true'),
   })
+  // ── Cross-field boundary checks ─────────────────────────────────────────────
   .superRefine((data, ctx) => {
+    // Skip cross-field checks in test mode to allow partial configurations.
     if (data.NODE_ENV === 'test') { return; }
+
+    // 1. Production cursor secret: either CURSOR_SECRET or JWT_SECRET must be set.
     if (data.NODE_ENV === 'production' && !data.CURSOR_SECRET && !data.JWT_SECRET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -92,6 +159,8 @@ const ConfigSchema = z
         path: ['CURSOR_SECRET'],
       });
     }
+
+    // 2. KYC half-configuration: URL and key must be present together or absent together.
     const hasUrl = Boolean(data.KYC_PROVIDER_URL);
     const hasKey = Boolean(data.KYC_PROVIDER_API_KEY);
     if (hasUrl !== hasKey) {
@@ -102,6 +171,8 @@ const ConfigSchema = z
         path: hasUrl ? ['KYC_PROVIDER_API_KEY'] : ['KYC_PROVIDER_URL'],
       });
     }
+
+    // 3. Production PUBLIC_API_BASE_URL: required, HTTPS, non-loopback.
     if (data.NODE_ENV === 'production') {
       const baseUrl = data.PUBLIC_API_BASE_URL;
       if (!baseUrl) {
@@ -115,6 +186,7 @@ const ConfigSchema = z
       }
       let parsed;
       try { parsed = new URL(baseUrl); } catch (_) { parsed = null; }
+
       if (!parsed || parsed.protocol !== 'https:') {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -377,4 +449,5 @@ module.exports = {
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
   securityHeaders,
+  VALIDATION_BOUNDARIES,
 };

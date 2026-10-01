@@ -1,3 +1,5 @@
+
+
 /**
  * Tests for centralized config module — #1304 Make failure recovery deterministic.
  *
@@ -19,6 +21,7 @@ const {
   logRedactedSummary,
   ConfigValidationError,
   ConfigSchema,
+  VALIDATION_BOUNDARIES,
 } = require('./index');
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
