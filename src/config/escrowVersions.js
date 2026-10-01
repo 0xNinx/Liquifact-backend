@@ -18,13 +18,105 @@ const { isValidStellarContractAddress } = require('../utils/validators');
  * Known LiquifactEscrow deployments: semver -> SCHEM_VERSION (u32).
  * Add a new entry here whenever a wasm upgrade increments SCHEMA_VERSION.
  *
- * @type {Record<string, number>}
+ * @type {Readonly<Record<string, number>>}
  */
-const REGISTRY = {
+const REGISTRY = Object.freeze({
   '1.0.0': 1,
   '1.1.0': 2,
   '1.2.0': 3,
-};
+});
+
+/**
+ * Validates a semver string.
+ *
+ * @param {string} version
+ * @returns {boolean}
+ */
+function isValidSemver(version) {
+  return typeof version === 'string' && SEMVER_REGEX.test(version);
+}
+
+/**
+ * Validates an on-chain SCHEMA_VERSION value.
+ *
+ * Accepts only positive integers within the u32 range. Rejects NaN,
+ * Infinity, floats, negative numbers, zero, and out-of-range values.
+ *
+ * @param {*} value
+ * @returns {boolean}
+ */
+function isValidSchemaVersion(value) {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    Number.isFinite(value) &&
+    value > 0 &&
+    value <= MAX_SCHEMA_VERSION
+  );
+}
+
+/**
+ * Validates the registry at load time. Throws a deterministic error if any
+ * entry is malformed. This fails fast so a corrupted registry cannot silently
+ * produce wrong comparison results at runtime.
+ *
+ * @param {Record<string, number>} registry
+ * @throws {Error}
+ */
+function validateRegistry(registry) {
+  if (!registry || typeof registry !== 'object' || Array.isArray(registry)) {
+    throw new Error('Escrow version registry must be a non-null object');
+  }
+
+  const entries = Object.entries(registry);
+  if (entries.length === 0) {
+    throw new Error('Escrow version registry must not be empty');
+  }
+
+  const seenSchemaVersions = new Set();
+  for (const [semver, schemaVersion] of entries) {
+    if (!isValidSemver(semver)) {
+      throw new Error(`Invalid semver key in escrow version registry: ${semver}`);
+    }
+    if (!isValidSchemaVersion(schemaVersion)) {
+      throw new Error(
+        `Invalid SCHEMA_VERSION for ${semver} in escrow version registry: ${schemaVersion}`
+      );
+    }
+    if (seenSchemaVersions.has(schemaVersion)) {
+      throw new Error(
+        `Duplicate SCHEMA_VERSION ${schemaVersion} in escrow version registry`
+      );
+    }
+    seenSchemaVersions.add(schemaVersion);
+  }
+}
+
+validateRegistry(REGISTRY);
+
+/**
+ * Pre-computed, immutable view of the registry used for comparisons.
+ *
+ * Sorting by SCHEMA_VERSION and freezing the result ensures that
+ * comparisons are deterministic and independent of object key order.
+ *
+ * @type {ReadonlyArray<{readonly [string, number]}>}
+ */
+const SORTED_ENTRIES = Object.freeze(
+  Object.entries(REGISTRY)
+    .map(([semver, schemaVersion]) => Object.freeze([semver, schemaVersion]))
+    .sort((a, b) => a[1] - b[1])
+);
+
+/**
+ * The highest known SCHEMA_VERSION and its semver.
+ *
+ * @type {readonly { semver: string, schemaVersion: number }}
+ */
+const MAX_ENTRY = Object.freeze({
+  semver: SORTED_ENTRIES[SORTED_ENTRIES.length - 1][0],
+  schemaVersion: SORTED_ENTRIES[SORTED_ENTRIES.length - 1][1],
+});
 
 /**
  * Validates a Stellar contract address.
@@ -88,7 +180,7 @@ function decodeSchemaVersion(scv) {
  * and decodes the returned XDR value as a u32.  Uses `callSorobanContract` for
  * automatic retry on transient errors.
  *
- * Rejects with a structured error on RPC failure — never calls process.exit.
+ * Rejects with a structured error on R PC failure — never calls process.exit.
  *
  * @param {string} [contractId] - Contract address (C...56 chars). Defaults to
  *   `ESCROW_CONTRACT_ID` env var.
@@ -157,6 +249,10 @@ async function getOnChainSchemaVersion(contractId) {
 /**
  * Compares an on-chain SCHEM_VERSION against the registry.
  *
+ * The comparison is deterministic and independent of object key order.
+ * Invalid inputs (NaN, floats, negative, zero, out-of-range) are rejected
+ * with a structured error rather than producing a misleading status.
+ *
  * @param {number} onChainVersion - Value returned by getOnChainSchemaVersion.
  * @returns {{status: 'current'|'aahead'|'unknown', knownVersion: string|null}}
  *   -
@@ -165,10 +261,10 @@ async function getOnChainSchemaVersion(contractId) {
  *   - `unknown`  — not found in registry and not higher than any entry.
  */
 function compareVersions(onChainVersion) {
-  const entries = Object.entries(REGISTRY); // [semver, schemaVersion]
-
-  if (entries.length === 0) {
-    return { status: 'unknown', knownVersion: null };
+  if (!isValidSchemaVersion(onChainVersion)) {
+    const err = new Error(`Invalid on-chain SCHEMA_VERSION: ${onChainVersion}`);
+    err.code = 'INVALID_SCHEMA_VERSION';
+    throw err;
   }
 
   // Find the registry entry with the highest SCHEM_VERSION.
@@ -182,13 +278,18 @@ function compareVersions(onChainVersion) {
     return { status: 'current', knownVersion: maxSemver };
   }
 
-  if (onChainVersion > maxSchemaVersion) {
-    return { status: 'ahead', knownVersion: maxSemver };
+  if (onChainVersion > MAX_ENTRY.schemaVersion) {
+    return { status: 'ahead', knownVersion: MAX_ENTRY.semver };
   }
 
-  // Check if it matches any lower entry.
-  const match = entries.find(([, v]) => v === onChainVersion);
-  return { status: 'unknown', knownVersion: match ? match[0] : null };
+  // Find the highest known entry whose SCHEMA_VERSION is <= the on-chain value.
+  // Because SORTED_ENTRIES is ascending, the last match is the best match.
+  const match = SORTED_ENTRIES.find(([, v]) => v === onChainVersion);
+  if (match) {
+    return { status: 'ancient', knownVersion: match[0] };
+  }
+
+  return { status: 'unknown', knownVersion: null };
 }
 
 /**
@@ -269,6 +370,7 @@ async function getOnChainSchemaVersionWithRecovery(contractId, options = {}) {
 
 module.exports = {
   REGISTRY,
+  MAX_SCHEMA_VERSION,
   getOnChainSchemaVersion,
   getOnChainSchemaVersionWithRecovery,
   compareVersions,

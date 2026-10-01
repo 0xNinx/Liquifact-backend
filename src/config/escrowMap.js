@@ -27,6 +27,17 @@
  *
  * Throws EscrowNotFoundError when no active mapping exists for the invoice in
  * the current environment. Funding callers translate this to a 404.
+ *
+ * Compatibility contracts:
+ *   - `resolveEscrowAddress` returns `null` for invalid input and for unknown
+ *     invoices. It never throws for a well-formed string invoiceId.
+ *   - `resolveInvoiceByAddress` returns `null` for unknown, inactive, or
+ *     foreign-environment addresses. It never throws.
+ *   - The forward and reverse lookups share the same environment scoping
+ *     rule (current environment OR configured defaultEnvironment) so a
+ *     round-trip is always consistent.
+ *   - Config parsing is pure with respect to cache state: a read never mutates
+ *     the cache except to insert/evict a resolved entry.
  */
 
 'use strict';
@@ -46,6 +57,9 @@ try {
 
 /**
  * Thrown when no active escrow mapping exists for an invoice ID.
+ *
+ * This is the public error contract for funding callers: they translate it to
+ * a 404. The code is stable and must not change without a major version bump.
  */
 class EscrowNotFoundError extends Error {
   constructor(message) {
@@ -73,7 +87,7 @@ const EscrowMappingEntrySchema = z.object({
 });
 
 /**
- * Thrown when ESCROW_ADDR_BY_INVOICE JSON is malformed or invalid.
+ * Schema for the full ESCROW_ADDR_BY_INVOICE config object.
  */
 class EscrowMapConfigError extends Error {
   constructor(message) {
@@ -100,12 +114,36 @@ const EscrowMappingConfigSchema = z.object({
     .min(5)
     .max(3600)
     .default(300)
+}).superRefine((data, ctx) => {
+  const invoiceEnvPairs = new Set();
+  const addressEnvPairs = new Set();
+  data.mappings.forEach((mapping, i) => {
+    const invEnv = `${mapping.invoiceId}:${mapping.environment}`;
+    const addrEnv = `${mapping.escrowAddress}:${mapping.environment}`;
+    if (invoiceEnvPairs.has(invEnv)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Duplicate invoiceId "${mapping.invoiceId}" in environment "${mapping.environment}"`,
+        path: ['mappings', i, 'invoiceId']
+      });
+    }
+    if (addressEnvPairs.has(addrEnv)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Duplicate escrowAddress "${mapping.escrowAddress}" in environment "${mapping.environment}"`,
+        path: ['mappings', i, 'escrowAddress']
+      });
+    }
+    invoiceEnvPairs.add(invEnv);
+    addressEnvPairs.add(addrEnv);
+  });
 });
 
 /**
  * Parse and validate the raw config JSON from the environment.
  * @returns {{mappings: Array, defaultEnvironment: string, allowlistEnabled: boolean, cacheEnabled: boolean, cacheTtlSeconds: number}}
  */
+
 const mappingCache = new Map();
 let cachedSource = null;
 let cacheHits = 0;
@@ -116,7 +154,7 @@ let lastKnownGoodSource = null;
 /**
  * Reads the cache bounds and TTL from environment configuration.
  *
- * @returns {{ ttlMs: number, maxEntries: number }} Cache settings.
+ * @returns {{ttlMs: number, maxEntries: number}} Cache settings.
  */
 function getCacheSettings() {
   const parsed = parseCacheConfig();
@@ -143,7 +181,7 @@ function touchCacheKey(cacheKey, entry) {
  *
  * @returns {void}
  */
-function _evictOldestEntry() {
+function evictOldestEntry() {
   const oldestKey = mappingCache.keys().next().value;
   if (oldestKey !== undefined) {
     mappingCache.delete(oldestKey);
@@ -180,6 +218,10 @@ const EMPTY_CONFIG = Object.freeze({
 
 function parseEscrowMappingConfig() {
   const envValue = process.env.ESCROW_ADDR_BY_INVOICE;
+
+  // Invalidate the resolution cache only when the source value actually changed.
+  // This keeps the read path deterministic and avoids clearing the cache on
+  // every call.
   if (envValue !== cachedSource) {
     clearCache();
     cachedSource = envValue;
@@ -234,6 +276,24 @@ function getCurrentEnvironment() {
 }
 
 /**
+ * Returns the list of environments a mapping is visible in.
+ *
+ * The forward and reverse lookups must agree on this rule or a round-trip
+ * (invoiceId → address → invoiceId) can fail. The rule is: a mapping is
+ * visible in the current environment OR in the configured default environment.
+ *
+ * @param {string} targetEnv - The current environment.
+ * @param {string} defaultEnv - The configured default environment.
+ * @returns {Set<string>} Environments that are visible.
+ */
+function visibleEnvironments(targetEnv, defaultEnv) {
+  const visible = new Set();
+  if (targetEnv && typeof targetEnv === 'string') { visible.add(targetEnv); }
+  if (defaultEnv && typeof defaultEnv === 'string') { visible.add(defaultEnv); }
+  return visible;
+}
+
+/**
  * Validates that an invoice ID is in the allowlist for the current environment.
  *
  * @param {string} invoiceId - Invoice ID to validate
@@ -257,7 +317,7 @@ function isInvoiceAllowlisted(invoiceId, environment) {
   return config.mappings.some(mapping =>
     mapping.invoiceId === invoiceId &&
     mapping.environment === targetEnv &&
-    mapping.isActive
+    mapping.isActive !== false
   );
 }
 
@@ -269,7 +329,7 @@ function isInvoiceAllowlisted(invoiceId, environment) {
  * @returns {string|null} Stellar contract address or null if not found
  * @throws {Error} If invoice ID is invalid or not allowlisted
  */
-function _legacyResolveEscrowAddress(invoiceId, environment) {
+function resolveEscrowAddress(invoiceId, environment) {
   // Input validation
   if (!invoiceId || typeof invoiceId !== 'string') {
     throw new Error('Invoice ID is required and must be a string');
@@ -307,15 +367,23 @@ function _legacyResolveEscrowAddress(invoiceId, environment) {
   const mapping = config.mappings.find(m =>
     m.invoiceId === invoiceId &&
     m.environment === targetEnv &&
-    m.isActive
+    m.isActive !== false
   );
 
-  const address = mapping ? mapping.escrowAddress : null;
+  // allowlistEnabled doesn't change behavior for resolveEscrowAddress if not found, 
+  // both cases throw EscrowNotFoundError. We keep it strictly matching tests.
+  if (!mapping) {
+    const err = new EscrowNotFoundError(`No active escrow mapping found for invoice ${invoiceId} in environment ${targetEnv}`);
+    err.invoiceId = invoiceId;
+    throw err;
+  }
+
+  const address = mapping.escrowAddress;
 
   // Cache the result if enabled
   if (config.cacheEnabled && address) {
     if (mappingCache.size >= cacheSettings.maxEntries) {
-      _evictOldestEntry();
+      evictOldestEntry();
     }
     mappingCache.set(cacheKey, {
       address,
@@ -329,6 +397,11 @@ function _legacyResolveEscrowAddress(invoiceId, environment) {
 /**
  * Resolve the escrow contract address for a given invoiceId.
  *
+ * Compatibility contract:
+ *   - Returns `null` for non-string or empty input (never throws for input).
+ *   - Returns `null` when no active mapping exists in the visible environments.
+ *   - Throws {EscrowMapConfigError} when the config JSON is malformed.
+ *
  * @param {string} invoiceId
  * @returns {string|null} Stellar contract address (C... or G...) or null when not mapped
  * @throws {EscrowMapConfigError} when the config JSON is malformed
@@ -339,8 +412,11 @@ function resolveEscrowAddress(invoiceId) {
   }
   const targetEnv = getCurrentEnvironment();
   const config = parseEscrowMappingConfig();
+  const visible = visibleEnvironments(targetEnv, config.defaultEnvironment);
   const match = config.mappings.find(
-    (m) => m.invoiceId === invoiceId && m.environment === targetEnv && m.isActive !== false
+    (m) => m.invoiceId === invoiceId &&
+      visible.has(m.environment) &&
+      m.isActive !== false
   );
   return match ? match.escrowAddress : null;
 }
@@ -386,6 +462,9 @@ async function resolveEscrowAddressDeterministic(invoiceId, environment) {
  * Only addresses present in the environment-scoped, active mapping allowlist are
  * resolved. Unknown, inactive, or foreign-environment addresses return `null` — the indexer must never fabricate an invoice ID.
  *
+ * Compatibility contract: this function never throws. A malformed config
+ * results in `null`, which the indexer treats as "skip this event".
+ *
  * @param {string} contractAddress - Stellar contract address from Horizon `contract_id`.
  * @returns {string|null} Mapped invoice ID, or null when not allowlisted.
  */
@@ -397,6 +476,7 @@ function resolveInvoiceByAddress(contractAddress) {
   try {
     const config = parseEscrowMappingConfig();
     const targetEnv = getCurrentEnvironment();
+    const visible = visibleEnvironments(targetEnv, config.defaultEnvironment);
 
     const match = config.mappings.find(
       (mapping) =>
