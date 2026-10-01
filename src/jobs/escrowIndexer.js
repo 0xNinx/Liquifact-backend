@@ -167,6 +167,7 @@ function deriveInvoiceId(record, reverseLookup = resolveInvoiceByAddress) {
 
   return null;
 }
+
 /**
  * Validates and normalizes a raw escrow event into the canonical shape used by
  * the indexer's persistence and projection logic.
