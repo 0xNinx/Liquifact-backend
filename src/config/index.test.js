@@ -1,3 +1,5 @@
+
+
 /**
  * Tests for centralized config module — #1303 Protect state invariants.
  *
@@ -20,6 +22,7 @@ const {
   isValidated,
   _resetForTesting,
   ConfigSchema,
+  VALIDATION_BOUNDARIES,
 } = require('./index');
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
