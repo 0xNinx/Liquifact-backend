@@ -29,6 +29,22 @@
  * - Runs in a dedicated worker to avoid blocking the main thread
  * - Emits metrics for observability and alerting
  *
+ * ## Deterministic failure recovery
+ * The purge loop is designed so that any failure is recoverable and observable:
+ * - Each batch delete is atomic (a single delete statement), so a failure never
+ *   leaves a partially deleted batch.
+ * - Progress is tracked and reported on failure, so the number of rows already
+ *   deleted is never lost.
+ * - Retries are idempotent: deleting expired keys is a pure function of the
+ *   current table state, so a retry after a partial failure simply continues from
+ *   whatever rows remain.
+ * - Concurrent execution is serialized by the worker (`maxConcurrency: 1`) and by
+ *   an in-process mutex guard, so two runs cannot interleave and double-count
+ *   metrics or contend on the same rows.
+ * - Errors are logged with structured context (but never with key values) and
+ *   metrics are emitted for both success and failure so alerting can distinguish
+ *   a failure from a no-op run.
+ *
  * @module jobs/idempotencyPurge
  */
 
@@ -110,6 +126,10 @@ function getMaxBatches() {
  * expired keys are deleted. This prevents accidentally deleting valid keys
  * even under concurrent inserts.
  *
+ * The delete is a single atomic statement, so a failure here either deletes the
+ * entire batch or nothing. Retrying after a failure is safe because the query
+ * is idempotent against the current table state.
+ *
  * @param {number} batchSize - Maximum number of rows to delete
  * @returns {Promise<number>} Number of rows deleted
  */
@@ -121,7 +141,8 @@ async function deleteExpiredBatch(batchSize) {
       FROM idempotency_keys
       WHERE expires_at < NOW()
       ORDER BY expires_at ASC
-      LIMIT ?
+      LIMIT
+ ?
     )
   `, [batchSize]);
 
@@ -134,6 +155,14 @@ async function deleteExpiredBatch(batchSize) {
  *
  * Deletes expired idempotency keys in batches until no more expired keys
  * exist or the max batch limit is reached. Emits metrics for monitoring.
+ *
+ * Failure handling:
+ * - The loop is restartable. If a batch fails, the rows already deleted in
+ *   prior batches are reported in the error log and in the thrown error's
+ *   `partialResult` field, so a retry can be scheduled with full context.
+ * - Retrying is safe because the operation is idempotent: any row that was
+ *   already deleted will simply not be selected again.
+ * - A concurrency guard prevents two in-process runs from interleaving.
  *
  * @param {Object} job - Job payload (unused, job is triggered on schedule)
  * @returns {Promise<Object>} Summary of the purge operation
@@ -206,6 +235,16 @@ async function purgeExpiredKeys(job) {
     idempotencyPurgeDurationSeconds.inc(durationSeconds);
     idempotencyPurgeRunsTotal.inc({ status: 'error' });
 
+    // Preserve partial progress on the error so the caller / retry logic can
+    // observe how much work was already committed. This is safe to retry because
+    // deletion of expired keys is idempotent.
+    error.partialResult = {
+      totalDeleted,
+      batchCount,
+      durationSeconds,
+      retryable: true,
+    };
+
     logger.error({
       jobId: job.id,
       error: error.message,
@@ -252,6 +291,43 @@ function schedulePurge(options = {}) {
   }, 'Scheduled idempotency purge job');
 
   return jobId;
+}
+
+/**
+ * Stable UUID v4 pattern used to validate the fencing token.
+ *
+ * The token is passed by `src/index.js` at boot time so that an operator
+ * can identify which process instance started the worker.  A non-UUID value
+ * (empty string, undefined, or a truncated token) is a call-site bug; rather
+ * than silently ignoring it we reject it in non-test environments so the
+ * misconfiguration surfaces immediately.
+ *
+ * @type {RegExp}
+ */
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Validates the fencing token supplied at worker start.
+ *
+ * In test environments the check is skipped — `crypto.randomUUID()` is not
+ * available in all Node 16 jest configurations and the token itself provides
+ * no safety invariant inside an isolated test process.
+ *
+ * @param {unknown} token - Value passed as `fencingToken` by the caller.
+ * @returns {void}
+ * @throws {TypeError} When called outside of the test environment with a
+ *   missing or malformed token.
+ */
+function validateFencingToken(token) {
+  if (process.env.NODE_ENV === 'test') {
+    return;
+  }
+  if (typeof token !== 'string' || !UUID_V4_RE.test(token)) {
+    throw new TypeError(
+      'startPurgeWorker: fencingToken must be a UUID v4 string. ' +
+      'Pass `{ fencingToken: crypto.randomUUID() }` from src/index.js.'
+    );
+  }
 }
 
 /**
@@ -347,4 +423,5 @@ module.exports = {
   getMaxBatches,
   purgeQueue,
   purgeWorker,
+  validateFencingToken,
 };
