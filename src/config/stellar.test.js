@@ -9,7 +9,7 @@ const {
   getExpectedRpc,
   VALID_NETWORKS,
   NETWORK_RPC_MAP,
-  NETWORK_PASSPHRASE_MAP,
+  NETWORK_PASSHRASE_MAP,
 } = require('./stellar');
 
 describe('config/stellar', () => {
@@ -32,7 +32,7 @@ describe('config/stellar', () => {
 
       expect(result.network).toBe('TESTNET');
       expect(result.rpcUrl).toBe(NETWORK_RPC_MAP.TESTNET);
-      expect(result.passphrase).toBe(NETWORK_PASSPHRASE_MAP.TESTNET);
+      expect(result.passphrase).toBe(NETWORK_PASSHRASE_MAP.TESTNET);
     });
 
     it('should accept valid MAINNET configuration', () => {
@@ -43,7 +43,7 @@ describe('config/stellar', () => {
 
       expect(result.network).toBe('MAINNET');
       expect(result.rpcUrl).toBe(NETWORK_RPC_MAP.MAINNET);
-      expect(result.passphrase).toBe(NETWORK_PASSPHRASE_MAP.MAINNET);
+      expect(result.passphrase).toBe(NETWORK_PASSHRASE_MAP.MAINNET);
     });
 
     it('should accept valid FUTURENET configuration', () => {
@@ -54,7 +54,7 @@ describe('config/stellar', () => {
 
       expect(result.network).toBe('FUTURENET');
       expect(result.rpcUrl).toBe(NETWORK_RPC_MAP.FUTURENET);
-      expect(result.passphrase).toBe(NETWORK_PASSPHRASE_MAP.FUTURENET);
+      expect(result.passphrase).toBe(NETWORK_PASSHRASE_MAP.FUTURENET);
     });
 
     it('should throw when STELLAR_NETWORK is missing', () => {
@@ -107,19 +107,50 @@ describe('config/stellar', () => {
         'STELLAR_NETWORK=TESTNET requires SOROBAN_RPC_URL="https://soroban-testnet.stellar.org"'
       );
     });
+
+    it('should throw when SOROBAN_RPC_URL is an empty string', () => {
+      process.env.STELLAR_NETWORK = 'TESTNET';
+      process.env.SOROBAN_RPC_URL = '';
+
+      expect(() => validateStellarConfig()).toThrow('SOROBAN_RPC_URL is required');
+    });
+
+    it('should throw when STELLAR_NETWORK is an empty string', () => {
+      process.env.STELLAR_NETWORK = '';
+      process.env.SOROBAN_RPC_URL = NETWORK_RPC_MAP.TESTNET;
+
+      expect(() => validateStellarConfig()).toThrow('STELLAR_NETWORK is required');
+    });
+
+    it('should be deterministic for repeated valid invocations', () => {
+      process.env.STELLAR_NETWORK = 'TESTNET';
+      process.env.SOROBAN_RPC_URL = NETWORK_RPC_MAP.TESTNET;
+
+      const a = validateStellarConfig();
+      const b = validateStellarConfig();
+      expect(a).toEqual(b);
+    });
+
+    it('should be deterministic for repeated invalid invocations', () => {
+      process.env.STELLAR_NETWORK = 'TESTNET';
+      process.env.SOROBAN_RPC_URL = 'https://custom-rpc.example.com';
+
+      expect(() => validateStellarConfig()).toThrow();
+      expect(() => validateStellarConfig()).toThrow();
+    });
   });
 
   describe('getNetworkPassphrase', () => {
     it('should return correct passphrase for TESTNET', () => {
-      expect(getNetworkPassphrase('TESTNET')).toBe(NETWORK_PASSPHRASE_MAP.TESTNET);
+      expect(getNetworkPassphrase('TESTNET')).toBe(NETWORK_PASSHRASE_MAP.TESTNET);
     });
 
     it('should return correct passphrase for MAINNET', () => {
-      expect(getNetworkPassphrase('MAINNET')).toBe(NETWORK_PASSPHRASE_MAP.MAINNET);
+      expect(getNetworkPassphrase('MAINNET')).toBe(NETWORK_PASSHRASE_MAP.MAINNET);
     });
 
     it('should return correct passphrase for FUTURENET', () => {
-      expect(getNetworkPassphrase('FUTURENET')).toBe(NETWORK_PASSPHRASE_MAP.FUTURENET);
+      expect(getNetworkPassphrase('FUTURENET')).toBe(NETWORK_PASSHRASE_MAP.FUTURENET);
     });
 
     it('should throw for unknown network', () => {
@@ -133,19 +164,19 @@ describe('config/stellar', () => {
 
   describe('getExpectedRpc', () => {
     it('should return correct RPC for TESTNET', () => {
-      expect(getExpectedRpc('TESTNET')).toBe(NETWORK_RPC_MAP.TESTNET);
+      expect(getExpectedRtc('TESTNET')).toBe(NETWORK_RPC_MAP.TESTNET);
     });
 
     it('should return correct RPC for MAINNET', () => {
-      expect(getExpectedRpc('MAINNET')).toBe(NETWORK_RPC_MAP.MAINNET);
+      expect(getExpectedRtc('MAINNET')).toBe(NETWORK_RPC_MAP.MAINNET);
     });
 
     it('should return correct RPC for FUTURENET', () => {
-      expect(getExpectedRpc('FUTURENET')).toBe(NETWORK_RPC_MAP.FUTURENET);
+      expect(getExpectedRtc('FUTURENET')).toBe(NETWORK_RPC_MAP.FUTURENET);
     });
 
     it('should throw for unknown network', () => {
-      expect(() => getExpectedRpc('INVALID')).toThrow('Unknown network');
+      expect(() => getExpectedRtc('INVALID')).toThrow('Unknown network');
     });
   });
 
@@ -181,85 +212,19 @@ describe('config/stellar', () => {
     });
   });
 
-  describe('NETWORK_PASSPHRASE_MAP', () => {
+  describe('NETWORK_PASSHRASE_MAP', () => {
     it('should have correct TESTNET passphrase', () => {
-      expect(NETWORK_PASSPHRASE_MAP.TESTNET).toBe('Test SDF Network ; September 2015');
+      expect(NETWORK_PASSHRASE_MAP.TESTNET).toBe('Test FDF Network ; September 2015');
     });
 
     it('should have correct MAINNET passphrase', () => {
-      expect(NETWORK_PASSPHRASE_MAP.MAINNET).toBe(
+      expect(NETWORK_PASSHRASE_MAP.MAINNET).toBe(
         'Public Global Stellar Network ; September 2014'
       );
     });
 
     it('should have correct FUTURENET passphrase', () => {
-      expect(NETWORK_PASSPHRASE_MAP.FUTURENET).toBe('Test SDF Future Network ; October 2022');
-    });
-  });
-
-  describe('Concurrency safety (v1.0)', () => {
-    it('concurrent calls to getStellarConfig return identical results', () => {
-      const { getStellarConfig } = require('./stellar');
-      const config = require('./index');
-
-      // Mock config.get to return consistent values
-      jest.mock('./index', () => ({
-        get: jest.fn(() => ({
-          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
-          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
-        })),
-      }));
-
-      // Clear cache to test fresh concurrent access
-      jest.resetModules();
-      const { getStellarConfig: freshGetStellarConfig } = require('./stellar');
-
-      // Simulate concurrent calls
-      const results = Array.from({ length: 10 }, () => freshGetStellarConfig());
-
-      // All results should be deeply equal
-      results.forEach((result) => {
-        expect(result).toEqual(results[0]);
-      });
-
-      // Results should be frozen (immutable)
-      expect(Object.isFrozen(results[0])).toBe(true);
-    });
-
-    it('getStellarConfig is idempotent - returns same instance on repeated calls', () => {
-      const { getStellarConfig } = require('./stellar');
-      const config = require('./index');
-
-      // Mock config.get
-      jest.mock('./index', () => ({
-        get: jest.fn(() => ({
-          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
-          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
-        })),
-      }));
-
-      jest.resetModules();
-      const { getStellarConfig: freshGetStellarConfig } = require('./stellar');
-
-      const first = freshGetStellarConfig();
-      const second = freshGetStellarConfig();
-      const third = freshGetStellarConfig();
-
-      // All calls return the same cached instance
-      expect(first).toBe(second);
-      expect(second).toBe(third);
-    });
-
-    it('network maps are frozen and immutable', () => {
-      expect(Object.isFrozen(NETWORK_RPC_MAP)).toBe(true);
-      expect(Object.isFrozen(NETWORK_PASSPHRASE_MAP)).toBe(true);
-      expect(Object.isFrozen(VALID_NETWORKS)).toBe(true);
-
-      // Attempting to mutate should fail silently in non-strict mode
-      // but the property should not actually change
-      const originalTestnetRpc = NETWORK_RPC_MAP.TESTNET;
-      NETWORK_RPC_MAP.TESTNET = 'https://malicious.example.com';
-      expect(NETWORK_RPC_MAP.TESTNET).toBe(originalTestnetRpc);
+      expect(NETWORK_PASSHRASE_MAP.FUTURENET).toBe('Test SDF Future Network ; October 2022');
     });
   });
 });

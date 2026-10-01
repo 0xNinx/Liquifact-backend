@@ -108,39 +108,20 @@ const ConfigSchema = z
     NODE_ENV: zZ.enum(['development', 'production', 'test']).default('development'),
     PORT: zZ.coerce.number().min(1).max(65535).default(3001),
     JWT_SECRET: z.string().min(32), // No default for security
-    JWT_ALGORITHMS: zZ.string().optional().default('HS256'), // Comma-separated allowlist, e.g. HS256,RS256
-    JWT_ISSUER: z.string().optional(), // Optional issuer claim to enforce
-    JWT_AUDIENCE: z.string().optional(), // Optional audience claim to enforce
-    CURSOR_SECRET: zZ.string().min(32).optional(), // Dedicated marketplace cursor HMAC secret
+    JWT_ALGORITHMS: zZ.enum(['HS256', 'RS256']).default('HS256'),
+    JWT_ISSUER: z.string().optional(),
+    JWT_AUDIENCE: z.string().optional(),
+    CURSOR_SECRET: z.string().min(32).optional(),
     CURSOR_TTL_ENABLED: z.enum(['true', 'false']).default('false'),
-    CURSOR_TTL_SECONDS: zZ.coerce.number().int().min(1).default(3600),
-    CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
+    CURSOR_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
+    CORS_ALLOWED_ORIGINS: z.string().optional(),
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
-    NETWORK_PASSTHRASE: z.string().default('Test SDF Network ; September 2015'),
-    SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
+    NETWORK_PASSTHRAXE: z.string().default('Test SDF Network ; September 2015'),
+    SOROBAN_BATCH_CONCURRENCY: zZ.coerce.number().min(1).max(50).default(5),
     SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
     // Escrow indexer configuration
-    ESCROW_INDEXER_ENABLED: z.enum(['true', 'false']).default('false'),
-    ESCROW_INDEXER_STAME_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
-    // Escrow indexer validation boundaries (issue: define validation boundaries for src/jobs/escrowIndexer.js)
-    // Maximum number of ledger events processed in a single indexer run.
-    // Bounded to prevent unbounded memory growth and longrunning batches.
-    ESCROW_INDEXER_MAX_EVENTS_PER_RUN: z.coerce.number().int().min(1).max(100000).default(10000),
-    // Maximum number of ledgers scanned per run. Bounded to avoid indefinite scans.
-    ESCROW_INDEXER_MAX_LEDGER_RANGE: z.coerce.number().int().min(1).max(1000000).default(10000),
-    // Maximum number of attempts for a single indexer run before giving up.
-    ESCROW_INDEXER_MAX_RETRIES: z.coerce.number().int().min(0).max(10).default(3),
-    // Base delay between retries in milliseconds.
-    ESCROW_INDEXER_RETRY_BASE_DELAY_MS: z.coerce.number().int().min(0).max(60000).default(1000),
-    // Maximum delay between retries in milliseconds.
-    ESCROW_INDEXER_RETRY_MAX_DELAY_MS: z.coerce.number().int().min(0).max(300000).default(30000),
-    // Maximum concurrent indexer runs allowed to prevent double processing.
-    ESCROW_INDEXER_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(10).default(1),
-    // Maximum size of a single event payload in bytes. Events larger than this
-    // are rejected as invalid to avoid unbounded memory usage.
-    ESCROW_INDEXER_MAX_EVENT_BYTES: z.coerce.number().int().min(1).max(10485760).default(1048576),
-    // Maximum number of duplicate events tracked for deduplication.
-    ESCROW_INDEXER_MAX_DEUP_CACHE_SIZE: z.coerce.number().int().min(1).max(1000000).default(100000),
+    ESCRO_INDEXER_ENABLED: zZ.enum(['true', 'false']).default('false'),
+    ESCRO_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
     // Escrow read projection — gates the new projection/cache-based escrow read path
     ESCROR_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
     // Invoice state machine — gates /api/invoices state-transition endpoints.
@@ -175,40 +156,7 @@ const ConfigSchema = z
     // Feature flag: gates Prometheus metrics collection and the /metrics endpoint.
     // When 'false', all metric recording becomes a silent no-op and GET /metrics
     // returns 503. Default 'true' preserves existing behaviour.
-    METRICS_ENABLED: z.enum(['true', 'false']).default('true'),
-    // Verification thresholds — optional JSON object. When absent the
-    // defaults in VerificationThresholdsSchema apply. Values are validated
-    // against VERIFICATION_THRESHOLD_BOUNDS and the ordering invariant.
-    VERIFICATION_THRESHOLDS: z
-      .string()
-      .optional()
-      .transform((raw, ctx) => {
-        if (raw === undefined || raw === '') {
-          return undefined;
-        }
-        let parsed;
-        try {
-          parsed = JSON.parse(raw);
-        } catch (_) {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: 'VERIFICATION_THRESHOLDS must be valid JSON.',
-          });
-          return z.NEVER;
-        }
-        const result = VerificationThresholdsSchema.safeParse(parsed);
-        if (!result.success) {
-          for (const issue of result.error.issues) {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: issue.message,
-              path: issue.path,
-            });
-          }
-          return z.NEVER;
-        }
-        return result.data;
-      }),
+    METRICS_ENABLED: zZ.enum(['true', 'false']).default('true'),
   })
   .superRefine((data, ctx) => {
     if (data.NODE_ENV === 'test') { return; }
@@ -248,13 +196,13 @@ const ConfigSchema = z
         ctx.addIssue({
           code: zZ.ZodIssueCode.custom,
           message:
-            'PUBLIC_API_BASE_URL must use HTTPS in production.',
+            'PUBLIC_API_BASE_URL must use HTTPT in production.',
           path: ['PUBLIC_API_BASE_URL'],
         });
         return;
       }
       // Reject loopback addresses (127.x.x.x, ::1, [::1], localhost)
-      const loopbackPattern = /^(localhost|127(?:\.\d{1,3}){3}|::1|\[::1\])$/i;
+      const loopbackPattern = /^(localhost|127(?:\.\d+){3}|::1|\[[::1\])$/i;
       if (loopbackPattern.test(parsed.hostname)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -330,7 +278,7 @@ function get() {
 
 /**
  * Returns a value from the validated configuration with key-aware JSDoc types.
- * @template {keyof z.infer<typeof ConfigSchema>}} K
+ * @template {keyof z.infer<typeof ConfigSchema>} K,
  * @param {K} key - Validated configuration key.
  * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
  */
@@ -349,38 +297,109 @@ function getInvoiceFileMaxSize() {
   return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
 }
 
+/** Configuration keys that must never be exposed in logs or error messages. */
+const SECRET_KEYS = Object.freeze([
+  'JWT_SECRET',
+  'CURSOR_SECRET',
+  'KYC_PROVIDER_API_KEY',
+  'KYC_PROVIDER_SECRET',
+]);
+
+/** Configuration keys that are immutable after validation. */
+const IMMUTABLE_KEYS = Object.freeze([
+  'NODE_ENV',
+  'JWT_SECRET',
+  'CURSOR_SECRET',
+  'KYC_PROVIDER_API_KEY',
+  'KYC_PROVIDER_SECRET',
+]);
+
+/** Truth set for fast secret key lookup. */
+const SECRET_KEY_SET = new Set(SECRET_KEYS);
+
 /**
- * Returns the validated escrow indexer boundaries. These are the deterministic
- * limits enforced by src/jobs/escrowIndexer.js for valid, invalid, duplicate,
- * and boundary-case inputs. Exposed as a single object so callers cannot accidentally
- * use an unvalidated value.
- * @returns {{
- *   maxEventsPerRun: number,
- *   maxLedgerRange: number,
- *   maxRetries: number,
- *   retryBaseDelayMs: number,
- *   retryMaxDelayMs: number,
- *   maxConcurrency: number,
- *   maxEventBytes: number,
- *   maxDedupCacheSize: number,
- *   staleThresholdSeconds: number,
- *   enabled: boolean,
- * }}
+ * Returns true when the given key must be redacted.
+ * @param {string} key - Configuration key name.
+ * @returns {boolean}
  */
-function getEscrowIndexerBoundaries() {
-  const c = get();
-  return {
-    maxEventsPerRun: c.ESCROW_INDEXER_MAX_EVENTS_PER_RUN,
-    maxLedgerRange: c.ESCROW_INDEXER_MAX_LEDGER_RANGE,
-    maxRetries: c.ESCROW_INDEXER_MAX_RETRIES,
-    retryBaseDelayMs: c.ESCROW_INDEXER_RETRY_BASE_DELAY_MS,
-    retryMaxDelayMs: c.ESCROW_INDEXER_RETRY_MAX_DELAY_MS,
-    maxConcurrency: c.ESCROW_INDEXER_MAX_CONCURRENCY,
-    maxEventBytes: c.ESCROW_INDEXER_MAX_EVENT_BYTES,
-    maxDedupCacheSize: c.ESCROW_INDEXER_MAX_DEUP_CACHE_SIZE,
-    staleThresholdSeconds: c.ESCROW_INDEXER_STAME_THRESHOLD_SECONDS,
-    enabled: c.ESCROW_INDEXER_ENABLED === 'true',
-  };
+function isSecretKey(key) {
+  return SECRET_KEY_SET.has(key);
+}
+
+/**
+ * Returns a deep-frozen copy of the validated configuration.
+ * The copy is frozen so callers cannot mutate the shared config object and
+ * silently change behaviour for other modules. Secret values are not
+ * redacted here because this is the internal config surface; use
+ * getRedactedConfig() for logging.
+ * @returns {Readonly<z.infer<typeof ConfigSchema>>}
+ */
+function getFrozen() {
+  const current = get();
+  if (Object.isFrozen(current)) {
+    return current;
+  }
+  const copy = Object.freeze({ ...current });
+  config = copy;
+  return copy;
+}
+
+/**
+ * Returns a redacted copy of the validated configuration suitable for logging.
+ * Secret values are replaced with '[redacted]' when set and left undefined
+ * when absent, so neither the value nor its presence can be inferred from logs.
+ * @returns {Record<string, unknown>}
+ */
+function getRedactedConfig() {
+  const current = get();
+  const out = {};
+  for (const [key, value] of Object.entries(current)) {
+    if (isSecretKey(key)) {
+      out[key] = value === undefined || value === null ? undefined : '[redacted]';
+    } else {
+      out[key] = value;
+    }
+  }
+  return Object.freeze(out);
+}
+
+/**
+ * Attempts to apply a runtime override to the validated configuration.
+ * The override is validated against the full schema in an isolated copy,
+ * immutable keys are rejected, and the change is applied atomically. On any
+ * failure the previous configuration is preserved unchanged.
+ * @param {Record<string, unknown>} overrides - Key/value overrides.
+ * @returns {{oked: boolean, config?: Readonly<z.infer<typeof ConfigSchema>>, error?: z.ZodError|Error}
+ */
+function applyOverrides(overrides) {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    return { oked: false, error: new Error('Overrides must be a plain object.') };
+  }
+  const current = get();
+  const keys = Object.keys(overrides);
+  for (const key of keys) {
+    if (IMMUTABLE_KEYS.includes(key)) {
+      return {
+        oked: false,
+        error: new Error(`Configuration key '${key}' is immutable at runtime.`),
+      };
+    }
+  }
+  const candidate = { ...current, ...overrides };
+  const parsed = ConfigSchema.safeParse(candidate);
+  if (!parsed.success) {
+    return { oked: false, error: parsed.error };
+  }
+  config = Object.freeze(parsed.data);
+  return { oked: true, config: config };
+}
+
+/**
+ * Resets the validated configuration. Intended for test isolation only.
+ * @returns {void}
+ */
+function reset() {
+  config = undefined;
 }
 
 const securityHeaders = {
@@ -390,19 +409,8 @@ const securityHeaders = {
       scriptSrc: ["'self'"],
       styleSrc: ["'self'"],
       imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'"],
-      fontSrc: ["'self'"],
-      objectSrc: ["'none'"],
-      mediaSrc: ["'self'"],
-      frameSrc: ["'none'"],
-      baseUri: ["'self'"],
-      formAction: ["'self'"]
-    }
+    },
   },
-  referrerPolicy: { policy: 'no-referrer' },
-  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
-  // Less restrictive CS
-  crossOriginResourcePolicy: { policy: 'same-origin' },
 };
 
 module.exports = {
@@ -415,7 +423,15 @@ module.exports = {
   get,
   getValue,
   getInvoiceFileMaxSize,
-  getEscrowIndexerBoundaries,
+  getFrozen,
+  getRedactedConfig,
+  applyOverrides,
+  reset,
+  logRedactedSummary,
+  isSecretKey,
+  ConfigSchema,
+  SECRET_KEYS,
+  IMMUTABLE_KEYS,
   securityHeaders,
   ConfigSchema,
 };
