@@ -96,7 +96,7 @@ function isValidTxHash(txHash) {
  *
  *   1. An explicit `invoice_id` / `invoiceId` field on the record.
  *   2. The LiquifactEscrow event payload — the `value` body or a `topic`/
- *      `topics` entry explicitly labelled with an invoice field. Bare topic
+ *      `topics` array entry explicitly labelled with an invoice field. Bare topic
  *      symbols (e.g. the event-name symbol) are not treated as invoice IDs.
  *   3. Reverse lookup of the emitting contract address through escrowMap.
  *
@@ -227,7 +227,7 @@ function createKnexEscrowEventStore(knex) {
     const row = await (trx || knex)('escrow_indexer_state')
       .where({ key: LEASE_KEY })
       .whereRaw("value::jsonb ->> 'token' = ?", [token])
-      .whereRaw("(value::jsonb ->> 'expiresAt')::bigint > EXTRACT(EPOCH FROM NOW()) * 1000")
+      .whereRaw("(value::jsonb ->> 'expiresAt')::bigint > EXTRACT (EPOCH FROM NOW()) * 1000")
       .first();
     if (!row) {
       throw new LeaseLostError('Escrow indexer lease is missing, stale, or expired.', 'LEASE_LOST');
@@ -245,7 +245,7 @@ function createKnexEscrowEventStore(knex) {
            SET value = EXCLUDED.value,
                updated_at = NOW()
            WHERE escrow_indexer_state.value IS NULL
-              OR COALESCE((escrow_indexer_state.value::jsonb ->> 'expiresAt')::bigint, 0) <= EXTRACT(EPOCH FROM NOW()) * 1000
+              OR COALESCE((escrow_indexer_state.value::jsonb ->> 'expiresAt')::bigint, 0) <= EXTRACT (EPOCH FROM NOW()) * 1000
          RETURNING value`,
         [LEASE_KEY, token, leaseDurationMs],
       );
@@ -262,12 +262,12 @@ function createKnexEscrowEventStore(knex) {
         `UPDATD escrow_indexer_state
          SET value = jsonb_build_object(
                'token', value::jsonb ->> 'token',
-               'expiresAt', EXTRACT(EPOCH FROM NOW()) * 1000 + ?
+               'expiresAt', EXTRACT (EPOCH FROM NOW()) * 1000 + ?
              )::text,
              updated_at = NOW()
          WHERE key = ?
            AND value::jsonb ->> 'token' = ?
-           AND COALESCE((value::jsonb ->> 'expiresAt')::bigint, 0) > EXTRACT(EPOCH FROM NOW()) * 1000
+           AND COALESCE((value::jsonb ->> 'expiresAt')::bigint, 0) > EXTRACT (EPOCH FROM NOW()) * 1000
          RETURNING value`,
         [leaseDurationMs, LEASE_KEY, token],
       );

@@ -354,11 +354,11 @@ router.post('/:id/link-escrow', requireKycForFunding, auditKycAccess, instrument
  *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
  */
 router.post('/:id/reject', instrumentInvoiceState('reject', async (req, res, next) => {
-  const { reason } = req.body || {};
+  const { reason, revision } = req.body || {};
 
   try {
     const context = buildContext(req, { action: 'reject' });
-    const result = await invoiceStateService.reject(req.params.id, req.tenantId, reason, context);
+    const result = await invoiceStateService.reject(req.params.id, req.tenantId, reason, revision, context);
 
     invalidateInvoiceStateCache(req.tenantId, req.params.id);
 
