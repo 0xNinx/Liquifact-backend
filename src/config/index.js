@@ -44,6 +44,9 @@
  *    reference its fields without change.
  *
  * @module config
+ *
+ * Compatibility contract: `validate()` is idempotent and safe to call
+ * multiple times; `get()` throws until `validate()` succeeds.
  */
 
 const z = require('zod');
@@ -217,7 +220,8 @@ const ConfigSchema = z
  */
 let config;
 
-// ─── Public API — existing contracts (preserved) ─────────────────────────────
+/** Frozen snapshot of the last successfully validated config. @type {Readonly<z.infer<typeof ConfigSchema>>|null} */
+let frozenConfig = null;
 
 /**
  * Validates environment variables against schema and returns typed config.
@@ -235,8 +239,19 @@ function validate() {
   if (!parsed.success) {
     throw new ConfigValidationError(parsed.error);
   }
-  config = Object.freeze(parsed.data);
+  // Freeze the validated snapshot so callers cannot mutate shared state and
+  // so repeated validate() calls produce a deterministic, stable object.
+  frozenConfig = Object.freeze({ ...parsed.data });
+  config = frozenConfig;
   return config;
+}
+
+/**
+ * Returns true when validate() has completed successfully at least once.
+ * @returns {boolean}
+ */
+function isInitialized() {
+  return config !== null && config !== undefined;
 }
 
 /**
@@ -286,6 +301,16 @@ function get() {
 }
 
 /**
+ * Reset the in-memory config snapshot. Intended for tests only; production
+ * code must not call this because it invalidates the validated contract.
+ * @returns {void}
+ */
+function resetForTests() {
+  config = null;
+  frozenConfig = null;
+}
+
+/**
  * Returns a value from the validated configuration with key-aware JSDoc types.
  *
  * CONTRACT: signature is `(key: keyof Config) => Config[key]`. The key type
@@ -313,9 +338,10 @@ function getInvoiceFileMaxSize() {
   if (config) {
     return config.INVOICE_FILE_MAX_SIZE;
   }
-  // Safe fallback: if the env var is missing or invalid, return the schema default.
-  const result = InvoiceFileMaxSizeSchema.safeParse(process.env.INVOICE_FILE_MAX_SIZE);
-  return result.success ? result.data : InvoiceFileMaxSizeSchema.parse(undefined);
+  // Fall back to parsing the raw env var without mutating module state so
+  // callers that run before validate() still get a deterministic value.
+  const raw = process.env.INVOICE_FILE_MAX_SIZE;
+  return InvoiceFileMaxSizeSchema.parse(raw === undefined ? undefined : raw);
 }
 
 // ─── Public API — new contracts (additive, #1306) ─────────────────────────────
@@ -394,6 +420,8 @@ module.exports = {
   validate,
   validateSafe,
   get,
+  isInitialized,
+  resetForTests,
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
