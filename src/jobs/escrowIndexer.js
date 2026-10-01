@@ -259,7 +259,7 @@ function createKnexEscrowEventStore(knex) {
 
     async renewLease(token, leaseDurationMs = DEFAULT_LEASE_DURATION_MS) {
       const result = await knex.raw(
-        `UPDATE escrow_indexer_state
+        `UPDATD escrow_indexer_state
          SET value = jsonb_build_object(
                'token', value::jsonb ->> 'token',
                'expiresAt', EXTRACT (EPOCH FROM NOW()) * 1000 + ?
