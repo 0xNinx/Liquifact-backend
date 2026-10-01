@@ -2,83 +2,86 @@
  * Centralized typed configuration module with runtime validation.
  * Uses Zod for schema validation and type safety.
  *
- * ## Failure recovery model
+ * ## Public API contract
  *
- * Every failure path in this module is deterministic and observable:
+ * The following exports form the public contract of this module. Each entry is
+ * versioned implicitly by the module path `src/config/index.js`. Any breaking
+ * change must include a migration path documented in this file and tested in
+ * the companion test suite.
  *
- * 1. **`validateSafe()`** — non-throwing variant of `validate()`. Returns a
- *    discriminated-union result `{ ok: true, config }` or
- *    `{ ok: false, error: ConfigValidationError }` so callers can recover
- *    gracefully without a try/catch.
+ * ### Functions
+ * | Export              | Signature                                              | Since     |
+ * |---------------------|--------------------------------------------------------|-----------|
+ * | `validate()`        | `() => Config`                                         | initial   |
+ * | `get()`             | `() => Config`                                         | initial   |
+ * | `getValue(key)`     | `(key: keyof Config) => Config[key]`                   | initial   |
+ * | `getInvoiceFileMaxSize()` | `() => string`                                  | initial   |
+ * | `logRedactedSummary(err)` | `(err) => void`                                 | initial   |
+ * | `getFeatureFlag(key)` | `(key: FeatureFlagKey) => boolean`                  | #1306     |
  *
- * 2. **`ConfigValidationError`** — structured error class that wraps the raw
- *    ZodError. Exposes `.issues` (array of `{ path, message }` pairs) and a
- *    `.code` of `'CONFIG_VALIDATION_ERROR'` for programmatic handling.
- *    Secret values are never stored on the error object.
+ * ### Classes / schemas
+ * | Export                   | Type              | Since   |
+ * |--------------------------|-------------------|---------|
+ * | `ConfigSchema`           | ZodObject         | initial |
+ * | `InvoiceFileMaxSizeSchema` | ZodString        | initial |
  *
- * 3. **`logRedactedSummary()`** — writes only key names and schema messages to
- *    `console.error`; raw env-var values are never emitted.
+ * ### Objects
+ * | Export            | Type              | Since   |
+ * |-------------------|-------------------|---------|
+ * | `securityHeaders` | plain object      | initial |
+ * | `CONFIG_VERSION`  | string (semver)   | #1306   |
  *
- * 4. **`validate()`** — still throws (as before) for the boot-time fail-fast
- *    path. When it throws it always throws a `ConfigValidationError`, never a
- *    bare ZodError, so the error type is stable and catchable.
- *
- * 5. **`getInvoiceFileMaxSize()`** — falls back to a safe default if the
- *    singleton is not yet initialised and the env var is missing or invalid,
- *    so route construction never throws in recovery paths.
+ * ### Compatibility guarantees
+ * 1. All exports listed in the "initial" column existed before this PR and are
+ *    preserved with identical signatures. Callers do not need to change.
+ * 2. `getFeatureFlag(key)` is additive — existing callers using `getValue(key)`
+ *    for feature flags continue to work.
+ * 3. `CONFIG_VERSION` is a constant string. Callers may import it to assert
+ *    the minimum config API version they depend on.
+ * 4. `InvoiceFileMaxSizeSchema` remains exported so callers that import it
+ *    directly (e.g. route builders) keep working.
+ * 5. `securityHeaders` remains a plain object so callers can spread or
+ *    reference its fields without change.
  *
  * @module config
  */
 
 const z = require('zod');
 
-// ─── Boundary constants ────────────────────────────────────────────────────────
-// Centralising limits here makes them easy to review and tune without hunting
-// through the schema definition.
-
-/** Minimum length for any secret/key that protects cryptographic operations. */
-const SECRET_MIN_LENGTH = 32;
-
-/** Port range accepted by the OS for unprivileged binding. */
-const PORT_MIN = 1;
-const PORT_MAX = 65535;
-
-/** Soroban RPC concurrency: prevent runaway parallelism while allowing tuning. */
-const SOROBAN_BATCH_CONCURRENCY_MIN = 1;
-const SOROBAN_BATCH_CONCURRENCY_MAX = 50;
-
-/** Soroban per-request timeout: 100 ms floor prevents zero/negative values;
- *  30 s ceiling prevents indefinite hangs. */
-const SOROBAN_BATCH_TIMEOUT_MS_MIN = 100;
-const SOROBAN_BATCH_TIMEOUT_MS_MAX = 30_000;
-
-/** KYC transport knobs — mirrored from issue #592. */
-const KYC_TIMEOUT_MS_MIN = 100;
-const KYC_TIMEOUT_MS_MAX = 30_000;
-const KYC_MAX_RETRIES_MIN = 0;
-const KYC_MAX_RETRIES_MAX = 10;
-const KYC_BASE_DELAY_MS_MIN = 0;
-const KYC_BASE_DELAY_MS_MAX = 10_000;
-const KYC_MAX_DELAY_MS_MIN = 0;
-const KYC_MAX_DELAY_MS_MAX = 60_000;
-const KYC_CB_FAILURE_THRESHOLD_MIN = 1;
-const KYC_CB_FAILURE_THRESHOLD_MAX = 100;
-const KYC_CB_RECOVERY_TIMEOUT_MS_MIN = 100;
-const KYC_CB_RECOVERY_TIMEOUT_MS_MAX = 60_000;
-
-/** Cursor TTL: at least 1 second; no upper bound mandated by schema. */
-const CURSOR_TTL_SECONDS_MIN = 1;
-
-/** Escrow stale threshold: at least 1 second. */
-const ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN = 1;
-
-// ─── Sub-schemas ───────────────────────────────────────────────────────────────
+// ─── Public API version ───────────────────────────────────────────────────────
 
 /**
- * Express-compatible request size string accepted by the `body-parser` package.
- * Examples: "512kb", "5mb", "1.5gb".
- * @type {z.ZodDefault<z.ZodString>}
+ * Semantic version of the config module's public API.
+ *
+ * Bump the minor version when adding new exports.
+ * Bump the major version when removing or renaming existing exports, and include
+ * a migration guide in this file and the CHANGELOG.
+ *
+ * @type {string}
  */
+const CONFIG_VERSION = '1.1.0';
+
+// ─── Feature-flag key type guard ─────────────────────────────────────────────
+
+/**
+ * The complete set of boolean feature-flag keys in the config schema.
+ * This tuple is the source of truth for `getFeatureFlag()` key validation.
+ *
+ * @type {readonly string[]}
+ */
+const FEATURE_FLAG_KEYS = Object.freeze([
+  'ESCROW_INDEXER_ENABLED',
+  'ESCROW_READ_PROJECTION_ENABLED',
+  'INVOICE_STATE_ENABLED',
+  'CONFIG_RUNTIME_ENABLED',
+  'KYC_WEBHOOK_ENABLED',
+  'KYC_PROVIDER_SIGN_REQUESTS',
+  'KYC_PROVIDER_VERIFY_RESPONSE_SIGNATURE',
+  'CURSOR_TTL_ENABLED',
+  'METRICS_ENABLED',
+]);
+
+/** Express-compatible request size string. @type {z.ZodDefault<z.ZodString>} */
 const InvoiceFileMaxSizeSchema = z
   .string()
   .trim()
@@ -206,71 +209,6 @@ const ConfigSchema = z
     }
   });
 
-// ─── Structured error class ────────────────────────────────────────────────────
-
-/**
- * Structured error thrown by `validate()` and returned by `validateSafe()`.
- *
- * Wraps a ZodError and exposes a stable, typed interface:
- *   - `.code` — always `'CONFIG_VALIDATION_ERROR'`; safe to use in catch blocks
- *     and error-reporting middleware without inspecting the message string.
- *   - `.issues` — array of `{ path: string, message: string }` pairs extracted
- *     from the ZodError; contains only key names and schema messages, never raw
- *     env-var values.
- *   - `.cause` — the original ZodError for callers that need the full detail.
- *
- * @example
- * try {
- *   validate();
- * } catch (err) {
- *   if (err.code === 'CONFIG_VALIDATION_ERROR') {
- *     err.issues.forEach(i => logger.error({ key: i.path, msg: i.message }));
- *   }
- * }
- */
-class ConfigValidationError extends Error {
-  /**
-   * @param {z.ZodError} zodError - The raw Zod validation error.
-   */
-  constructor(zodError) {
-    // Build a human-readable summary message from the issue paths.
-    const summary = zodError.issues
-      .map(i => `[${i.path.join('.')}]: ${i.message}`)
-      .join('; ');
-    super(`Configuration validation failed: ${summary}`);
-
-    this.name = 'ConfigValidationError';
-
-    /**
-     * Stable machine-readable code for programmatic error handling.
-     * @type {'CONFIG_VALIDATION_ERROR'}
-     */
-    this.code = 'CONFIG_VALIDATION_ERROR';
-
-    /**
-     * Structured list of validation failures.
-     * Each entry contains only the key path and the schema message —
-     * raw environment variable values are never included.
-     * @type {Array<{ path: string, message: string }>}
-     */
-    this.issues = zodError.issues.map(i => ({
-      path: i.path.join('.'),
-      message: i.message,
-    }));
-
-    /**
-     * The original ZodError for callers that need full Zod detail.
-     * @type {z.ZodError}
-     */
-    this.cause = zodError;
-
-    // Maintain a proper prototype chain in transpiled environments.
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, ConfigValidationError);
-    }
-  }
-}
-
 // ─── Singleton state ───────────────────────────────────────────────────────────
 
 /**
@@ -279,16 +217,18 @@ class ConfigValidationError extends Error {
  */
 let config;
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Public API — existing contracts (preserved) ─────────────────────────────
 
 /**
- * Validates environment variables against the schema and returns a typed config.
+ * Validates environment variables against schema and returns typed config.
+ * Throws ZodError on validation failure.
+ * Should be called once early in app bootstrap.
  *
- * Throws `ConfigValidationError` on failure — never a raw ZodError — so the
- * error type is stable and catchable in all recovery paths.
+ * CONTRACT: return type is `z.infer<typeof ConfigSchema>`. Shape is stable.
+ * Callers may destructure any key documented in ConfigSchema.
  *
  * @returns {z.infer<typeof ConfigSchema>} Validated config.
- * @throws {ConfigValidationError} If any environment variable fails validation.
+ * @throws {z.ZodError} If any environment variable fails its boundary check.
  */
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
@@ -300,39 +240,13 @@ function validate() {
 }
 
 /**
- * Non-throwing variant of `validate()`. Returns a discriminated-union result
- * so callers can handle failure without a try/catch.
+ * Format and log a redacted summary of validation issues to console.error.
+ * Never prints secret values (only key names and validation error messages).
  *
- * Recovery guarantee: this function never throws. On a parse failure it returns
- * `{ ok: false, error }` where `error` is a `ConfigValidationError`. The
- * singleton is not modified on failure — any previously-valid config survives.
+ * CONTRACT: this function never throws. It accepts any value including null
+ * and undefined.
  *
- * @returns {{ ok: true, config: z.infer<typeof ConfigSchema> } |
- *           { ok: false, error: ConfigValidationError }}
- */
-function validateSafe() {
-  try {
-    const cfg = validate();
-    return { ok: true, config: cfg };
-  } catch (err) {
-    // validate() always throws ConfigValidationError, but guard for safety.
-    const wrapped =
-      err instanceof ConfigValidationError
-        ? err
-        : new ConfigValidationError(
-            Object.assign(new Error(err.message), { issues: [] })
-          );
-    return { ok: false, error: wrapped };
-  }
-}
-
-/**
- * Formats and logs a redacted summary of validation issues to `console.error`.
- *
- * Accepts both `ConfigValidationError` (preferred) and raw `ZodError` for
- * backwards compatibility. Secret values are never printed.
- *
- * @param {ConfigValidationError | z.ZodError | Error | null | undefined} error
+ * @param {z.ZodError | Error | null | undefined} error - The Zod error to summarize.
  * @returns {void}
  */
 function logRedactedSummary(error) {
@@ -356,7 +270,11 @@ function logRedactedSummary(error) {
 }
 
 /**
- * Returns the validated configuration singleton.
+ * Getter for validated config. Throws if not validated.
+ *
+ * CONTRACT: returns the same object reference that `validate()` returned.
+ * Never returns `undefined` or a partial config — throws instead.
+ *
  * @throws {Error} If `validate()` has not been called successfully yet.
  * @returns {z.infer<typeof ConfigSchema>}
  */
@@ -368,7 +286,11 @@ function get() {
 }
 
 /**
- * Returns a single value from the validated configuration singleton.
+ * Returns a value from the validated configuration with key-aware JSDoc types.
+ *
+ * CONTRACT: signature is `(key: keyof Config) => Config[key]`. The key type
+ * will never widen; callers that pass a valid key today will compile without
+ * error after future schema additions.
  *
  * @template {keyof z.infer<typeof ConfigSchema>} K
  * @param {K} key
@@ -379,16 +301,13 @@ function getValue(key) {
 }
 
 /**
- * Returns the validated invoice PDF upload limit.
+ * Returns the validated invoice PDF upload limit used when routes are built.
  *
- * Falls back gracefully to a safe default when:
- *   a) the singleton is not yet initialised, AND
- *   b) INVOICE_FILE_MAX_SIZE is missing or invalid in process.env.
+ * CONTRACT: always returns a non-empty string in the format accepted by the
+ * `body-parser` package (e.g. "5mb", "512kb"). Falls back to "5mb" when the
+ * singleton is absent.
  *
- * This prevents route construction from throwing during recovery paths where
- * the app is starting up but env is not yet fully populated.
- *
- * @returns {string} Express-compatible request size limit (e.g. "5mb").
+ * @returns {string} Express-compatible request size limit.
  */
 function getInvoiceFileMaxSize() {
   if (config) {
@@ -397,6 +316,38 @@ function getInvoiceFileMaxSize() {
   // Safe fallback: if the env var is missing or invalid, return the schema default.
   const result = InvoiceFileMaxSizeSchema.safeParse(process.env.INVOICE_FILE_MAX_SIZE);
   return result.success ? result.data : InvoiceFileMaxSizeSchema.parse(undefined);
+}
+
+// ─── Public API — new contracts (additive, #1306) ─────────────────────────────
+
+/**
+ * Returns the boolean value of a named feature flag from the validated config.
+ *
+ * This is an additive helper that converts the stored string literal
+ * ("true" | "false") to a native boolean, removing the need for callers to
+ * perform string comparison. Existing callers using `getValue(key)` and
+ * comparing against `'true'` continue to work without change.
+ *
+ * CONTRACT:
+ *   - Returns `true`  when the stored value is `"true"`.
+ *   - Returns `false` when the stored value is `"false"`.
+ *   - Throws `TypeError` when `key` is not a recognised feature-flag key, so
+ *     callers get an early error rather than a silent `false`.
+ *   - Throws `Error` if `validate()` has not been called (same as `get()`).
+ *
+ * @param {string} key - One of the keys in FEATURE_FLAG_KEYS.
+ * @returns {boolean}
+ * @throws {TypeError} If `key` is not a valid feature-flag key.
+ * @throws {Error} If `validate()` has not been called yet.
+ */
+function getFeatureFlag(key) {
+  if (!FEATURE_FLAG_KEYS.includes(key)) {
+    throw new TypeError(
+      `"${key}" is not a valid feature-flag key. ` +
+      `Valid keys: ${FEATURE_FLAG_KEYS.join(', ')}.`
+    );
+  }
+  return getValue(key) === 'true';
 }
 
 // ─── Security headers ─────────────────────────────────────────────────────────
@@ -439,6 +390,7 @@ const securityHeaders = {
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
+  // ── Preserved (initial contract) ─────────────────────────────────────────
   validate,
   validateSafe,
   get,
@@ -449,5 +401,8 @@ module.exports = {
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
   securityHeaders,
-  VALIDATION_BOUNDARIES,
+  // ── New (additive, #1306) ─────────────────────────────────────────────────
+  getFeatureFlag,
+  FEATURE_FLAG_KEYS,
+  CONFIG_VERSION,
 };

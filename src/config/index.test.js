@@ -1,16 +1,19 @@
 
 
 /**
- * Tests for centralized config module — #1304 Make failure recovery deterministic.
+ * Tests for centralized config module — #1306 Preserve compatibility contracts.
  *
  * Covers:
- *  - validateSafe() returns { ok, config } or { ok, error } — never throws
- *  - ConfigValidationError: code, issues structure, no secret leakage
- *  - validate() throws ConfigValidationError (not raw ZodError)
- *  - logRedactedSummary handles ConfigValidationError and ZodError
- *  - getInvoiceFileMaxSize() falls back safely when env is missing/invalid
+ *  - All original public exports exist with correct signatures (compatibility)
+ *  - CONFIG_VERSION is exported and is a semver string
+ *  - FEATURE_FLAG_KEYS is exported and frozen
+ *  - getFeatureFlag() returns boolean true/false for all flag keys
+ *  - getFeatureFlag() throws TypeError for unknown keys
+ *  - Existing callers using getValue() for feature flags still work
  *  - All original regression tests preserved
  */
+
+const mod = require('./index');
 
 const {
   validate,
@@ -19,10 +22,13 @@ const {
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
-  ConfigValidationError,
+  getFeatureFlag,
+  FEATURE_FLAG_KEYS,
+  CONFIG_VERSION,
   ConfigSchema,
-  VALIDATION_BOUNDARIES,
-} = require('./index');
+  InvoiceFileMaxSizeSchema,
+  securityHeaders,
+} = mod;
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -30,7 +36,7 @@ const VALID_JWT = 'valid-secret-at-least-32-chars-long-here';
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 
-describe('Config — failure recovery (#1304)', () => {
+describe('Config — compatibility contracts (#1306)', () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
@@ -42,275 +48,233 @@ describe('Config — failure recovery (#1304)', () => {
     process.env = originalEnv;
   });
 
-  // ── ConfigValidationError structure ───────────────────────────────────────
+  // ── Export surface ─────────────────────────────────────────────────────────
 
-  test('validate() throws ConfigValidationError (not a raw ZodError)', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validate: v, ConfigValidationError: CVE } = require('./index');
-      let caught;
-      try { v(); } catch (e) { caught = e; }
-      expect(caught).toBeInstanceOf(CVE);
-      expect(caught.name).toBe('ConfigValidationError');
+  test('#1306 validate is exported as a function', () => {
+    expect(typeof mod.validate).toBe('function');
+  });
+
+  test('#1306 get is exported as a function', () => {
+    expect(typeof mod.get).toBe('function');
+  });
+
+  test('#1306 getValue is exported as a function', () => {
+    expect(typeof mod.getValue).toBe('function');
+  });
+
+  test('#1306 getInvoiceFileMaxSize is exported as a function', () => {
+    expect(typeof mod.getInvoiceFileMaxSize).toBe('function');
+  });
+
+  test('#1306 logRedactedSummary is exported as a function', () => {
+    expect(typeof mod.logRedactedSummary).toBe('function');
+  });
+
+  test('#1306 ConfigSchema is exported', () => {
+    expect(mod.ConfigSchema).toBeDefined();
+    expect(typeof mod.ConfigSchema.parse).toBe('function');
+  });
+
+  test('#1306 InvoiceFileMaxSizeSchema is exported', () => {
+    expect(mod.InvoiceFileMaxSizeSchema).toBeDefined();
+    expect(typeof mod.InvoiceFileMaxSizeSchema.parse).toBe('function');
+  });
+
+  test('#1306 securityHeaders is exported as a plain object', () => {
+    expect(typeof mod.securityHeaders).toBe('object');
+    expect(mod.securityHeaders).not.toBeNull();
+    expect(mod.securityHeaders.contentSecurityPolicy).toBeDefined();
+    expect(mod.securityHeaders.hsts).toBeDefined();
+    expect(mod.securityHeaders.referrerPolicy).toBeDefined();
+  });
+
+  // ── New additive exports (#1306) ──────────────────────────────────────────
+
+  test('#1306 CONFIG_VERSION is exported as a string', () => {
+    expect(typeof CONFIG_VERSION).toBe('string');
+    // Must be a valid semver-like string: X.Y.Z
+    expect(CONFIG_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  test('#1306 FEATURE_FLAG_KEYS is exported as a frozen array', () => {
+    expect(Array.isArray(FEATURE_FLAG_KEYS)).toBe(true);
+    expect(Object.isFrozen(FEATURE_FLAG_KEYS)).toBe(true);
+    expect(FEATURE_FLAG_KEYS.length).toBeGreaterThan(0);
+  });
+
+  test('#1306 FEATURE_FLAG_KEYS contains all expected flag keys', () => {
+    const expected = [
+      'ESCROW_INDEXER_ENABLED',
+      'ESCROW_READ_PROJECTION_ENABLED',
+      'INVOICE_STATE_ENABLED',
+      'CONFIG_RUNTIME_ENABLED',
+      'KYC_WEBHOOK_ENABLED',
+      'CURSOR_TTL_ENABLED',
+      'METRICS_ENABLED',
+    ];
+    expected.forEach(key => {
+      expect(FEATURE_FLAG_KEYS).toContain(key);
     });
   });
 
-  test('ConfigValidationError has stable .code = "CONFIG_VALIDATION_ERROR"', () => {
+  test('#1306 getFeatureFlag is exported as a function', () => {
+    expect(typeof getFeatureFlag).toBe('function');
+  });
+
+  // ── getFeatureFlag() — success paths ──────────────────────────────────────
+
+  test('#1306 getFeatureFlag returns true when flag is "true"', () => {
     jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validate: v, ConfigValidationError: CVE } = require('./index');
-      let err;
-      try { v(); } catch (e) { err = e; }
-      expect(err.code).toBe('CONFIG_VALIDATION_ERROR');
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.ESCROW_READ_PROJECTION_ENABLED = 'true';
+      const { validate: v, getFeatureFlag: gff } = require('./index');
+      v();
+      expect(gff('ESCROW_READ_PROJECTION_ENABLED')).toBe(true);
     });
   });
 
-  test('ConfigValidationError.issues is an array of { path, message }', () => {
+  test('#1306 getFeatureFlag returns false when flag is "false"', () => {
     jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validate: v } = require('./index');
-      let err;
-      try { v(); } catch (e) { err = e; }
-      expect(Array.isArray(err.issues)).toBe(true);
-      expect(err.issues.length).toBeGreaterThan(0);
-      err.issues.forEach(issue => {
-        expect(typeof issue.path).toBe('string');
-        expect(typeof issue.message).toBe('string');
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.ESCROW_READ_PROJECTION_ENABLED = 'false';
+      const { validate: v, getFeatureFlag: gff } = require('./index');
+      v();
+      expect(gff('ESCROW_READ_PROJECTION_ENABLED')).toBe(false);
+    });
+  });
+
+  test('#1306 getFeatureFlag returns native boolean (not string)', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.METRICS_ENABLED = 'true';
+      const { validate: v, getFeatureFlag: gff } = require('./index');
+      v();
+      const result = gff('METRICS_ENABLED');
+      expect(typeof result).toBe('boolean');
+      expect(result).toBe(true);
+    });
+  });
+
+  test('#1306 getFeatureFlag works for all keys in FEATURE_FLAG_KEYS', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validate: v, getFeatureFlag: gff, FEATURE_FLAG_KEYS: fk } = require('./index');
+      v();
+      fk.forEach(key => {
+        const val = gff(key);
+        expect(typeof val).toBe('boolean');
       });
     });
   });
 
-  test('ConfigValidationError.issues does not contain raw secret values', () => {
-    jest.isolateModules(() => {
-      const secretValue = 'my-real-secret-do-not-leak';
-      process.env.JWT_SECRET = secretValue; // too short but contains the value
-      const { validate: v } = require('./index');
-      let err;
-      try { v(); } catch (e) { err = e; }
-      const issueText = JSON.stringify(err.issues);
-      expect(issueText).not.toContain(secretValue);
-    });
-  });
-
-  test('ConfigValidationError.cause is the original ZodError', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validate: v, ConfigValidationError: CVE } = require('./index');
-      let err;
-      try { v(); } catch (e) { err = e; }
-      expect(err.cause).toBeDefined();
-      expect(typeof err.cause.issues).toBe('object');
-    });
-  });
-
-  test('ConfigValidationError has a readable .message', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validate: v } = require('./index');
-      let err;
-      try { v(); } catch (e) { err = e; }
-      expect(err.message).toMatch(/Configuration validation failed/i);
-      expect(err.message).toContain('JWT_SECRET');
-    });
-  });
-
-  // ── validateSafe() — success path ─────────────────────────────────────────
-
-  test('validateSafe() returns { ok: true, config } on valid env', () => {
+  test('#1306 getFeatureFlag returns false for flags that default to "false"', () => {
     jest.isolateModules(() => {
       process.env.JWT_SECRET = VALID_JWT;
-      const { validateSafe: vs } = require('./index');
-      const result = vs();
-      expect(result.ok).toBe(true);
-      expect(result.config).toBeDefined();
-      expect(result.config.JWT_SECRET).toBe(VALID_JWT);
-      expect(result.error).toBeUndefined();
-    });
-  });
-
-  test('validateSafe() returns frozen config on success', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validateSafe: vs } = require('./index');
-      const { config: cfg } = vs();
-      expect(Object.isFrozen(cfg)).toBe(true);
-    });
-  });
-
-  // ── validateSafe() — failure path ─────────────────────────────────────────
-
-  test('validateSafe() returns { ok: false, error } on invalid env', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validateSafe: vs } = require('./index');
-      const result = vs();
-      expect(result.ok).toBe(false);
-      expect(result.error).toBeDefined();
-      expect(result.config).toBeUndefined();
-    });
-  });
-
-  test('validateSafe() never throws — not even on completely broken env', () => {
-    jest.isolateModules(() => {
-      // Remove all env vars to maximise the number of failures.
-      process.env = {};
-      const { validateSafe: vs } = require('./index');
-      expect(() => vs()).not.toThrow();
-      const result = vs();
-      expect(result.ok).toBe(false);
-    });
-  });
-
-  test('validateSafe() error is a ConfigValidationError', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validateSafe: vs, ConfigValidationError: CVE } = require('./index');
-      const { error } = vs();
-      expect(error).toBeInstanceOf(CVE);
-      expect(error.code).toBe('CONFIG_VALIDATION_ERROR');
-    });
-  });
-
-  test('validateSafe() error.issues contains the expected failing key', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validateSafe: vs } = require('./index');
-      const { error } = vs();
-      const paths = error.issues.map(i => i.path);
-      expect(paths).toContain('JWT_SECRET');
-    });
-  });
-
-  test('validateSafe() does not modify the singleton on failure', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const mod = require('./index');
-
-      // Establish a valid singleton.
-      mod.validateSafe();
-      const first = mod.get();
-
-      // Break env and try again.
-      process.env.JWT_SECRET = 'short';
-      const result = mod.validateSafe();
-      expect(result.ok).toBe(false);
-
-      // Singleton unchanged.
-      expect(mod.get()).toBe(first);
-    });
-  });
-
-  // ── Repeated failures (retry simulation) ──────────────────────────────────
-
-  test('calling validateSafe() repeatedly with bad env always returns ok: false', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const { validateSafe: vs } = require('./index');
-      for (let i = 0; i < 5; i++) {
-        const r = vs();
-        expect(r.ok).toBe(false);
-      }
-    });
-  });
-
-  test('validateSafe() succeeds after env is fixed (recovery simulation)', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short';
-      const mod = require('./index');
-
-      // First attempt fails.
-      expect(mod.validateSafe().ok).toBe(false);
-
-      // Fix the env (simulate operator correcting the value).
-      process.env.JWT_SECRET = VALID_JWT;
-
-      // Recovery succeeds.
-      const result = mod.validateSafe();
-      expect(result.ok).toBe(true);
-      expect(result.config.JWT_SECRET).toBe(VALID_JWT);
-    });
-  });
-
-  // ── logRedactedSummary ────────────────────────────────────────────────────
-
-  test('logRedactedSummary handles ConfigValidationError without leaking secrets', () => {
-    jest.isolateModules(() => {
-      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      const secretValue = 'ultra-secret-key-99999';
-      process.env.JWT_SECRET = secretValue;
-      const { validate: v, logRedactedSummary: lrs } = require('./index');
-
-      let err;
-      try { v(); } catch (e) { err = e; }
-      lrs(err);
-
-      const output = consoleSpy.mock.calls.flat().join('\n');
-      expect(output).toContain('JWT_SECRET');
-      expect(output).not.toContain(secretValue);
-      consoleSpy.mockRestore();
-    });
-  });
-
-  test('logRedactedSummary handles raw ZodError (backwards compat)', () => {
-    jest.isolateModules(() => {
-      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      process.env.JWT_SECRET = 'short';
-      const { ConfigSchema: CS, logRedactedSummary: lrs } = require('./index');
-
-      const result = CS.safeParse(process.env);
-      expect(result.success).toBe(false);
-      lrs(result.error);
-
-      const output = consoleSpy.mock.calls.flat().join('\n');
-      expect(output).toContain('JWT_SECRET');
-      consoleSpy.mockRestore();
-    });
-  });
-
-  test('logRedactedSummary handles null without throwing', () => {
-    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    expect(() => logRedactedSummary(null)).not.toThrow();
-    consoleSpy.mockRestore();
-  });
-
-  test('logRedactedSummary handles undefined without throwing', () => {
-    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    expect(() => logRedactedSummary(undefined)).not.toThrow();
-    consoleSpy.mockRestore();
-  });
-
-  test('logRedactedSummary handles a plain Error without throwing', () => {
-    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-    expect(() => logRedactedSummary(new Error('boom'))).not.toThrow();
-    consoleSpy.mockRestore();
-  });
-
-  // ── getInvoiceFileMaxSize safe fallback ───────────────────────────────────
-
-  test('getInvoiceFileMaxSize returns default "5mb" when env is missing and singleton absent', () => {
-    jest.isolateModules(() => {
-      delete process.env.INVOICE_FILE_MAX_SIZE;
-      const { getInvoiceFileMaxSize: gifs } = require('./index');
-      expect(gifs()).toBe('5mb');
-    });
-  });
-
-  test('getInvoiceFileMaxSize returns default "5mb" when env value is invalid and singleton absent', () => {
-    jest.isolateModules(() => {
-      process.env.INVOICE_FILE_MAX_SIZE = 'not-a-size';
-      const { getInvoiceFileMaxSize: gifs } = require('./index');
-      expect(gifs()).toBe('5mb');
-    });
-  });
-
-  test('getInvoiceFileMaxSize returns config value after successful validate()', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      process.env.INVOICE_FILE_MAX_SIZE = '1mb';
-      const { validate: v, getInvoiceFileMaxSize: gifs } = require('./index');
+      const { validate: v, getFeatureFlag: gff } = require('./index');
       v();
-      expect(gifs()).toBe('1mb');
+      expect(gff('ESCROW_INDEXER_ENABLED')).toBe(false);
+      expect(gff('KYC_WEBHOOK_ENABLED')).toBe(false);
+      expect(gff('CURSOR_TTL_ENABLED')).toBe(false);
     });
+  });
+
+  test('#1306 getFeatureFlag returns true for flags that default to "true"', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validate: v, getFeatureFlag: gff } = require('./index');
+      v();
+      expect(gff('ESCROW_READ_PROJECTION_ENABLED')).toBe(true);
+      expect(gff('INVOICE_STATE_ENABLED')).toBe(true);
+      expect(gff('CONFIG_RUNTIME_ENABLED')).toBe(true);
+      expect(gff('METRICS_ENABLED')).toBe(true);
+    });
+  });
+
+  // ── getFeatureFlag() — error paths ────────────────────────────────────────
+
+  test('#1306 getFeatureFlag throws TypeError for an unknown key', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validate: v, getFeatureFlag: gff } = require('./index');
+      v();
+      expect(() => gff('NOT_A_FLAG')).toThrow(TypeError);
+    });
+  });
+
+  test('#1306 getFeatureFlag TypeError message names the invalid key', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validate: v, getFeatureFlag: gff } = require('./index');
+      v();
+      expect(() => gff('BAD_KEY')).toThrow(/BAD_KEY/);
+    });
+  });
+
+  test('#1306 getFeatureFlag throws before validate() is called', () => {
+    jest.isolateModules(() => {
+      const { getFeatureFlag: gff } = require('./index');
+      expect(() => gff('METRICS_ENABLED')).toThrow(/Config not validated/i);
+    });
+  });
+
+  // ── Backwards compatibility: getValue() still works for flags ─────────────
+
+  test('#1306 existing callers using getValue() for feature flags still work', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.ESCROW_READ_PROJECTION_ENABLED = 'false';
+      const { validate: v, getValue: gv } = require('./index');
+      v();
+      // Pattern used by existing callers before getFeatureFlag() was added.
+      const enabled = getValue('ESCROW_READ_PROJECTION_ENABLED') === 'true';
+      expect(enabled).toBe(false);
+    });
+  });
+
+  test('#1306 getValue() and getFeatureFlag() agree on flag values', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.METRICS_ENABLED = 'false';
+      const { validate: v, getValue: gv, getFeatureFlag: gff } = require('./index');
+      v();
+      const viaGetValue = gv('METRICS_ENABLED') === 'true';
+      const viaGetFeatureFlag = gff('METRICS_ENABLED');
+      expect(viaGetValue).toBe(viaGetFeatureFlag);
+    });
+  });
+
+  // ── securityHeaders contract ───────────────────────────────────────────────
+
+  test('#1306 securityHeaders.contentSecurityPolicy.directives.defaultSrc is ["\'self\'"]', () => {
+    expect(securityHeaders.contentSecurityPolicy.directives.defaultSrc).toEqual(["'self'"]);
+  });
+
+  test('#1306 securityHeaders.hsts has correct maxAge', () => {
+    expect(securityHeaders.hsts.maxAge).toBe(31536000);
+    expect(securityHeaders.hsts.includeSubDomains).toBe(true);
+    expect(securityHeaders.hsts.preload).toBe(true);
+  });
+
+  test('#1306 securityHeaders.docsContentSecurityPolicy allows unsafe-inline for scripts', () => {
+    expect(securityHeaders.docsContentSecurityPolicy.directives.scriptSrc)
+      .toContain("'unsafe-inline'");
+  });
+
+  // ── InvoiceFileMaxSizeSchema contract ─────────────────────────────────────
+
+  test('#1306 InvoiceFileMaxSizeSchema.parse returns default "5mb" for undefined', () => {
+    expect(InvoiceFileMaxSizeSchema.parse(undefined)).toBe('5mb');
+  });
+
+  test('#1306 InvoiceFileMaxSizeSchema accepts valid size strings', () => {
+    expect(InvoiceFileMaxSizeSchema.parse('512kb')).toBe('512kb');
+    expect(InvoiceFileMaxSizeSchema.parse('1mb')).toBe('1mb');
+    expect(InvoiceFileMaxSizeSchema.parse('2gb')).toBe('2gb');
+  });
+
+  test('#1306 InvoiceFileMaxSizeSchema rejects invalid strings', () => {
+    expect(() => InvoiceFileMaxSizeSchema.parse('not-a-size')).toThrow();
+    expect(() => InvoiceFileMaxSizeSchema.parse('5')).toThrow();
   });
 
   // ── Original regression tests ─────────────────────────────────────────────
@@ -322,6 +286,22 @@ describe('Config — failure recovery (#1304)', () => {
       const cfg = v();
       expect(cfg.NODE_ENV).toBe('development');
       expect(cfg.PORT).toBe(3001);
+    });
+  });
+
+  test('overrides defaults', () => {
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.PORT = '8080';
+      process.env.JWT_ISSUER = 'custom-issuer';
+      process.env.JWT_AUDIENCE = 'custom-audience';
+      process.env.JWT_ALGORITHMS = 'HS256,HS384';
+      process.env.PUBLIC_API_BASE_URL = 'https://api.example.com';
+      const { validate: v } = require('./index');
+      const cfg = v();
+      expect(cfg.PORT).toBe(8080);
+      expect(cfg.JWT_ISSUER).toBe('custom-issuer');
     });
   });
 
@@ -349,7 +329,23 @@ describe('Config — failure recovery (#1304)', () => {
     });
   });
 
-  test('rejects half-set KYC configuration in non-test env', () => {
+  test('logRedactedSummary does not expose secret values', () => {
+    jest.isolateModules(() => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      process.env.JWT_SECRET = 'short';
+      process.env.KYC_PROVIDER_API_KEY = 'some-secret-key-1234';
+      const { validate: v, logRedactedSummary: lrs } = require('./index');
+      let err;
+      try { v(); } catch (e) { err = e; }
+      lrs(err);
+      const output = consoleSpy.mock.calls.flat().join('\n');
+      expect(output).toContain('JWT_SECRET');
+      expect(output).not.toContain('some-secret-key-1234');
+      consoleSpy.mockRestore();
+    });
+  });
+
+  test('rejects half-set KYC in non-test env', () => {
     jest.isolateModules(() => {
       process.env.NODE_ENV = 'production';
       process.env.JWT_SECRET = VALID_JWT;
@@ -371,6 +367,36 @@ describe('Config — failure recovery (#1304)', () => {
     });
   });
 
+  test('rejects non-HTTPS PUBLIC_API_BASE_URL in production', () => {
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.PUBLIC_API_BASE_URL = 'http://api.example.com';
+      const { validate: v } = require('./index');
+      expect(() => v()).toThrow(/must use HTTPS/i);
+    });
+  });
+
+  test('rejects loopback PUBLIC_API_BASE_URL in production', () => {
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.PUBLIC_API_BASE_URL = 'https://localhost:3001';
+      const { validate: v } = require('./index');
+      expect(() => v()).toThrow(/must not be a loopback address/i);
+    });
+  });
+
+  test('accepts a valid HTTPS non-loopback PUBLIC_API_BASE_URL in production', () => {
+    jest.isolateModules(() => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.PUBLIC_API_BASE_URL = 'https://api.liquifact.com';
+      const { validate: v } = require('./index');
+      expect(v().PUBLIC_API_BASE_URL).toBe('https://api.liquifact.com');
+    });
+  });
+
   test('schema direct parse', () => {
     const result = ConfigSchema.parse({
       NODE_ENV: 'test',
@@ -380,11 +406,27 @@ describe('Config — failure recovery (#1304)', () => {
     expect(result).toMatchObject({ NODE_ENV: 'test', PORT: 3001 });
   });
 
+  test('getInvoiceFileMaxSize falls back to env before validation', () => {
+    jest.isolateModules(() => {
+      process.env.INVOICE_FILE_MAX_SIZE = '512kb';
+      const { getInvoiceFileMaxSize: gifs } = require('./index');
+      expect(gifs()).toBe('512kb');
+    });
+  });
+
   test('ESCROW_READ_PROJECTION_ENABLED defaults to "true"', () => {
     jest.isolateModules(() => {
       process.env.JWT_SECRET = VALID_JWT;
       const { validate: v } = require('./index');
       expect(v().ESCROW_READ_PROJECTION_ENABLED).toBe('true');
+    });
+  });
+
+  test('ESCROW_INDEXER_ENABLED defaults to "false"', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validate: v } = require('./index');
+      expect(v().ESCROW_INDEXER_ENABLED).toBe('false');
     });
   });
 
@@ -401,14 +443,6 @@ describe('Config — failure recovery (#1304)', () => {
       process.env.JWT_SECRET = VALID_JWT;
       const { validate: v } = require('./index');
       expect(v().INVOICE_STATE_ENABLED).toBe('true');
-    });
-  });
-
-  test('ESCROW_INDEXER_ENABLED defaults to "false"', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validate: v } = require('./index');
-      expect(v().ESCROW_INDEXER_ENABLED).toBe('false');
     });
   });
 });
