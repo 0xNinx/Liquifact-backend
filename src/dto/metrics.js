@@ -128,10 +128,13 @@ function toSmeMetricsResponse(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
   const toCount = (value) => {
     const n = Number(value);
-    if (!Number.isFinite(n) || n < 0) {
-      return 0;
-    }
-    return Math.floor(n);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  };
+  return {
+    open: toCount(obj.open),
+    funded: toCount(obj.funded),
+    settled: toCount(obj.settled),
+    defaulted: toCount(obj.defaulted),
   };
   return {
     open: toCount(obj.open),
@@ -179,6 +182,8 @@ function toSmeMetricsMeta(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
 
   // Mandatory fields with defaults.
+  // Invariant: timestamp and version are always present and non-empty strings
+  // so downstream consumers can rely on them without null checks.
   const meta = {
     timestamp: (typeof obj.timestamp === 'string' && obj.timestamp.length > 0)
       ? obj.timestamp
@@ -198,11 +203,8 @@ function toSmeMetricsMeta(raw) {
       meta.total = total;
     }
   }
-  if (typeof obj.limit === 'number' && Number.isFinite(obj.limit) && obj.limit >= 0) {
-    const limit = Math.floor(obj.limit);
-    if (Number.isSafeInteger(limit)) {
-      meta.limit = limit;
-    }
+  if (typeof obj.limit === 'number' && Number.isFinite(obj.limit) && obj.limit > 0) {
+    meta.limit = obj.limit;
   }
   if (typeof obj.hasMore === 'boolean') {
     meta.hasMore = obj.hasMore;
@@ -275,25 +277,18 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
 function toPersistenceRecordParams(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
 
+  const endpoint = String(obj.endpoint || 'unknown');
   const statusCode = Number(obj.statusCode);
-  const safeStatusCode = Number.isFinite(statusCode) && statusCode >= 100 && statusCode <= 599
-    ? Math.floor(statusCode)
-    : 200;
-
-  const duration = Number(obj.durationSeconds);
-  const safeDuration = Number.isFinite(duration) && duration >= 0 ? duration : 0;
-
+  const durationSeconds = Number(obj.durationSeconds);
   const cause = String(obj.cause || 'none');
-  const success = typeof obj.success === 'boolean' ? obj.success : safeStatusCode < 400;
-  const errorCount = Number.isFinite(Number(obj.errorCount)) && Number(obj.errorCount) > 0 ? 1 : (success ? 0 : 1);
 
   return {
-    endpoint: String(obj.endpoint || 'unknown'),
-    statusCode: safeStatusCode,
-    durationSeconds: safeDuration,
-    cause: /** @type {PersistenceCause} */ (cause),
-    success,
-    errorCount,
+    endpoint: endpoint.length > 0 ? endpoint : 'unknown',
+    statusCode: Number.isFinite(statusCode) && statusCode > 0 ? statusCode : 200,
+    durationSeconds: Number.isFinite(durationSeconds) && durationSeconds >= 0
+      ? durationSeconds
+      : 0,
+    cause: /** @type {PersistenceCause} */ (cause.length > 0 ? cause : 'none'),
     req: obj.req || undefined,
   };
 }
@@ -305,8 +300,23 @@ function toPersistenceRecordParams(raw) {
 /**
  * Checks whether a value is a conformant {@link SmeMetricsResponse} DTO.
  *
- * Enforces the full invariant set: non-negative safe integers for every
- * count field, and no unexpected own enumerable keys.
+ * @param {unknown} value - Value to inspect.
+ * @returns {boolean} `true` when the value has the expected shape.
+ */
+function isValidSmeMetricsResponse(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  return (
+    Number.isInteger(value.open) && value.open >= 0 &&
+    Number.isInteger(value.funded) && value.funded >= 0 &&
+    Number.isInteger(value.settled) && value.settled >= 0 &&
+    Number.isInteger(value.defaulted) && value.defaulted >= 0
+  );
+}
+
+/**
+ * Checks whether a value is a conformant {@link PersistenceRecordParams} DTO.
  *
  * @param {unknown} value - Value to inspect.
  * @returns {boolean} `true` when the value has the expected shape.
@@ -316,12 +326,12 @@ function isSmeMetricsResponse(value) {
     return false;
   }
   return (
-    typeof value.endpoint === 'string' &&
-    typeof value.statusCode === 'number' &&
+    typeof value.endpoint === 'string' && value.endpoint.length > 0 &&
+    typeof value.statusCode === 'number' && Number.isFinite(value.statusCode) &&
+    value.statusCode > 0 &&
     typeof value.durationSeconds === 'number' &&
-    typeof value.cause === 'string' &&
-    typeof value.success === 'boolean' &&
-    typeof value.errorCount === 'number'
+    Number.isFinite(value.durationSeconds) && value.durationSeconds >= 0 &&
+    typeof value.cause === 'string' && value.cause.length > 0
   );
 }
 
