@@ -26,6 +26,7 @@ pub struct Bounty {
     pub amount:           i128,
     pub protocol_fee_bps: u32,
     pub released:         bool,
+    pub refunded:         bool,
 }
 
 /// Snapshot of a release attempt, persisted before any token movement so that
@@ -49,13 +50,14 @@ pub struct BountyContract;
 impl BountyContract {
     /// One-time initialiser – sets the fee recipient address.
     pub fn initialize(env: Env, fee_recipient: Address) {
-        if env.storage().instance().has(&DataKey::FeeRecipient) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             panic!("already initialized");
         }
         env.storage()
             .instance()
             .set(&DataKey::FeeRecipient, &fee_recipient);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.storage().instance().set(&DataKey::Initialized, &true);
     }
 
     /// Create a bounty.
@@ -74,6 +76,10 @@ impl BountyContract {
 
         assert!(amount > 0,           "amount must be positive");
         assert!(protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
+        assert!(
+            env.storage().instance().has(&DataKey::Initialized),
+            "not initialized"
+        );
 
         // Invariant: hunter must be a distinct, non-zero address from creator to
         // avoid self-dealing and ambiguous authorization on release.
@@ -91,6 +97,7 @@ impl BountyContract {
             amount,
             protocol_fee_bps,
             released: false,
+            refunded: false,
         };
         env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
@@ -124,6 +131,7 @@ impl BountyContract {
 
         bounty.creator.require_auth();
         assert!(!bounty.released, "already released");
+        assert!(!bounty.refunded, "already refunded");
 
         let fee_recipient: Address = env
             .storage()
@@ -188,12 +196,46 @@ impl BountyContract {
         assert!(record.fee_paid && record.payout_paid, "release incomplete");
 
         bounty.released = true;
+        bounty.refunded = false;
         env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
         env.storage().persistent().remove(&DataKey::ReleasePending(id));
 
         env.events().publish(
             (Symbol::new(&env, "bounty_released"), id),
             (payout, fee),
+        );
+    }
+
+    /// Refund a bounty to the creator if it has not been released.
+    ///
+    /// Only the creator may refund, and only while the bounty is unreleased.
+    /// This is the inverse transition of `release_bounty` and preserves the
+    /// invariant that a bounty is either released, refunded, or pending —
+    /// never both released and refunded.
+    pub fn refund_bounty(env: Env, id: u64) {
+        let mut bounty: Bounty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(id))
+            .expect("bounty not found");
+
+        bounty.creator.require_auth();
+        assert!(!bounty.released, "already released");
+        assert!(!bounty.refunded, "already refunded");
+
+        let client = token::Client::new(&env, &bounty.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &bounty.creator,
+            &bounty.amount,
+        );
+
+        bounty.refunded = true;
+        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
+
+        env.events().publish(
+            (Symbol::new(&env, "bounty_refunded"), id),
+            bounty.amount,
         );
     }
 
