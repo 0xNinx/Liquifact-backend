@@ -1,4 +1,4 @@
-/**
+/*
  * src/config/escrowMap.js
  *
  * Resolves an invoiceId to its on-chain LiquifactEscrow contract address and
@@ -26,6 +26,17 @@
  *
  * Throws EscrowNotFoundError when no active mapping exists for the invoice in
  * the current environment. Funding callers translate this to a 404.
+ *
+ * Compatibility contracts:
+ *   - `resolveEscrowAddress` returns `null` for invalid input and for unknown
+ *     invoices. It never throws for a well-formed string invoiceId.
+ *   - `resolveInvoiceByAddress` returns `null` for unknown, inactive, or
+ *     foreign-environment addresses. It never throws.
+ *   - The forward and reverse lookups share the same environment scoping
+ *     rule (current environment OR configured defaultEnvironment) so a
+ *     round-trip is always consistent.
+ *   - Config parsing is pure with respect to cache state: a read never mutates
+ *     the cache except to insert/evict a resolved entry.
  */
 
 (function (root, factory) {

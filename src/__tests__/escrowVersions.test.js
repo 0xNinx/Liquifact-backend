@@ -7,6 +7,7 @@
  *  - escrowVersions.js: REGISTRY, isValidContractId, compareVersions, getOnChainSchemaVersion
  *  - contractListRefresh.js: runContractListRefresh
  *  - adminEscrow routes: POST /refresh, GET /version (auth + logic)
+ *  - escrowMap.js: compatibility contracts (getEscrowMap, resolveEscrow, invariants)
  */
 
 jest.mock('../services/soroban');
@@ -45,6 +46,13 @@ const {
   ESCROW_VERSION_ERROR_CODES = {},
 } = escrowVersions;
 
+const {
+  getEscrowMap,
+  resolveEscrow,
+  ESCROW_MAP,
+  ESCROW_MAP_INVARIANTS,
+} = require('../config/escrowMap');
+
 const { runContractListRefresh } = require('../jobs/contractListRefresh');
 
 const request = require('supertest');
@@ -70,6 +78,7 @@ function makeAdminToken(overrides = {}) {
 
 const adminToken = makeAdminToken();
 const VALID_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const VALID_ID_2 = 'CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 
 // ─── module load guard ───────────────────────────────────────────────────────
 
