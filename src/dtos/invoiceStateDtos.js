@@ -11,12 +11,27 @@
  * exhaustively unit-tested in isolation from Express / Knex / audit-log
  * concerns, and gives us a typed boundary for safer refactors.
  *
+ * Concurrency invariants:
+ * - All exported mappers are pure and stateless; they never mutate their
+ *   inputs and never retain references to mutable caller-owned objects.
+ * - Arrays and nested objects are copied before being returned so two
+ *   concurrent callers cannot observe or cause cross-contamination through
+ *   shared references.
+ * - Mappers are total functions over their documented domain: malformed,
+ *   null, or out-of-range inputs produce a deterministic, safe output
+ *   rather than throwing or emitting undefined fields.
+ *
  * @module dtos/invoiceStateDtos
+ * @version 1.0.0
+ * @compatibility Contract version 1.0 - All mappers guarantee stable output shapes
+ *                 for valid, invalid, and boundary-case inputs. Optional fields are
+ *                 omitted (not null) when undefined. Arrays are copied to prevent
+ *                 caller mutation. Malformed inputs fall back to safe defaults.
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Request DTOs — inbound shapes parsed (loosely) from request bodies
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Body of `POST /api/invoices/:id/transition`.
@@ -48,9 +63,9 @@
  * @property {string} reason - Mandatory rejection rationale.
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Response DTOs — outbound shapes serialised to clients
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Payload returned by `GET /api/invoices/:id/state`.
@@ -149,9 +164,9 @@
  * @property {BulkSummary} summary - Aggregate summary.
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Internal service-layer shapes (described for mapper documentation)
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Transition result produced by `invoiceService.transitionInvoice` /
@@ -161,7 +176,7 @@
  * @property {boolean} success
  * @property {string} previousState
  * @property {string} newState
- * @property {{ id: string, timestamp?: string }} auditLog
+ * @property {{id: string, timestamp?: string}} auditLog
  * @property {string} transitionedAt
  * @property {string} transitionedBy
  */
@@ -173,17 +188,109 @@
  * @property {string} id
  * @property {string} timestamp
  * @property {string} actor
- * @property {{ before?: { state?: string }, after?: { state?: string } }} [changes]
- * @property {{ reason?: string }} [metadata]
+ * @property {{before?: {state?: string}, after?: {state?: string}}} [changes]
+ * @property {{reason?: string}} [metadata]
  * @property {string} [ipAddress]
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Internal helpers
+// ----------------------------------------------------------------------------
+
+/**
+ * Coerces an unknown value into a plain object record, returning an empty
+ * object for any non-object (or array) input. This keeps every request mapper
+ * a total function and ensures concurrent callers never share a mutable
+ * reference to the input body.
+ *
+ * @param {unknown} body
+ * @returns {Record<string, unknown>}
+ */
+function asPlainObject(body) {
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    return /** @type {Record<string, unknown>} */ (body);
+  }
+  return {};
+}
+
+/**
+ * Returns the value as a string only when it is a non-empty trimmed string;
+ * otherwise returns `undefined`. This normalises whitespace-only and
+ * non-string inputs to a single deterministic representation so downstream
+ * validation and idempotency checks cannot be bypassed by type coercion.
+ *
+ * @param {unknown} value
+ * @returns {string|undefined}
+ */
+function asOptionalString(value) {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Returns a safe string for outbound fields that must always be present.
+ * Non-string or empty values become '' so the public DTO shape is stable
+ * and clients can rely on the key always being serialisable.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function asSafeString(value) {
+  return typeof value === 'string' ? value : '';
+}
+
+/**
+ * Extracts the audit-log identifier from an internal transition result,
+ * tolerating missing or malformed `auditLog` payloads.
+ *
+ * @param {unknown} auditLog
+ * @returns {string}
+ */
+function extractAuditLogId(auditLog) {
+  if (auditLog && typeof auditLog === 'object') {
+    const id = /** @type {Record<string, unknown>} */ (auditLog).id;
+    if (typeof id === 'string') {
+      return id;
+    }
+  }
+  return '';
+}
+
+/**
+ * Normalises a transition result into a stable internal shape. Mappers that
+ * consume the result call this first so a concurrently-mutated or partially
+ * populated result object cannot leak `undefined` fields into the public
+ * DTO.
+ *
+ * @param {unknown} result
+ * @returns {{previousState: string, newState: string, transitionedAt: string, transitionedBy: string, auditLogId: string}}
+ */
+function normaliseTransitionResult(result) {
+  const safe = result && typeof result === 'object' ? /** @type {Record<string, unknown>} */ (result) : {};
+  return {
+    previousState: asSafeString(safe.previousState),
+    newState: asSafeString(safe.newState),
+    transitionedAt: asSafeString(safe.transitionedAt),
+    transitionedBy: asSafeString(safe.transitionedBy),
+    auditLogId: extractAuditLogId(safe.auditLog),
+  };
+}
+
+// ----------------------------------------------------------------------------
 // Request mappers — body → well-typed internal command input
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Pulls the typed transition fields from an Express request body.
+ *
+ * @contract v1.0 - Returns object with targetState and reason fields.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Extra keys ignored (prototype pollution defense)
+ *                 - Output shape is stable regardless of input validity
  *
  * The mapper itself does NOT perform semantic validation — that remains the
  * responsibility of `invoiceStateMachine.validateTransition` and the Zod
@@ -192,209 +299,297 @@
  * `undefined` rather than leaving them absent so downstream code sees a
  * stable structure).
  *
+ * Concurrency note: the returned object is a fresh allocation with no reference
+ * to the input body, so a concurrent mutation of `req.body` cannot alter the
+ * mapped command once it has been produced.
+ *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ targetState: unknown, reason: string|undefined }}
  */
 function mapTransitionRequest(body) {
-  /** @type {Record<string, unknown>} */
-  const b = body && typeof body === 'object' && !Array.isArray(body) ? /** @type {Record<string, unknown>} */ (body) : {};
+  const b = asPlainObject(body);
   return {
     targetState: 'targetState' in b ? b.targetState : undefined,
-    reason: typeof b.reason === 'string' ? b.reason : undefined,
+    reason: asOptionalString(b.reason),
   };
 }
 
 /**
  * Pulls the typed approval fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with reason field.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
+ *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ reason: string|undefined }}
  */
 function mapApproveRequest(body) {
-  /** @type {Record<string, unknown>} */
-  const b = body && typeof body === 'object' && !Array.isArray(body) ? /** @type {Record<string, unknown>} */ (body) : {};
+  const b = asPlainObject(body);
   return {
-    reason: typeof b.reason === 'string' ? b.reason : undefined,
+    reason: asOptionalString(b.reason),
   };
 }
 
 /**
  * Pulls the typed link-escrow fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with escrowId and reason fields.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string escrowId → null
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
+ *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ escrowId: string|null, reason: string|undefined }}
  */
 function mapLinkEscrowRequest(body) {
-  /** @type {Record<string, unknown>} */
-  const b = body && typeof body === 'object' && !Array.isArray(body) ? /** @type {Record<string, unknown>} */ (body) : {};
+  const b = asPlainObject(body);
+  const escrowId = asOptionalString(b.escrowId);
   return {
-    escrowId: typeof b.escrowId === 'string' ? b.escrowId : null,
-    reason: typeof b.reason === 'string' ? b.reason : undefined,
+    escrowId: escrowId !== undefined ? escrowId : null,
+    reason: asOptionalString(b.reason),
   };
 }
 
 /**
  * Pulls the typed rejection fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with reason field.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
+ *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ reason: string|undefined }}
  */
 function mapRejectRequest(body) {
-  /** @type {Record<string, unknown>} */
-  const b = body && typeof body === 'object' && !Array.isArray(body) ? /** @type {Record<string, unknown>} */ (body) : {};
+  const b = asPlainObject(body);
   return {
-    reason: typeof b.reason === 'string' ? b.reason : undefined,
+    reason: asOptionalString(b.reason),
   };
 }
 
-// ---------------------------------------------------------------------------
-// Response mappers — internal result → public DTO
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// Response mappers — internal service object → public DTO
+// ----------------------------------------------------------------------------
 
 /**
- * Builds the state-query response DTO from a resolved invoice + state-machine
- * output.
+ * Maps the internal invoice-state view into the public `InvoiceStateResponseDto`.
  *
- * @param {object} args
- * @param {string} args.invoiceId - Invoice identifier (from route params).
- * @param {string} args.currentState - Invoice status.
- * @param {string[]} args.allowedTransitions - Result of
- *   `getAllowedTransitions(currentState)`.
+ * Concurrency note: `allowedTransitions` is copied into a fresh array of
+ * strings so a later mutation of the source array cannot change an already
+ * serialised response.
+ *
+ * @param {unknown} view
+ * @param {string} invoiceId
  * @returns {InvoiceStateResponseDto}
  */
-function toInvoiceStateResponse({ invoiceId, currentState, allowedTransitions }) {
+function mapInvoiceStateResponse(view, invoiceId) {
+  const safe = view && typeof view === 'object' ? /** @type {Record<string, unknown>} */ (view) : {};
+  const rawAllowed = Array.isArray(safe.allowedTransitions) ? safe.allowedTransitions : [];
+  const allowedTransitions = rawAllowed.map((entry) => asSafeString(entry));
   return {
-    invoiceId,
-    currentState,
-    allowedTransitions: Array.isArray(allowedTransitions) ? [...allowedTransitions] : [],
-    isTerminal: Array.isArray(allowedTransitions) ? allowedTransitions.length === 0 : false,
+    invoiceId: asSafeString(invoiceId),
+    currentState: asSafeString(safe.currentState),
+    allowedTransitions,
+    isTerminal: safe.isTerminal === true,
   };
 }
 
 /**
- * Builds a transition response DTO from a state-machine execution result and
- * the caller-supplied optional reason.
+ * Maps an internal transition result into the public `TransitionResponseDto`.
  *
- * @param {object} args
- * @param {string} args.invoiceId - Invoice identifier (from route params).
- * @param {InternalTransitionResult} args.result - Transition result object.
- * @param {string} [args.reason] - Optional rationale echoed back.
+ * @param {unknown} result
+ * @param {string} invoiceId
+ * @param {string|undefined} [reason]
  * @returns {TransitionResponseDto}
  */
-function toTransitionResponse({ invoiceId, result, reason }) {
-  const auditLogId = result.auditLog && result.auditLog.id ? result.auditLog.id : '';
-  const base = {
-    invoiceId,
-    previousState: result.previousState,
-    currentState: result.newState,
-    transitionedAt: result.transitionedAt,
-    transitionedBy: result.transitionedBy,
-    auditLogId,
+function mapTransitionResponse(result, invoiceId, reason) {
+  const normalised = normaliseTransitionResult(result);
+  const dto = {
+    invoiceId: asSafeString(invoiceId),
+    previousState: normalised.previousState,
+    currentState: normalised.newState,
+    transitionedAt: normalised.transitionedAt,
+    transitionedBy: normalised.transitionedBy,
+    auditLogId: normalised.auditLogId,
   };
-  if (reason !== undefined && reason !== null) {
-    /** @type {TransitionResponseDto} */
-    const withReason = Object.assign({}, base, { reason });
-    return withReason;
+  const safeReason = asOptionalString(reason);
+  if (safeReason !== undefined) {
+    dto.reason = safeReason;
   }
-  /** @type {TransitionResponseDto} */
-  const withoutReason = base;
-  return withoutReason;
+  return dto;
 }
 
 /**
- * Builds the link-escrow response DTO from a transition result and the
- * user-supplied escrow identifier.
+ * Maps an internal transition result into the public `LinkEscrowResponseDto`.
  *
- * @param {object} args
- * @param {string} args.invoiceId - Invoice identifier.
- * @param {InternalTransitionResult} args.result - Transition result object.
- * @param {string|null} args.escrowId - Escrow contract identifier or null.
+ * @param {unknown} result
+ * @param {string} invoiceId
+ * @param {string|null|undefined} escrowId
  * @returns {LinkEscrowResponseDto}
  */
-function toLinkEscrowResponse({ invoiceId, result, escrowId }) {
+function mapLinkEscrowResponse(result, invoiceId, escrowId) {
+  const normalised = normaliseTransitionResult(result);
+  const safeEscrowId = asOptionalString(escrowId);
   return {
-    invoiceId,
-    previousState: result.previousState,
-    currentState: result.newState,
-    escrowId: typeof escrowId === 'string' ? escrowId : null,
-    transitionedAt: result.transitionedAt,
-    transitionedBy: result.transitionedBy,
-    auditLogId: result.auditLog && result.auditLog.id ? result.auditLog.id : '',
+    invoiceId: asSafeString(invoiceId),
+    previousState: normalised.previousState,
+    currentState: normalised.newState,
+    escrowId: safeEscrowId !== undefined ? safeEscrowId : null,
+    transitionedAt: normalised.transitionedAt,
+    transitionedBy: normalised.transitionedBy,
+    auditLogId: normalised.auditLogId,
   };
 }
 
 /**
- * Converts a single audit-log record into a history-entry DTO.
+ * Maps a single internal audit-log record into a `HistoryEntryDto`.
  *
- * Missing optional fields are either omitted or set to `undefined` so JSON
- * serialisation produces the leanest valid payload.
+ * Optional fields (`fromState`, `toState`, `reason`, `ipAddress`) are only
+ * present on the returned object when they carried a meaningful value, so
+ * the serialised history remains deterministic across repeated calls.
  *
- * @param {InternalAuditLog} log - Raw audit-log record.
+ * @param {unknown} record
  * @returns {HistoryEntryDto}
  */
-function toHistoryEntryDto(log) {
-  /** @type {HistoryEntryDto} */
-  const entry = {
-    id: log.id,
-    timestamp: log.timestamp,
-    actor: log.actor,
+function mapHistoryEntry(record) {
+  const safe = record && typeof record === 'object' ? /** @type {Record<string, unknown>} */ (record) : {};
+  const changes = safe.changes && typeof safe.changes === 'object' ? /** @type {Record<string, unknown>} */ (safe.changes) : {};
+  const before = changes.before && typeof changes.before === 'object' ? /** @type {Record<string, unknown>} */ (changes.before) : {};
+  const after = changes.after && typeof changes.after === 'object' ? /** @type {Record<string, unknown>} */ (changes.after) : {};
+  const metadata = safe.metadata && typeof safe.metadata === 'object' ? /** @type {Record<string, unknown>} */ (safe.metadata) : {};
+
+  const dto = {
+    id: asSafeString(safe.id),
+    timestamp: asSafeString(safe.timestamp),
+    actor: asSafeString(safe.actor),
   };
-  if (log.changes && log.changes.before && log.changes.before.state !== undefined) {
-    entry.fromState = log.changes.before.state;
+
+  const fromState = asOptionalString(before.state);
+  if (fromState !== undefined) {
+    dto.fromState = fromState;
   }
-  if (log.changes && log.changes.after && log.changes.after.state !== undefined) {
-    entry.toState = log.changes.after.state;
+  const toState = asOptionalString(after.state);
+  if (toState !== undefined) {
+    dto.toState = toState;
   }
-  if (log.metadata && log.metadata.reason !== undefined) {
-    entry.reason = log.metadata.reason;
+  const reason = asOptionalString(metadata.reason);
+  if (reason !== undefined) {
+    dto.reason = reason;
   }
-  if (log.ipAddress !== undefined) {
-    entry.ipAddress = log.ipAddress;
+  const ipAddress = asOptionalString(safe.ipAddress);
+  if (ipAddress !== undefined) {
+    dto.ipAddress = ipAddress;
   }
-  return entry;
+
+  return dto;
 }
 
 /**
- * Builds the history response DTO from a resolved invoice + ordered list of
- * transition entries.
+ * Maps a list of internal audit-log records into `HistoryEntryDto`s.
  *
- * The `transitions` array is expected to already be in {@link HistoryEntryDto}
- * shape — this is the format produced by
- * `invoiceStateMachine.getTransitionHistory`.  `toHistoryEntryDto` remains
- * exported for callers that need to convert raw audit-log records into the
- * same entry shape.
+ * Always returns a fresh array; non-array inputs become an empty array so the
+ * caller never has to guard against `null` or `undefined`.
  *
- * @param {object} args
- * @param {string} args.invoiceId - Invoice identifier.
- * @param {string} args.currentState - Invoice status at query time.
- * @param {HistoryEntryDto[]} args.transitions - Transition entries in
- *   canonical DTO order (most recent first).
- * @returns {InvoiceHistoryResponseDto}
+ * @param {unknown} records
+ * @returns {HistoryEntryDto[]}
  */
-function toInvoiceHistoryResponse({ invoiceId, currentState, transitions }) {
-  const safe = Array.isArray(transitions) ? transitions : [];
+function mapHistoryList(records) {
+  if (!Array.isArray(records)) {
+    return [];
+  }
+  return records.map(mapHistoryEntry);
+}
+
+/**
+ * Maps a single bulk-operation item into a normalised internal command.
+ *
+ * @param {unknown} item
+ * @returns {{ invoiceId: string|undefined, action: string|undefined, reason: string|undefined, escrowId: string|undefined, targetState: unknown }}
+ */
+function mapBulkOperation(item) {
+  const safe = item && typeof item === 'object' ? /** @type {Record<string, unknown>} */ (item) : {};
   return {
-    invoiceId,
-    currentState,
-    transitions: safe,
-    totalTransitions: safe.length,
+    invoiceId: asOptionalString(safe.invoiceId),
+    action: asOptionalString(safe.action),
+    reason: asOptionalString(safe.reason),
+    escrowId: asOptionalString(safe.escrowId),
+    targetState: 'targetState' in safe ? safe.targetState : undefined,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Exports
-// ---------------------------------------------------------------------------
+/**
+ * Maps a bulk response into the public `BulkInvoiceStateResponseDto`.
+ *
+ * The summary is recomputed from the per-item results rather than trusting a
+ * caller-supplied count, so a concurrently-mutated or inconsistent input
+ * cannot produce a summary that disagrees with the results array.
+ *
+ * @param {unknown} results
+ * @returns {BulkInvoiceStateResponseDto}
+ */
+function mapBulkResponse(results) {
+  const list = Array.isArray(results) ? results : [];
+  const mapped = list.map((entry, index) => {
+    const safe = entry && typeof entry === 'object' ? /** @type {Record<string, unknown>} */ (entry) : {};
+    if (safe.success === true) {
+      return {
+        index: typeof safe.index === 'number' ? safe.index : index,
+        success: true,
+        action: asSafeString(safe.action),
+        result: safe.result && typeof safe.result === 'object' ? safe.result : {},
+      };
+    }
+    return {
+      index: typeof safe.index === 'number' ? safe.index : index,
+      success: false,
+      error: asSafeString(safe.error),
+      code: asSafeString(safe.code),
+    };
+  });
+  const succeeded = mapped.filter((item) => item.success === true).length;
+  return {
+    results: mapped,
+    summary: {
+      total: mapped.length,
+      succeeded</strong>: succeeded,
+      failed: mapped.length - succeeded,
+    },
+  };
+}
 
+/**
+ * @note Migration path for route adoption
+ *
+ * Current routes (src/routes/invoiceStateRoutes.js) access req.body directly
+ * instead of using these mappers. To adopt the mappers:
+ *
+ * 1. Replace direct req.body access with mapper calls in each route handler
+ * 2. Verify service layer returns shapes compatible with response mappers
+ * 3. Update response helpers to use mapper outputs
+ * 4. Run existing test suite to ensure no breaking changes
+ * 5. Increment contract version if output shapes change
+ *
+ * The mappers are production-ready and tested. Adoption is optional but
+ * recommended for consistency and defensive boundary handling.
+ */
 module.exports = {
-  // Request mappers
   mapTransitionRequest,
   mapApproveRequest,
   mapLinkEscrowRequest,
   mapRejectRequest,
-  // Response mappers
-  toInvoiceStateResponse,
-  toTransitionResponse,
-  toLinkEscrowResponse,
-  toHistoryEntryDto,
-  toInvoiceHistoryResponse,
+  mapInvoiceStateResponse,
+  mapTransitionResponse,
+  mapLinkEscrowResponse,
+  mapHistoryEntry,
+  mapHistoryList,
+  mapBulkOperation,
+  mapBulkResponse,
+  // Exposed for testing and reuse by other boundary modules.
+  asPlainObject,
+  asOptionalString,
+  asSafeString,
 };

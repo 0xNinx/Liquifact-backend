@@ -443,6 +443,39 @@ impl BountyContract {
         Ok(())
     }
 
+    /// Refund a bounty to the creator if it has not been released.
+    ///
+    /// Only the creator may refund, and only while the bounty is unreleased.
+    /// This is the inverse transition of `release_bounty` and preserves the
+    /// invariant that a bounty is either released, refunded, or pending —
+    /// never both released and refunded.
+    pub fn refund_bounty(env: Env, id: u64) {
+        let mut bounty: Bounty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(id))
+            .expect("bounty not found");
+
+        bounty.creator.require_auth();
+        assert!(!bounty.released, "already released");
+        assert!(!bounty.refunded, "already refunded");
+
+        let client = token::Client::new(&env, &bounty.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &bounty.creator,
+            &bounty.amount,
+        );
+
+        bounty.refunded = true;
+        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
+
+        env.events().publish(
+            (Symbol::new(&env, "bounty_refunded"), id),
+            bounty.amount,
+        );
+    }
+
     /// Read a bounty (view helper).
     ///
     /// Panics when no bounty is stored under `id`; use [`Self::find_bounty`]
@@ -1590,5 +1623,65 @@ mod tests {
         assert_eq!(published, 1, "exactly one event per creation");
         // Two events in total: the mock token's `transfer` and the bounty's own.
         assert_eq!(env.events().all().len(), before + 2);
+    }
+
+    // ── failure-recovery / determinism ───────────────────────────────────────
+
+    #[test]
+    fn test_release_record_cleared_after_success() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let id = client.create_bounty(&creator, &hunter, &token, &1_000_i128, &100u32);
+
+        assert!(client.get_release_record(&id).is_none());
+        client.release_bounty(&id);
+        assert!(client.get_release_record(&id).is_none(), "record must be cleared on success");
+    }
+
+    #[test]
+    fn test_zero_fee_release_is_deterministic() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let id = client.create_bounty(&creator, &hunter, &token, &1_000_i128, &0u32);
+
+        let token_client = TokenClient::new(&env, &token);
+        let before = token_client.balance(&hunter);
+        client.release_bounty(&id);
+        let after = token_client.balance(&hunter);
+
+        assert_eq!(after - before, 1_000_i128);
+        assert!(client.get_release_record(&id).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "creator and hunter must differ")]
+    fn test_rejects_self_bounty() {
+        let (env, contract_id, _fee_recipient, creator, _hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        client.create_bounty(&creator, &creator, &token, &100_i128, &0u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "amount must be positive")]
+    fn test_rejects_zero_amount() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        client.create_bounty(&creator, &hunter, &token, &0_i128, &0u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "fee_bps must be <= 10000")]
+    fn test_rejects_excessive_fee() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        client.create_bounty(&creator, &hunter, &token, &100_i128, &10_001u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "bounty not found")]
+    fn test_release_unknown_bounty_panics() {
+        let (env, contract_id, _fee_recipient, _creator, _hunter, _token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        client.release_bounty(&999u64);
     }
 }
