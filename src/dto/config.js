@@ -4,7 +4,7 @@
  * @fileoverview Typed DTO helpers for admin config request/response boundaries.
  *
  * These helpers keep the route contract explicit without changing runtime
- * behavior. They map plain objects to/from a small typed DTO envelope that is
+ * behavior. They map plain objects to/from a small typed DXO envelope that is
  * easier to evolve safely during refactors.
  *
  * Invariants enforced here:
@@ -21,6 +21,16 @@
  *
  * @module dto/config
  */
+
+/**
+ * Determine whether a value is a plain object (not null, not array).
+ *
+ * @param {unknown} value - Value to inspect.
+ * @returns {boolean} True when the value is a non-null, non-array object.
+ */
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 /**
  * @typedef {Object} AdminConfigRequestDto
@@ -78,7 +88,7 @@ function toAdminConfigRequestDto(payload) {
 }
 
 /**
- * Convert a typed admin config request DTO back to the route shape.
+ * Convert a typed admin config request DXO back to the route shape.
  *
  * This function is symmetric with `toAdminConfigRequestDto` so that code
  * receiving a DTO can pass it back through the boundary without any asymmetry.
@@ -88,7 +98,8 @@ function toAdminConfigRequestDto(payload) {
  * @returns {Readonly<AdminConfigRequestDto>} A request DTO with the same boundary shape.
  */
 function fromAdminConfigRequestDto(dto) {
-  return toAdminConfigRequestDto(dto);
+  const normalized = toAdminConfigRequestDto(dto);
+  return { section: normalized.section, config: { ...normalized.config } };
 }
 
 /**
@@ -126,7 +137,12 @@ function toAdminConfigResponseDto(payload) {
  * @returns {Readonly<AdminConfigResponseDto>} A response DTO with the same boundary shape.
  */
 function fromAdminConfigResponseDto(dto) {
-  return toAdminConfigResponseDto(dto);
+  const normalized = toAdminConfigResponseDto(dto);
+  return {
+    section: normalized.section,
+    config: { ...normalized.config },
+    message: normalized.message,
+  };
 }
 
 /**
@@ -161,7 +177,8 @@ function toConfigSectionsResponseDto(sections) {
  * @returns {Readonly<ConfigSectionsResponseDto>} A sections DTO with the same boundary shape.
  */
 function fromConfigSectionsResponseDto(dto) {
-  return toConfigSectionsResponseDto(dto && dto.sections);
+  const sections = isPlainObject(dto) ? dto.sections : undefined;
+  return toConfigSectionsResponseDto(sections);
 }
 
 module.exports = {

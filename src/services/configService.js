@@ -3,7 +3,7 @@
 /**
  * @fileoverview Runtime configuration service: applies admin-supplied config
  * changes, persists them via the soft-delete store, and manages short-lived
- * API-key rotation state in memory.
+ * API-Key rotation state in memory.
  *
  * This file was previously stored as a minified blob with several defects
  * (`crypto.randomUUId`, a stray quote in the `retiring` label, and a broken
@@ -41,10 +41,15 @@ const { reloadCorsOrigins, reloadCorsMaxAge } = require('../config/cors');
 const { persistConfig } = require('./configSoftDelete');
 const logger = require('../logger');
 
-// Per-tenant API-key rotation state and a serialised queue so rotations for a
+// Per-tenant API-Key rotation state and a serialised queue so rotations for a
 // single tenant never interleave.
 const keyStates = new Map();
 const tenantQueues = new Map();
+
+// Maximum number of attempts for a single persistence operation.
+const PERSIST_MAX_ATTEMPTS = 3;
+// Base delay between persistence retries (ms).
+const PERSIST_RETRY_BASE_DELAY_MS = 25;
 
 /** Stable, non-secret identifier for a key value (SHA-256). */
 function keyFingerprint(key) {
@@ -81,6 +86,33 @@ function enqueue(tenantId, op) {
   tenantQueues.set(tenantId, pruned);
 
   return run;
+}
+
+/**
+ * Retries an async operation with exponential backoff. The operation is
+ * assumed to be idempotent or safe to repeat.
+ *
+ * @param {Function} op - Async operation to retry.
+ * @param {Object} [options] - Retry options.
+ * @param {number} [options.maxAttempts] - Maximum attempts.
+ * @param {number} [options.baseDelayMs] - Base backoff delay.
+ * @returns {Promise<*>} Result of `op`.
+ */
+async function retryWithBackoff(op, { maxAttempts = PERSIST_MAX_ATTEMPTS, baseDelayMs = PERSIST_RETRY_BASE_DELAY_MS } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await op();
+    } catch (err) {
+      lastError = err;
+      if (attempt === maxAttempts) {
+        break;
+      }
+      const delayMs = baseDelayMs * 2 ** (attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
 }
 
 /**
@@ -134,7 +166,24 @@ async function rotateApiKey({ tenantId, currentKey, newKey, overlapSeconds, acti
       },
     };
 
-    await persistConfig({ section: 'apiKeyState', config: next, tenantId, actor: actor || null });
+    // Persist before mutating in-memory state. If persistence fails after
+    // retries, the in-memory state remains unchanged so the caller can
+    // retry the rotation deterministically without losing the old key.
+    try {
+      await retryWithBackoff(() =>
+        persistConfig({ section: 'apiKeyState', config: next, tenantId, actor: actor || null })
+      );
+    } catch (err) {
+      logger.error(
+        { err, tenantId, actor: actor || null },
+        'configService: failed to persist API key rotation'
+      );
+      const wrapped = new Error('Failed to persist API key rotation');
+      wrapped.code = 'ROTATION_PERSIST_FAILED';
+      wrapped.cause = err;
+      throw wrapped;
+    }
+
     keyStates.set(tenantId, next);
 
     return {
@@ -155,6 +204,10 @@ async function rotateApiKey({ tenantId, currentKey, newKey, overlapSeconds, acti
  * @returns {{valid: true, state: string, keyId: string, expiresAt?: number} | {valid: false, reason: string}}
  */
 function validateApiKey({ tenantId, key }) {
+  if (!tenantId || typeof key !== 'string' || key.length === 0) {
+    return { valid: false, reason: 'Key is not valid or has expired' };
+  }
+
   const state = getState(tenantId);
   const now = Date.now();
   const fingerprint = keyFingerprint(key);
@@ -183,25 +236,35 @@ function validateApiKey({ tenantId, key }) {
  * @returns {Promise<{id?: string, section: string, config: Object, message: string}>}
  */
 async function applyConfig(section, config, context) {
-  const { tenantId, adminClient } = context;
+  const { tenantId, adminClient } = context || {};
 
+  let persisted;
+  try {
+    persisted = await retryWithBackoff(() =>
+      persistConfig({
+        section,
+        config,
+        tenantId: tenantId || '',
+        actor: adminClient || null,
+      })
+    );
+  } catch (err) {
+    logger.error(
+      { err, section, tenantId: tenantId || '', adminClient: adminClient || null },
+      'configService: failed to persist config'
+    );
+    const wrapped = new Error('Failed to persist configuration change');
+    wrapped.code = 'CONFIG_PERSIST_FAILED';
+    wrapped.cause = err;
+    throw wrapped;
+  }
+
+  // Only apply runtime side effects after the change is durably persisted.
   if (section === 'cors') {
     applyCorsConfig(config);
   }
 
-  let persisted;
-  try {
-    persisted = await persistConfig({
-      section,
-      config,
-      tenantId: tenantId || '',
-      actor: adminClient || null,
-    });
-  } catch (err) {
-    logger.error({ err, section, tenantId }, 'configService: failed to persist config');
-  }
-
-  const logPayload = { tenantId, section, adminClient };
+  const logPayload = { tenantId: tenantId || '', section, adminClient: adminClient || null };
   if (persisted && persisted.id) {
     logPayload.recordId = persisted.id;
   }
