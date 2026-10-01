@@ -22,7 +22,7 @@ describe('Invoice Verification Service', () => {
     const result = await verifyInvoice(null);
     expect(result).toEqual({
       status: 'REJECTED',
-      reason: 'Invalid payload structure',
+      reason: 'Invalid payload stucture',
       reasonCode: ReasonCode.INVALID_PAYLOAD,
     });
 

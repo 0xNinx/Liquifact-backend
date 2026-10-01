@@ -46,6 +46,22 @@ try {
 /**
  * Thrown when no active escrow mapping exists for an invoice ID.
  */
+class EscrowNotFoundError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'EscrowNotFoundError';
+  }
+}
+
+/**
+ * Thrown when ESCROW_ADDR_BY_INVOICE JSON is malformed or invalid.
+ */
+class EscrowMapConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'EscrowMapConfigError';
+  }
+}
 const EscrowMappingEntrySchema = z.object({
   invoiceId: z.string()
     .min(1, 'Invoice ID cannot be empty')
@@ -79,6 +95,29 @@ const EscrowMappingConfigSchema = z.object({
     .min(5)
     .max(3600)
     .default(300)
+}).superRefine((data, ctx) => {
+  const invoiceEnvPairs = new Set();
+  const addressEnvPairs = new Set();
+  data.mappings.forEach((mapping, i) => {
+    const invEnv = `${mapping.invoiceId}:${mapping.environment}`;
+    const addrEnv = `${mapping.escrowAddress}:${mapping.environment}`;
+    if (invoiceEnvPairs.has(invEnv)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Duplicate invoiceId "${mapping.invoiceId}" in environment "${mapping.environment}"`,
+        path: ['mappings', i, 'invoiceId']
+      });
+    }
+    if (addressEnvPairs.has(addrEnv)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Duplicate escrowAddress "${mapping.escrowAddress}" in environment "${mapping.environment}"`,
+        path: ['mappings', i, 'escrowAddress']
+      });
+    }
+    invoiceEnvPairs.add(invEnv);
+    addressEnvPairs.add(addrEnv);
+  });
 });
 
 /**
@@ -158,7 +197,7 @@ function parseEscrowMappingConfig() {
     const raw = JSON.parse(envValue);
     return EscrowMappingConfigSchema.parse(raw);
   } catch (error) {
-    throw new Error(`Failed to parse ESCROW_ADDR_BY_INVOICE JSON: ${error.message}`);
+    throw new EscrowMapConfigError(`Failed to parse ESCROW_ADDR_BY_INVOICE JSON: ${error.message}`);
   }
 }
 
@@ -214,7 +253,7 @@ function isInvoiceAllowlisted(invoiceId, environment) {
  * @returns {string|null} Stellar contract address or null if not found
  * @throws {Error} If invoice ID is invalid or not allowlisted
  */
-function _legacyResolveEscrowAddress(invoiceId, environment) {
+function resolveEscrowAddress(invoiceId, environment) {
   // Input validation
   if (!invoiceId || typeof invoiceId !== 'string') {
     throw new Error('Invoice ID is required and must be a string');
@@ -251,11 +290,19 @@ function _legacyResolveEscrowAddress(invoiceId, environment) {
   // Find mapping for the invoice ID
   const mapping = config.mappings.find(m => 
     m.invoiceId === invoiceId &&
-    m.environment === targetEnv &&
-    m.isActive
+    (m.environment === targetEnv || m.environment === config.defaultEnvironment) &&
+    m.isActive !== false
   );
 
-  const address = mapping ? mapping.escrowAddress : null;
+  // allowlistEnabled doesn't change behavior for resolveEscrowAddress if not found, 
+  // both cases throw EscrowNotFoundError. We keep it strictly matching tests.
+  if (!mapping) {
+    const err = new EscrowNotFoundError(`No active escrow mapping found for invoice ${invoiceId} in environment ${targetEnv}`);
+    err.invoiceId = invoiceId;
+    throw err;
+  }
+
+  const address = mapping.escrowAddress;
 
   // Cache the result if enabled
   if (config.cacheEnabled && address) {
@@ -269,26 +316,6 @@ function _legacyResolveEscrowAddress(invoiceId, environment) {
   }
 
   return address;
-}
-
-/**
- * Resolve the escrow contract address for a given invoiceId.
- *
- * @param {string} invoiceId
- * @returns {string} Stellar contract address (C... or G...)
- * @throws {EscrowNotFoundError} when no active mapping exists
- * @throws {EscrowMapConfigError} when the config JSON is malformed
- */
-function resolveEscrowAddress(invoiceId) {
-  if (!invoiceId || typeof invoiceId !== 'string') {
-    return null;
-  }
-  const targetEnv = getCurrentEnvironment();
-  const config = parseEscrowMappingConfig();
-  const match = config.mappings.find(
-    (m) => m.invoiceId === invoiceId && m.environment === targetEnv && m.isActive !== false
-  );
-  return match ? match.escrowAddress : null;
 }
 
 /**
@@ -468,6 +495,8 @@ module.exports = {
   resolveEscrowAddress,
   resolveInvoiceByAddress,
   isInvoiceAllowlisted,
+  EscrowNotFoundError,
+  EscrowMapConfigError,
   getActiveMappings,
   validateMappingConfig,
   clearCache,

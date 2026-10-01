@@ -69,6 +69,35 @@ const escrowReadPurgeRunsTotal = _counter({
   labelNames: ['status'],
 });
 
+const escrowReadPurgeCoalescedTotal = _counter({
+  name: 'liquifact_escrow_read_purge_coalesced_total',
+  help: 'Total escrow-read purge invocations folded into an already-running sweep',
+});
+
+/**
+ * In-process single-flight handle for the currently executing sweep.
+ *
+ * `null` when no sweep is running; otherwise the in-flight promise. Any
+ * concurrent invocation (a manual admin trigger racing the scheduler, a retry
+ * overlapping a still-running attempt, or two handlers sharing a process)
+ * resolves the *same* promise instead of starting a competing sweep. Without
+ * this, two sweeps run against `escrow_event_projection` at the same time,
+ * both select the same expired tombstones (select-then-delete), and both
+ * invalidate caches and emit metrics for the same rows.
+ *
+ * @type {Promise<object>|null}
+ */
+let _activePurgeRun = null;
+
+/**
+ * Whether a purge sweep is currently executing in this process.
+ *
+ * @returns {boolean} True while a sweep is in flight.
+ */
+function isPurgeRunning() {
+  return _activePurgeRun !== null;
+}
+
 /**
  * Reads the purge cadence.
  *
@@ -89,15 +118,35 @@ function getIntervalMs() {
  * @param {object} [options={}] - Forwarded to
  *   {@link module:services/escrowReadSoftDelete.purgeExpiredSoftDeletes}
  *   (`dbClient`, `now`, `batchSize`, `maxBatches`) — used by tests.
- * @returns {Promise<object>} Purge summary plus `success: true`.
+ * @returns {Promise<object>} Purge summary plus `success: true` and
+ *   `coalesced: boolean` (true when this invocation joined an in-flight sweep).
  * @throws {Error} Re-throws the underlying failure after recording metrics so
  *   the worker's retry policy applies.
  */
 async function runEscrowReadPurge(job = {}, options = {}) {
+  // Single-flight: a concurrent invocation must never start a second sweep.
+  // It joins the in-flight promise and reports itself as coalesced. Only the
+  // owning invocation increments the success/error run counters, so outcomes
+  // are not double-counted.
+  if (_activePurgeRun) {
+    escrowReadPurgeCoalescedTotal.inc();
+    logger.warn(
+      { jobId: job && job.id },
+      'escrowReadPurge: purge already in flight — coalescing run'
+    );
+    const summary = await _activePurgeRun;
+    return { success: true, coalesced: true, ...summary };
+  }
+
   const startedAt = Date.now();
 
+  // Wrap in `Promise.resolve().then` so a synchronously-throwing service still
+  // yields a rejected promise rather than escaping before the guard is set.
+  const run = Promise.resolve().then(() => purgeExpiredSoftDeletes(options));
+  _activePurgeRun = run;
+
   try {
-    const summary = await purgeExpiredSoftDeletes(options);
+    const summary = await run;
 
     escrowReadPurgeRowsDeletedTotal.inc(summary.purged);
     escrowReadPurgeRunsTotal.inc({ status: 'success' });
@@ -115,7 +164,7 @@ async function runEscrowReadPurge(job = {}, options = {}) {
       'escrowReadPurge: run completed'
     );
 
-    return { success: true, ...summary };
+    return { success: true, coalesced: false, ...summary };
   } catch (error) {
     escrowReadPurgeRunsTotal.inc({ status: 'error' });
     logger.error(
@@ -123,6 +172,9 @@ async function runEscrowReadPurge(job = {}, options = {}) {
       'escrowReadPurge: run failed'
     );
     throw error;
+  } finally {
+    // Always release the guard so the next scheduled run can proceed.
+    _activePurgeRun = null;
   }
 }
 
@@ -212,6 +264,7 @@ module.exports = {
   triggerPurge,
   getStats,
   getIntervalMs,
+  isPurgeRunning,
   purgeQueue,
   purgeWorker,
 };
