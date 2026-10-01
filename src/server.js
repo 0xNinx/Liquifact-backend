@@ -8,6 +8,7 @@
 
 const app = require('./index');
 const { validate, logRedactedSummary } = require('./config');
+const { resolvePortFromEnv } = require('./config/listenPort');
 const shutdownCoordinator = require('./utils/shutdownCoordinator');
 
 /**
@@ -30,7 +31,9 @@ function runBootConfigValidation() {
 
 runBootConfigValidation();
 
-const PORT = process.env.PORT || 3001;
+// Same boundary as src/index.js: an invalid PORT throws instead of silently
+// binding a Unix socket at the unparsable path.
+const PORT = resolvePortFromEnv(process.env.PORT);
 
 const server = app.listen(PORT, () => {
   console.log(`LiquiFact API running at http://localhost:${PORT}`);
