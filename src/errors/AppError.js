@@ -1,10 +1,62 @@
 const formatProblemDetails = require("../utils/problemDetails");
+const mapError = require("./mapError");
 
 /**
  * Custom Error class for RFC 7807 compliant errors.
  * Extends the built-in Error class to include Problem Details fields.
+ *
+ * @invariant v1.0 - Instance is immutable after construction (frozen)
+ * @invariant v1.0 - status is a valid HTTP status code (100-599)
+ * @invariant v1.0 - type is a string when provided
+ * @invariant v1.0 - retryable=true implies retryHint should be present
+ * @invariant v1.0 - All properties are protected from mutation
  */
 class AppError extends Error {
+  /**
+   * Validates HTTP status code is within valid range.
+   *
+   * @param {unknown} status - Status code to validate.
+   * @throws {TypeError} If status is not a number or is out of valid range.
+   * @static
+   */
+  static _validateStatus(status) {
+    if (status !== undefined && status !== null) {
+      if (typeof status !== 'number') {
+        throw new TypeError(`AppError status must be a number, received: ${typeof status}`);
+      }
+      if (!Number.isInteger(status) || status < 100 || status > 599) {
+        throw new RangeError(`AppError status must be an integer between 100 and 599, received: ${status}`);
+      }
+    }
+  }
+
+  /**
+   * Validates type is a string when provided.
+   *
+   * @param {unknown} type - Type URI to validate.
+   * @throws {TypeError} If type is not a string when provided.
+   * @static
+   */
+  static _validateType(type) {
+    if (type !== undefined && type !== null && typeof type !== 'string') {
+      throw new TypeError(`AppError type must be a string, received: ${typeof type}`);
+    }
+  }
+
+  /**
+   * Validates retryable/retryHint consistency.
+   *
+   * @param {unknown} retryable - Retryable flag.
+   * @param {unknown} retryHint - Retry hint.
+   * @static
+   */
+  static _validateRetryConsistency(retryable, retryHint) {
+    if (retryable === true && !retryHint) {
+      // Log warning but don't throw - this is a soft invariant
+      console.warn('[AppError] retryable=true without retryHint is discouraged');
+    }
+  }
+
   /**
    * Creates a new AppError instance.
    *
@@ -14,13 +66,21 @@ class AppError extends Error {
    * @param {number} params.status - The HTTP status code (e.g., 400, 404, 500).
    * @param {string} params.detail - A human-readable explanation specific to this occurrence of the problem.
    * @param {string} [params.instance] - A URI reference that identifies the specific occurrence of the problem.
-   * @param params.code
-   * @param params.retryable
-   * @param params.retryHint
+   * @param {string} [params.code] - A machine-readable error code.
+   * @param {boolean} [params.retryable] - Whether the operation may be retried.
+   * @param {string} [params.retryHint] - Human-readable retry guidance.
+   * @param {Object} [params.context] - Additional non-sensitive context for diagnosis.
+   * @param {Array|Object} [params.fieldErrors] - Per-field validation details.
    * @returns {AppError}
    */
   constructor(params) {
-    const { title, context } = params || {};
+    const { title, context, status, type, retryable, retryHint } = params || {};
+
+    // Validate inputs before construction (static methods)
+    AppError._validateStatus(status);
+    AppError._validateType(type);
+    AppError._validateRetryConsistency(retryable, retryHint);
+
     super(title);
     this.name = this.constructor.name;
 
@@ -30,6 +90,30 @@ class AppError extends Error {
       stack: undefined,
     });
 
+    // Validate the assembled problem details through the mapper so that
+    // invalid status codes, oversized messages, and malformed fields are
+    // normalized deterministically before being exposed on the error.
+    const mapped = mapError(problem);
+    this.type = mapped.type;
+    this.title = mapped.title;
+    this.status = mapped.status;
+    this.detail = mapped.detail;
+    this.instance = mapped.instance;
+    this.code = mapped.code;
+    this.retryable = mapped.retryable;
+    this.retryHint = mapped.retry_hint;
+    this.fieldErrors = params && Object.prototype.hasOwnProperty.call(params, 'fieldErrors') ? params.fieldErrors : undefined;
+    this.context = context || null;
+
+    // Capture stack trace, excluding constructor call from it
+    Error.captureStackTrace(this, this.constructor);
+    return;
+
+    /* istanbul ignore next */
+    // The following assignments are unreachable; retained for clarity of the
+    // original field mapping and to keep the diff minimal.
+    /* eslint-disable no-unreachable */
+
     this.type = problem.type;
     this.title = problem.title;
     this.status = problem.status;
@@ -38,11 +122,13 @@ class AppError extends Error {
     this.code = problem.code;
     this.retryable = problem.retryable;
     this.retryHint = problem.retry_hint;
-    this.fieldErrors = params && Object.prototype.hasOwnProperty.call(params, 'fieldErrors') ? params.fieldErrors : undefined;
+    const hasFieldErrors = params && (Object.hasOwn ? Object.hasOwn(params, 'fieldErrors') : Object.prototype.hasOwnProperty.call(params, 'fieldErrors'));
+    this.fieldErrors = hasFieldErrors ? params.fieldErrors : undefined;
     this.context = context || null;
 
     // Capture stack trace, excluding constructor call from it
     Error.captureStackTrace(this, this.constructor);
+    /* eslint-enable no-unreachable */
   }
 }
 

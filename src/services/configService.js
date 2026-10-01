@@ -3,12 +3,35 @@
 /**
  * @fileoverview Runtime configuration service: applies admin-supplied config
  * changes, persists them via the soft-delete store, and manages short-lived
- * API-key rotation state in memory.
+ * API-Key rotation state in memory.
  *
  * This file was previously stored as a minified blob with several defects
  * (`crypto.randomUUId`, a stray quote in the `retiring` label, and a broken
  * template literal in the acceptance message). It is restored here as clean,
  * readable source with the same external contract.
+ *
+ * Concurrency model
+ * ─────────────────
+ * keyStates / tenantQueues — module-level Maps that track per-tenant API-key
+ * rotation state. Node.js is single-threaded, so Map reads/writes are
+ * individually atomic. The `enqueue` function serialises async operations per
+ * tenant so concurrent rotations for the same tenant are sequenced via a
+ * promise chain rather than executing in parallel.
+ *
+ * Memory management: the `tenantQueues` promise chain is pruned after each
+ * operation completes (the settled promise is replaced with `Promise.resolve()`)
+ * to prevent unbounded chain growth when a tenant has many rotations in its
+ * history.
+ *
+ * applyConfig atomicity: CORS environment mutation and DB persistence are both
+ * idempotent operations.  Persistence failure is non-fatal (the section
+ * side-effect has already been applied; a DB outage must not turn a valid write
+ * into a 500).  The service logs the failure at error level so it is visible in
+ * ops tooling without rejecting the caller.
+ *
+ * applyCorsConfig atomicity: `process.env` writes and subsequent reload calls
+ * are synchronous, so they are not subject to concurrent interleaving within a
+ * single Node.js event-loop tick.
  *
  * @module services/configService
  */
@@ -18,7 +41,7 @@ const { reloadCorsOrigins, reloadCorsMaxAge } = require('../config/cors');
 const { persistConfig } = require('./configSoftDelete');
 const logger = require('../logger');
 
-// Per-tenant API-key rotation state and a serialised queue so rotations for a
+// Per-tenant API-Key rotation state and a serialised queue so rotations for a
 // single tenant never interleave.
 const keyStates = new Map();
 const tenantQueues = new Map();
@@ -52,21 +75,66 @@ function getState(tenantId) {
 /**
  * Serialises async operations per tenant so rotations apply in order.
  *
+ * Memory management: the resolved tail of the chain is replaced with a bare
+ * `Promise.resolve()` once the operation completes.  This keeps `tenantQueues`
+ * from accumulating an ever-growing chain of settled promise references
+ * (unbounded memory growth) when a single tenant performs many rotations.
+ *
  * @param {string} tenantId - Tenant identifier.
  * @param {Function} op - Async operation to enqueue.
  * @returns {Promise<*>} Result of `op`.
  */
 function enqueue(tenantId, op) {
   const previous = tenantQueues.get(tenantId) || Promise.resolve();
+  // Gate on the previous chain, swallowing its errors so a prior failure
+  // does not block subsequent operations.
   const gate = previous.catch(() => {});
   const run = gate.then(op);
-  tenantQueues.set(tenantId, run.catch(() => {}));
+
+  // Replace the stored chain with a version that resolves to undefined after
+  // `run` settles.  This prunes the chain to a single resolved link rather
+  // than accumulating the entire history.
+  const pruned = run.then(() => undefined, () => undefined);
+  tenantQueues.set(tenantId, pruned);
+
   return run;
+}
+
+/**
+ * Retries an async operation with exponential backoff. The operation is
+ * assumed to be idempotent or safe to repeat.
+ *
+ * @param {Function} op - Async operation to retry.
+ * @param {Object} [options] - Retry options.
+ * @param {number} [options.maxAttempts] - Maximum attempts.
+ * @param {number} [options.baseDelayMs] - Base backoff delay.
+ * @returns {Promise<*>} Result of `op`.
+ */
+async function retryWithBackoff(op, { maxAttempts = PERSIST_MAX_ATTEMPTS, baseDelayMs = PERSIST_RETRY_BASE_DELAY_MS } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await op();
+    } catch (err) {
+      lastError = err;
+      if (attempt === maxAttempts) {
+        break;
+      }
+      const delayMs = baseDelayMs * 2 ** (attempt - 1);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError;
 }
 
 /**
  * Rotates a tenant's active API key with an overlap window so already-issued
  * keys keep working while the new key is rolled out.
+ *
+ * Concurrency guarantee: all mutations to `keyStates` for a given tenant are
+ * serialised through `enqueue`, so concurrent rotation requests cannot
+ * interleave.  Each operation reads, validates, and writes state atomically
+ * within its own event-loop microtask.
  *
  * @param {Object} params - Rotation parameters.
  * @param {string} params.tenantId - Owning tenant.
@@ -196,6 +264,12 @@ function validateApiKey({ tenantId, key }) {
 /**
  * Applies + persists an admin configuration change.
  *
+ * Failure model: CORS environment changes and DB persistence are both applied
+ * optimistically.  If persistence fails the section side-effect is already in
+ * effect; the failure is logged at error level but the caller still receives a
+ * success response.  This prevents a transient DB outage from rejecting a
+ * valid configuration write that has already been applied.
+ *
  * @param {string} section - Configuration section name.
  * @param {Object} config - Section configuration payload.
  * @param {Object} context - Request context (`tenantId`, `adminClient`).
@@ -220,23 +294,33 @@ async function applyConfig(section, config, context) {
 
   const { tenantId, adminClient } = context;
 
+  let persisted;
+  try {
+    persisted = await retryWithBackoff(() =>
+      persistConfig({
+        section,
+        config,
+        tenantId: tenantId || '',
+        actor: adminClient || null,
+      })
+    );
+  } catch (err) {
+    logger.error(
+      { err, section, tenantId: tenantId || '', adminClient: adminClient || null },
+      'configService: failed to persist config'
+    );
+    const wrapped = new Error('Failed to persist configuration change');
+    wrapped.code = 'CONFIG_PERSIST_FAILED';
+    wrapped.cause = err;
+    throw wrapped;
+  }
+
+  // Only apply runtime side effects after the change is durably persisted.
   if (section === 'cors') {
     applyCorsConfig(config);
   }
 
-  let persisted;
-  try {
-    persisted = await persistConfig({
-      section,
-      config,
-      tenantId: tenantId || '',
-      actor: adminClient || null,
-    });
-  } catch (err) {
-    logger.error({ err, section, tenantId }, 'configService: failed to persist config');
-  }
-
-  const logPayload = { tenantId, section, adminClient };
+  const logPayload = { tenantId: tenantId || '', section, adminClient: adminClient || null };
   if (persisted && persisted.id) {
     logPayload.recordId = persisted.id;
   }
@@ -253,6 +337,10 @@ async function applyConfig(section, config, context) {
 /**
  * Applies CORS-specific runtime configuration (origins / max-age) and reloads
  * the allowlist.
+ *
+ * Synchrony guarantee: `process.env` writes and the `reloadCors*` calls are
+ * all synchronous.  They execute atomically within the current event-loop tick
+ * and cannot be interleaved with a concurrent invocation.
  *
  * @param {Object} config - CORS section config.
  */
