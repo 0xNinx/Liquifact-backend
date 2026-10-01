@@ -101,6 +101,8 @@
  * @property {number}                   statusCode      - Final HTTP status code.
  * @property {number}                   durationSeconds - Request wall-clock duration in seconds.
  * @property {PersistenceCause}         cause           - Normalised error cause label.
+ * @property {boolean}                  success         - Whether the request completed without error.
+ * @property {number}                   errorCount      - 1 when the request failed, 0 otherwise.
  * @property {import('express').Request} [req]          - Express request (for scoped logging).
  */
 
@@ -124,11 +126,18 @@
  */
 function toSmeMetricsResponse(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  const toCount = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) {
+      return 0;
+    }
+    return Math.floor(n);
+  };
   return {
-    open: toNonNegativeInt(obj.open),
-    funded: toNonNegativeInt(obj.funded),
-    settled: toNonNegativeInt(obj.settled),
-    defaulted: toNonNegativeInt(obj.defaulted),
+    open: toCount(obj.open),
+    funded: toCount(obj.funded),
+    settled: toCount(obj.settled),
+    defaulted: toCount(obj.defaulted),
   };
 }
 
@@ -258,40 +267,33 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  * @param {number} raw.statusCode               - HTTP status code.
  * @param {number} raw.durationSeconds          - Wall-clock duration in seconds.
  * @param {string} [raw.cause='none']           - Error cause label (already normalised).
+ * @param {boolean} [raw.success]               - Whether the request succeeded.
+ * @param {number} [raw.errorCount]             - Error count (0 or 1).
  * @param {import('express').Request} [raw.req] - Express request for scoped logging.
  * @returns {PersistenceRecordParams} Normalised DTO.
  */
 function toPersistenceRecordParams(raw) {
   const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
 
-  const endpoint = (typeof obj.endpoint === 'string' && obj.endpoint.length > 0)
-    ? obj.endpoint
-    : 'unknown';
+  const statusCode = Number(obj.statusCode);
+  const safeStatusCode = Number.isFinite(statusCode) && statusCode >= 100 && statusCode <= 599
+    ? Math.floor(statusCode)
+    : 200;
 
-  const statusCode = (() => {
-    const n = Number(obj.statusCode);
-    if (!Number.isFinite(n)) return 200;
-    const i = Math.floor(n);
-    return (Number.isSafeInteger(i) && i >= 100 && i <= 599) ? i : 200;
-  })();
+  const duration = Number(obj.durationSeconds);
+  const safeDuration = Number.isFinite(duration) && duration >= 0 ? duration : 0;
 
-  const durationSeconds = (() => {
-    const n = Number(obj.durationSeconds);
-    return (Number.isFinite(n) && n >= 0) ? n : 0;
-  })();
-
-  const cause = (() => {
-    const c = typeof obj.cause === 'string' ? obj.cause : 'none';
-    return (c === 'validation' || c === 'storage' || c === 'internal' || c === 'none')
-      ? c
-      : 'none';
-  })();
+  const cause = String(obj.cause || 'none');
+  const success = typeof obj.success === 'boolean' ? obj.success : safeStatusCode < 400;
+  const errorCount = Number.isFinite(Number(obj.errorCount)) && Number(obj.errorCount) > 0 ? 1 : (success ? 0 : 1);
 
   return {
-    endpoint,
-    statusCode,
-    durationSeconds,
+    endpoint: String(obj.endpoint || 'unknown'),
+    statusCode: safeStatusCode,
+    durationSeconds: safeDuration,
     cause: /** @type {PersistenceCause} */ (cause),
+    success,
+    errorCount,
     req: obj.req || undefined,
   };
 }
@@ -313,21 +315,14 @@ function isSmeMetricsResponse(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
-  const keys = Object.keys(value);
-  if (keys.length !== 4) {
-    return false;
-  }
-  const required = ['open', 'funded', 'settled', 'defaulted'];
-  for (const key of required) {
-    if (!Object.prototype.hasOwnProperty.call(value, key)) {
-      return false;
-    }
-    const num = value[key];
-    if (!Number.isSafeInteger(num) || num < 0) {
-      return false;
-    }
-  }
-  return true;
+  return (
+    typeof value.endpoint === 'string' &&
+    typeof value.statusCode === 'number' &&
+    typeof value.durationSeconds === 'number' &&
+    typeof value.cause === 'string' &&
+    typeof value.success === 'boolean' &&
+    typeof value.errorCount === 'number'
+  );
 }
 
 module.exports = {

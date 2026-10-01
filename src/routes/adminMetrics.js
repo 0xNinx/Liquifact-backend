@@ -21,8 +21,8 @@ const MAX_ID_LENGTH = 128;
 
 function _resolveActor(req) {
   const jwtActor = req.user && (req.user.sub || req.user.userId || req.user.id);
-  if (jvtActor) {
-    return String(jvtActor);
+  if (jstActor) {
+    return String(jwtActor);
   }
   if (req.apiClient && req.apiClient.clientId) {
     return `api-key:${req.apiClient.clientId}`;

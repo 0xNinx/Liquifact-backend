@@ -15,6 +15,12 @@
  * `src/middleware/idempotency.js` and `src/jobs/idempotencyPurge.js`) and are
  * purged automatically once expired.
  *
+ * Compatibility contract: response payloads for both endpoints are produced
+ * exclusively through the `src/dto/metrics.js` mappers. Handlers must never
+ * construct metric response shapes inline, so DTO-level invariants (stable
+ * keys, null-vs-undefined handling, numeric coercion) are preserved across
+ * error, empty, and upgrade paths.
+ *
  * @module routes/sme/metrics
  */
 
@@ -165,7 +171,7 @@ router.get(
       const { userId, tenantId } = ctx;
 
       const rawMetrics = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
-      const data = toSmeMetricsResponse(rawMetrics);
+      const data = toSmeMetricsResponse(rawMetrics, { tenantId, userId });
 
       // Only schema-validated query values are consumed here. `validateGetMetricsQuery`
       // runs ahead of this handler and rejects the request outright on malformed
@@ -328,3 +334,77 @@ router.get(
  *               type: object
  *       
  */
+router.post(
+  '/metrics/bulk',
+  authenticateToken,
+  extractTenant,
+  express.json({ limit: '100kb' }),
+  optionalIdempotency,
+  validateBulkMetricsBody,
+  async (req, res, next) => {
+    try {
+      const callerCtx = validateMetricsRequest(req, res);
+      if (!callerCtx) {
+        return;
+      }
+
+      const { tenantId: callerTenantId } = callerCtx;
+      const { operations } = req.validated;
+
+      const results = [];
+      let succeeded = 0;
+      let failed = 0;
+
+      for (const op of operations) {
+        const { tenantId, userId } = op;
+
+        if (tenantId !== callerTenantId) {
+          results.push({
+            tenantId,
+            userId,
+            status: 'error',
+            data: null,
+            error: 'Cross-tenant access denied',
+          });
+          failed++;
+          continue;
+        }
+
+        try {
+          const data = await invoiceService.getSmeInvoiceCounts(tenantId, userId);
+          results.push({
+            tenantId,
+            userId,
+            status: 'success',
+            data: toSmeMetricsResponse(data, { tenantId, userId }),
+            error: null,
+          });
+          succeeded++;
+        } catch (err) {
+          results.push({
+            tenantId,
+            userId,
+            status: 'error',
+            data: null,
+            error: err.message || 'Internal error',
+          });
+          failed++;
+        }
+      }
+
+      return res.json({
+        results,
+        meta: {
+          total: operations.length,
+          succeeded,
+          failed,
+          timestamp: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      return next(err);
+    }
+  }
+);
+
+module.exports = router;

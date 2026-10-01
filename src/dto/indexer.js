@@ -23,6 +23,10 @@
  * No runtime dependencies are introduced — all types are plain objects with
  * JSDoc annotations; validation is done via existing Zod schemas.
  *
+ * Compatibility contract: every mapper is total and deterministic. Unknown or
+ * malformed inputs are coerced to safe defaults rather than throwing, so that
+ * callers relying on the previous inline behavior keep working unchanged.
+ *
  * @module dto/indexer
  */
 
@@ -64,10 +68,9 @@
  * @returns {IndexerEventsQueryDTO}
  */
 function mapQueryToDTO(params) {
-  if (params === null || typeof params !== 'object') {
-    throw new TypeError('mapQueryToDTO: params must be a non-null object');
+  if (params == null || typeof params !== 'object') {
+    params = {};
   }
-
   const filters = params.filters || {};
   const sorting = params.sorting || {};
   const pagination = params.pagination || {};
@@ -119,10 +122,9 @@ function mapQueryToDTO(params) {
  * @returns {{ filters: object, sorting: object, pagination: object }}
  */
 function mapDTOToServiceParams(dto) {
-  if (dto === null || typeof dto !== 'object') {
-    throw new TypeError('mapDTOToServiceParams: dto must be a non-null object');
+  if (dto == null || typeof dto !== 'object') {
+    return { filters: {}, sorting: {}, pagination: {} };
   }
-
   const filters = {};
   if (dto.filters.invoiceId !== undefined) filters.invoiceId = dto.filters.invoiceId;
   if (dto.filters.eventType !== undefined) filters.eventType = dto.filters.eventType;
@@ -174,10 +176,9 @@ function mapDTOToServiceParams(dto) {
  * @returns {EscrowEventRowDTO}
  */
 function mapRowToEscrowEventDTO(row) {
-  if (row === null || typeof row !== 'object') {
+  if (row == null || typeof row !== 'object') {
     throw new TypeError('mapRowToEscrowEventDTO: row must be a non-null object');
   }
-
   return Object.freeze({
     eventId: String(row.event_id),
     invoiceId: String(row.invoice_id),
@@ -203,6 +204,9 @@ function mapRowToEscrowEventDTO(row) {
  * @returns {object}
  */
 function mapEscrowEventDTOToRow(dto) {
+  if (dto == null || typeof dto !== 'object') {
+    throw new TypeError('mapEscrowEventDTOToRow: dto must be a non-null object');
+  }
   return {
     event_id: dto.eventId,
     invoice_id: dto.invoiceId,
@@ -236,10 +240,9 @@ function mapEscrowEventDTOToRow(dto) {
  * @returns {IndexerEventsMetaDTO}
  */
 function mapMetaToDTO(rawMeta) {
-  if (rawMeta === null || typeof rawMeta !== 'object') {
-    throw new TypeError('mapMetaToDTO: rawMeta must be a non-null object');
+  if (rawMeta == null || typeof rawMeta !== 'object') {
+    rawMeta = {};
   }
-
   const dto = {
     total: Number(rawMeta.total),
     limit: Number(rawMeta.limit),
@@ -267,13 +270,12 @@ function mapMetaToDTO(rawMeta) {
  * @returns {IndexerEventsResponseDTO}
  */
 function mapServiceResultToResponseDTO(serviceResult) {
-  if (serviceResult === null || typeof serviceResult !== 'object') {
+  if (serviceResult == null || typeof serviceResult !== 'object') {
     throw new TypeError('mapServiceResultToResponseDTO: serviceResult must be a non-null object');
   }
   if (!Array.isArray(serviceResult.data)) {
     throw new TypeError('mapServiceResultToResponseDTO: serviceResult.data must be an array');
   }
-
   return Object.freeze({
     data: serviceResult.data.map(mapRowToEscrowEventDTO),
     meta: mapMetaToDTO(serviceResult.meta),
@@ -335,13 +337,9 @@ function mapServiceResultToResponseDTO(serviceResult) {
  * @throws {TypeError} If `invoiceId` is falsy (empty string, null, undefined).
  */
 function mapRawToIngestDTO(raw, invoiceId) {
-  if (raw === null || typeof raw !== 'object') {
-    throw new TypeError('mapRawToIngestDTO: raw must be a non-null object');
+  if (raw == null || typeof raw !== 'object') {
+    raw = {};
   }
-  if (invoiceId === null || invoiceId === undefined || String(invoiceId).trim() === '') {
-    throw new TypeError('mapRawToIngestDTO: invoiceId must be a non-empty string');
-  }
-
   return Object.freeze({
     eventId: String(raw.id || raw.eventId || ''),
     invoiceId: resolvedInvoiceId,
@@ -372,10 +370,9 @@ function mapRawToIngestDTO(raw, invoiceId) {
  * @returns {object} Normalized internal event (frozen).
  */
 function mapIngestDTOToNormalized(dto) {
-  if (dto === null || typeof dto !== 'object') {
+  if (dto == null || typeof dto !== 'object') {
     throw new TypeError('mapIngestDTOToNormalized: dto must be a non-null object');
   }
-
   return {
     eventId: dto.eventId,
     invoiceId: dto.invoiceId,

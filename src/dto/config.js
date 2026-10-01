@@ -22,6 +22,16 @@
  */
 
 /**
+ * Determine whether a value is a plain object (not null, not array).
+ *
+ * @param {unknown} value - Value to inspect.
+ * @returns {boolean} True when the value is a non-null, non-array object.
+ */
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
  * @typedef {Object} AdminConfigRequestDto
  * @property {string} section - Configuration section name.
  * @property {Record<string, unknown>} config - Section-specific configuration payload.
@@ -138,13 +148,15 @@ function copyConfig(value) {
  */
 function toAdminConfigRequestDto(payload) {
   if (!isPlainObject(payload)) {
-    return { section: "", config: copyConfif(undefined) };
+    return { section: '', config: {} };
   }
 
-  return {
-    section: normalizeSection(payload.section, ""),
-    config: copyConfig(payload.config),
-  };
+  const section = typeof payload.section === 'string' ? payload.section : '';
+  const config = isPlainObject(payload.config)
+    ? { ...payload.config }
+    : {};
+
+  return { section, config };
 }
 
 /**
@@ -154,7 +166,8 @@ function toAdminConfigRequestDto(payload) {
  * @returns {AdminConfigRequestDto} A request DTO with the same boundary shape.
  */
 function fromAdminConfigRequestDto(dto) {
-  return toAdminConfigRequestDto(dto);
+  const normalized = toAdminConfigRequestDto(dto);
+  return { section: normalized.section, config: { ...normalized.config } };
 }
 
 /**
@@ -165,14 +178,16 @@ function fromAdminConfigRequestDto(dto) {
  */
 function toAdminConfigResponseDto(payload) {
   if (!isPlainObject(payload)) {
-    return { section: "", config: copyConfif(undefined), message: "" };
+    return { section: '', config: {}, message: '' };
   }
 
-  return {
-    section: normalizeSection(payload.section, ""),
-    config: copyConfig(payload.config),
-    message: normalizeMessage(payload.message),
-  };
+  const section = typeof payload.section === 'string' ? payload.section : '';
+  const config = isPlainObject(payload.config)
+    ? { ...payload.config }
+    : {};
+  const message = typeof payload.message === 'string' ? payload.message : '';
+
+  return { section, config, message };
 }
 
 /**
@@ -182,7 +197,12 @@ function toAdminConfigResponseDto(payload) {
  * @returns {AdminConfigResponseDto} A response DTO with the same boundary shape.
  */
 function fromAdminConfigResponseDto(dto) {
-  return toAdminConfigResponseDto(dto);
+  const normalized = toAdminConfigResponseDto(dto);
+  return {
+    section: normalized.section,
+    config: { ...normalized.config },
+    message: normalized.message,
+  };
 }
 
 /**
@@ -199,24 +219,7 @@ function toConfigSectionsResponseDto(sections) {
     return { sections: [] };
   }
 
-  const seen = new Set();
-  const normalized = [];
-
-  for (const section of sections) {
-    if (typeof section !== "string") {
-      continue;
-    }
-
-    const trimmed = section.trim();
-    if (trimmed.length === 0 || seen.has(trimmed)) {
-      continue;
-    }
-
-    seen.add(trimmed);
-    normalized.push(trimmed);
-  }
-
-  return { sections: normalized };
+  return { sections: sections.filter((section) => typeof section === 'string').slice() };
 }
 
 /**
@@ -226,7 +229,8 @@ function toConfigSectionsResponseDto(sections) {
  * @returns {ConfigSectionsResponseDto} An idempotent sections DTO.
  */
 function fromConfigSectionsResponseDto(dto) {
-  return toConfigSectionsResponseDto(dto && dto.sections);
+  const sections = isPlainObject(dto) ? dto.sections : undefined;
+  return toConfigSectionsResponseDto(sections);
 }
 
 module.exports = {
