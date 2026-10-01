@@ -13,6 +13,12 @@ const { cacheResponse, makeInvoiceStateKey } = require('../middleware/cache');
 const { getSharedStore } = require('../services/cacheStore');
 const { cacheConfig } = require('../config/cache');
 const { invoiceStateCacheEvictionsTotal } = require('../metrics');
+const {
+  validateTransitionRequest,
+  validateApproveRequest,
+  validateLinkEscrowRequest,
+  validateRejectRequest,
+} = require('../dtos/invoiceStateDtos');
 
 router.use(extractTenant);
 
@@ -140,7 +146,15 @@ router.get('/:id/state', cacheState, async (req, res, next) => {
 });
 
 router.post('/:id/transition', async (req, res, next) => {
-  const { targetState, reason, revision } = req.body || {};
+  const validation = validateTransitionRequest(req.body);
+  if (!validation.success) {
+    return res.status(400).json({
+      ...responseHelper.error('Request validation failed', 'VALIDATION_ERROR', { fieldErrors: validation.fieldErrors }),
+      correlationId: getCorrelationId(req),
+    });
+  }
+
+  const { targetState, reason, revision } = validation.data;
 
   try {
     const context = buildContext(req, { action: 'transition', targetState });
@@ -212,7 +226,16 @@ router.post('/:id/transition', async (req, res, next) => {
  *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
  */
 router.post('/:id/approve', instrumentInvoiceState('approve', async (req, res, next) => {
-  const { reason, revision } = req.body || {};
+  const validation = validateApproveRequest(req.body);
+  if (!validation.success) {
+    return res.status(400).json({
+      ...responseHelper.error('Request validation failed', 'VALIDATION_ERROR', { fieldErrors: validation.fieldErrors }),
+      correlationId: getCorrelationId(req),
+    });
+  }
+
+  const { reason } = validation.data;
+  const { revision } = req.body || {};
 
   try {
     const context = buildContext(req, { action: 'approve' });
@@ -282,7 +305,16 @@ router.post('/:id/approve', instrumentInvoiceState('approve', async (req, res, n
  *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
  */
 router.post('/:id/link-escrow', requireKycForFunding, auditKycAccess, instrumentInvoiceState('link-escrow', async (req, res, next) => {
-  const { escrowId, reason, revision } = req.body || {};
+  const validation = validateLinkEscrowRequest(req.body);
+  if (!validation.success) {
+    return res.status(400).json({
+      ...responseHelper.error('Request validation failed', 'VALIDATION_ERROR', { fieldErrors: validation.fieldErrors }),
+      correlationId: getCorrelationId(req),
+    });
+  }
+
+  const { escrowId, reason } = validation.data;
+  const { revision } = req.body || {};
 
   try {
     const context = buildContext(req, {
@@ -354,7 +386,15 @@ router.post('/:id/link-escrow', requireKycForFunding, auditKycAccess, instrument
  *               $ref: '#/components/schemas/InvoiceStateErrorResponse'
  */
 router.post('/:id/reject', instrumentInvoiceState('reject', async (req, res, next) => {
-  const { reason, revision } = req.body || {};
+  const validation = validateRejectRequest(req.body);
+  if (!validation.success) {
+    return res.status(400).json({
+      ...responseHelper.error('Request validation failed', 'VALIDATION_ERROR', { fieldErrors: validation.fieldErrors }),
+      correlationId: getCorrelationId(req),
+    });
+  }
+
+  const { reason } = validation.data;
 
   try {
     const context = buildContext(req, { action: 'reject' });

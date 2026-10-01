@@ -11,15 +11,9 @@
  * exhaustively unit-tested in isolation from Express / Knex / audit-log
  * concerns, and gives us a typed boundary for safer refactors.
  *
- * Concurrency invariants:
- * - All exported mappers are pure and stateless; they never mutate their
- *   inputs and never retain references to mutable caller-owned objects.
- * - Arrays and nested objects are copied before being returned so two
- *   concurrent callers cannot observe or cause cross-contamination through
- *   shared references.
- * - Mappers are total functions over their documented domain: malformed,
- *   null, or out-of-range inputs produce a deterministic, safe output
- *   rather than throwing or emitting undefined fields.
+ * Validation wrappers integrate with Zod schemas to enforce input boundaries
+ * at the DTO layer, providing deterministic rejection of malformed requests
+ * before they reach the service layer.
  *
  * @module dtos/invoiceStateDtos
  * @version 1.0.0
@@ -29,7 +23,13 @@
  *                 caller mutation. Malformed inputs fall back to safe defaults.
  */
 
-// ----------------------------------------------------------------------------
+const {
+  safeParseTransitionBody,
+  MAX_TRANSITION_REASON_LENGTH,
+  BOUNDED_TARGET_STATES,
+} = require('../schemas/invoiceState');
+
+// ---------------------------------------------------------------------------
 // Request DTOs — inbound shapes parsed (loosely) from request bodies
 // ----------------------------------------------------------------------------
 
@@ -371,9 +371,209 @@ function mapRejectRequest(body) {
   };
 }
 
-// ----------------------------------------------------------------------------
-// Response mappers — internal service object → public DTO
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Validation wrappers — enforce input boundaries at DTO layer
+// ---------------------------------------------------------------------------
+
+/**
+ * Performs common top-level shape validation for request bodies.
+ *
+ * @param {unknown} body - Raw `req.body`.
+ * @param {Record<string, string>} fieldErrors - Error accumulator.
+ * @returns {boolean} True if shape is valid, false otherwise.
+ */
+function validateBodyShape(body, fieldErrors) {
+  if (body === undefined) {
+    fieldErrors._root = 'MISSING_BODY';
+    return false;
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    fieldErrors._root = 'INVALID_BODY_TYPE';
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Validates that only allowed keys are present in the body.
+ *
+ * @param {Record<string, unknown>} body - Parsed body object.
+ * @param {Set<string>} allowedKeys - Set of permitted field names.
+ * @param {Record<string, string>} fieldErrors - Error accumulator.
+ * @returns {void}
+ */
+function validateAllowedKeys(body, allowedKeys, fieldErrors) {
+  for (const key of Object.keys(body)) {
+    if (!allowedKeys.has(key)) {
+      fieldErrors[key] = 'UNRECOGNIZED_FIELD';
+    }
+  }
+}
+
+/**
+ * Validates an optional reason field.
+ *
+ * @param {Record<string, unknown>} body - Parsed body object.
+ * @param {Record<string, string>} fieldErrors - Error accumulator.
+ * @param {boolean} required - Whether reason is required.
+ * @returns {void}
+ */
+function validateReasonField(body, fieldErrors, required = false) {
+  if (!('reason' in body)) {
+    if (required) {
+      fieldErrors.reason = 'MISSING_TRANSITION_REASON';
+    }
+    return;
+  }
+
+  if (typeof body.reason !== 'string') {
+    fieldErrors.reason = 'INVALID_REASON_TYPE';
+    return;
+  }
+
+  if (required && body.reason.trim().length === 0) {
+    fieldErrors.reason = 'MISSING_TRANSITION_REASON';
+    return;
+  }
+
+  if (body.reason.length > MAX_TRANSITION_REASON_LENGTH) {
+    fieldErrors.reason = 'TRANSITION_REASON_TOO_LONG';
+  }
+}
+
+/**
+ * Validates and maps a transition request body.
+ *
+ * Performs semantic validation using the Zod schema to enforce:
+ *   - targetState is a valid invoice state enum value
+ *   - reason (if present) is a string within length bounds
+ *   - revision is a non-negative integer
+ *   - No unrecognized fields (including prototype pollution vectors)
+ *
+ * @param {unknown} body - Raw `req.body`.
+ * @returns {{ success: true, data: { targetState: string, reason?: string, revision?: number, currentState?: string, actor?: string, metadata?: object } } | { success: false, fieldErrors: Record<string, string> }}
+ *   Validation result with either parsed data or field-level error codes.
+ */
+function validateTransitionRequest(body) {
+  return safeParseTransitionBody(body);
+}
+
+/**
+ * Validates and maps an approve request body.
+ *
+ * Enforces:
+ *   - reason (if present) is a string within length bounds
+ *   - No unrecognized fields
+ *
+ * @param {unknown} body - Raw `req.body`.
+ * @returns {{ success: true, data: { reason?: string } } | { success: false, fieldErrors: Record<string, string> }}
+ *   Validation result with either parsed data or field-level error codes.
+ */
+function validateApproveRequest(body) {
+  const fieldErrors = Object.create(null);
+
+  if (!validateBodyShape(body, fieldErrors)) {
+    return { success: false, fieldErrors };
+  }
+
+  /** @type {Record<string, unknown>} */
+  const b = body;
+  validateAllowedKeys(b, new Set(['reason']), fieldErrors);
+  validateReasonField(b, fieldErrors, false);
+
+  if (Object.keys(fieldErrors).length > 0) {
+    return { success: false, fieldErrors };
+  }
+
+  return {
+    success: true,
+    data: {
+      reason: typeof b.reason === 'string' ? b.reason : undefined,
+    },
+  };
+}
+
+/**
+ * Validates and maps a link-escrow request body.
+ *
+ * Enforces:
+ *   - escrowId (if present) is a string
+ *   - reason (if present) is a string within length bounds
+ *   - No unrecognized fields
+ *
+ * @param {unknown} body - Raw `req.body`.
+ * @returns {{ success: true, data: { escrowId: string|null, reason?: string } } | { success: false, fieldErrors: Record<string, string> }}
+ *   Validation result with either parsed data or field-level error codes.
+ */
+function validateLinkEscrowRequest(body) {
+  const fieldErrors = Object.create(null);
+
+  if (!validateBodyShape(body, fieldErrors)) {
+    return { success: false, fieldErrors };
+  }
+
+  /** @type {Record<string, unknown>} */
+  const b = body;
+  validateAllowedKeys(b, new Set(['escrowId', 'reason']), fieldErrors);
+
+  if ('escrowId' in b && b.escrowId !== null && typeof b.escrowId !== 'string') {
+    fieldErrors.escrowId = 'INVALID_ESCROW_ID_TYPE';
+  }
+
+  validateReasonField(b, fieldErrors, false);
+
+  if (Object.keys(fieldErrors).length > 0) {
+    return { success: false, fieldErrors };
+  }
+
+  return {
+    success: true,
+    data: {
+      escrowId: typeof b.escrowId === 'string' ? b.escrowId : null,
+      reason: typeof b.reason === 'string' ? b.reason : undefined,
+    },
+  };
+}
+
+/**
+ * Validates and maps a reject request body.
+ *
+ * Enforces:
+ *   - reason is required and must be a non-empty string
+ *   - reason is within length bounds
+ *   - No unrecognized fields
+ *
+ * @param {unknown} body - Raw `req.body`.
+ * @returns {{ success: true, data: { reason: string } } | { success: false, fieldErrors: Record<string, string> }}
+ *   Validation result with either parsed data or field-level error codes.
+ */
+function validateRejectRequest(body) {
+  const fieldErrors = Object.create(null);
+
+  if (!validateBodyShape(body, fieldErrors)) {
+    return { success: false, fieldErrors };
+  }
+
+  /** @type {Record<string, unknown>} */
+  const b = body;
+  validateAllowedKeys(b, new Set(['reason']), fieldErrors);
+  validateReasonField(b, fieldErrors, true);
+
+  if (Object.keys(fieldErrors).length > 0) {
+    return { success: false, fieldErrors };
+  }
+
+  return {
+    success: true,
+    data: {
+      reason: b.reason,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Response mappers — internal result → public DTO
+// ---------------------------------------------------------------------------
 
 /**
  * Maps the internal invoice-state view into the public `InvoiceStateResponseDto`.
@@ -577,19 +777,20 @@ function mapBulkResponse(results) {
  * recommended for consistency and defensive boundary handling.
  */
 module.exports = {
+  // Request mappers (pure coercion, no validation)
   mapTransitionRequest,
   mapApproveRequest,
   mapLinkEscrowRequest,
   mapRejectRequest,
-  mapInvoiceStateResponse,
-  mapTransitionResponse,
-  mapLinkEscrowResponse,
-  mapHistoryEntry,
-  mapHistoryList,
-  mapBulkOperation,
-  mapBulkResponse,
-  // Exposed for testing and reuse by other boundary modules.
-  asPlainObject,
-  asOptionalString,
-  asSafeString,
+  // Validation wrappers (enforce input boundaries)
+  validateTransitionRequest,
+  validateApproveRequest,
+  validateLinkEscrowRequest,
+  validateRejectRequest,
+  // Response mappers
+  toInvoiceStateResponse,
+  toTransitionResponse,
+  toLinkEscrowResponse,
+  toHistoryEntryDto,
+  toInvoiceHistoryResponse,
 };
