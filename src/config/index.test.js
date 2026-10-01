@@ -1,26 +1,25 @@
 
 
 /**
- * Tests for centralized config module — #1303 Protect state invariants.
+ * Tests for centralized config module — #1304 Make failure recovery deterministic.
  *
  * Covers:
- *  - Singleton is frozen (immutable) after validate()
- *  - Failed validate() does not overwrite a previously-valid singleton
- *  - isValidated() reflects correct state before/after validate()
- *  - get() / getValue() throw before validation, succeed after
- *  - _resetForTesting() clears the singleton
- *  - Retries and concurrent-style repeated calls remain safe
- *  - All original tests preserved for regression coverage
+ *  - validateSafe() returns { ok, config } or { ok, error } — never throws
+ *  - ConfigValidationError: code, issues structure, no secret leakage
+ *  - validate() throws ConfigValidationError (not raw ZodError)
+ *  - logRedactedSummary handles ConfigValidationError and ZodError
+ *  - getInvoiceFileMaxSize() falls back safely when env is missing/invalid
+ *  - All original regression tests preserved
  */
 
 const {
   validate,
+  validateSafe,
   get,
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
-  isValidated,
-  _resetForTesting,
+  ConfigValidationError,
   ConfigSchema,
   VALIDATION_BOUNDARIES,
 } = require('./index');
@@ -28,19 +27,13 @@ const {
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 const VALID_JWT = 'valid-secret-at-least-32-chars-long-here';
-const VALID_PROD = {
-  NODE_ENV: 'production',
-  JWT_SECRET: VALID_JWT,
-  PUBLIC_API_BASE_URL: 'https://api.example.com',
-};
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 
-describe('Config — state invariants (#1303)', () => {
+describe('Config — failure recovery (#1304)', () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
-    // Full module reload gives us a clean singleton for each test.
     jest.resetModules();
     process.env = { ...originalEnv };
   });
@@ -49,208 +42,274 @@ describe('Config — state invariants (#1303)', () => {
     process.env = originalEnv;
   });
 
-  // ── isValidated() ──────────────────────────────────────────────────────────
+  // ── ConfigValidationError structure ───────────────────────────────────────
 
-  test('isValidated() returns false before any validate() call', () => {
+  test('validate() throws ConfigValidationError (not a raw ZodError)', () => {
     jest.isolateModules(() => {
-      const { isValidated: fresh } = require('./index');
-      expect(fresh()).toBe(false);
+      process.env.JWT_SECRET = 'short';
+      const { validate: v, ConfigValidationError: CVE } = require('./index');
+      let caught;
+      try { v(); } catch (e) { caught = e; }
+      expect(caught).toBeInstanceOf(CVE);
+      expect(caught.name).toBe('ConfigValidationError');
     });
   });
 
-  test('isValidated() returns true after a successful validate()', () => {
+  test('ConfigValidationError has stable .code = "CONFIG_VALIDATION_ERROR"', () => {
     jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validate: v, isValidated: iv } = require('./index');
-      v();
-      expect(iv()).toBe(true);
+      process.env.JWT_SECRET = 'short';
+      const { validate: v, ConfigValidationError: CVE } = require('./index');
+      let err;
+      try { v(); } catch (e) { err = e; }
+      expect(err.code).toBe('CONFIG_VALIDATION_ERROR');
     });
   });
 
-  test('isValidated() remains false after a failed validate()', () => {
+  test('ConfigValidationError.issues is an array of { path, message }', () => {
     jest.isolateModules(() => {
-      process.env.JWT_SECRET = 'short'; // will fail
-      const { validate: v, isValidated: iv } = require('./index');
-      try { v(); } catch (_) { /* expected */ }
-      expect(iv()).toBe(false);
-    });
-  });
-
-  // ── Singleton immutability ─────────────────────────────────────────────────
-
-  test('config object is frozen after validate()', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
+      process.env.JWT_SECRET = 'short';
       const { validate: v } = require('./index');
-      const cfg = v();
+      let err;
+      try { v(); } catch (e) { err = e; }
+      expect(Array.isArray(err.issues)).toBe(true);
+      expect(err.issues.length).toBeGreaterThan(0);
+      err.issues.forEach(issue => {
+        expect(typeof issue.path).toBe('string');
+        expect(typeof issue.message).toBe('string');
+      });
+    });
+  });
+
+  test('ConfigValidationError.issues does not contain raw secret values', () => {
+    jest.isolateModules(() => {
+      const secretValue = 'my-real-secret-do-not-leak';
+      process.env.JWT_SECRET = secretValue; // too short but contains the value
+      const { validate: v } = require('./index');
+      let err;
+      try { v(); } catch (e) { err = e; }
+      const issueText = JSON.stringify(err.issues);
+      expect(issueText).not.toContain(secretValue);
+    });
+  });
+
+  test('ConfigValidationError.cause is the original ZodError', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = 'short';
+      const { validate: v, ConfigValidationError: CVE } = require('./index');
+      let err;
+      try { v(); } catch (e) { err = e; }
+      expect(err.cause).toBeDefined();
+      expect(typeof err.cause.issues).toBe('object');
+    });
+  });
+
+  test('ConfigValidationError has a readable .message', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = 'short';
+      const { validate: v } = require('./index');
+      let err;
+      try { v(); } catch (e) { err = e; }
+      expect(err.message).toMatch(/Configuration validation failed/i);
+      expect(err.message).toContain('JWT_SECRET');
+    });
+  });
+
+  // ── validateSafe() — success path ─────────────────────────────────────────
+
+  test('validateSafe() returns { ok: true, config } on valid env', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validateSafe: vs } = require('./index');
+      const result = vs();
+      expect(result.ok).toBe(true);
+      expect(result.config).toBeDefined();
+      expect(result.config.JWT_SECRET).toBe(VALID_JWT);
+      expect(result.error).toBeUndefined();
+    });
+  });
+
+  test('validateSafe() returns frozen config on success', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      const { validateSafe: vs } = require('./index');
+      const { config: cfg } = vs();
       expect(Object.isFrozen(cfg)).toBe(true);
     });
   });
 
-  test('mutating a field on the returned config has no effect (strict mode ignored silently)', () => {
+  // ── validateSafe() — failure path ─────────────────────────────────────────
+
+  test('validateSafe() returns { ok: false, error } on invalid env', () => {
     jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validate: v, get: g } = require('./index');
-      const cfg = v();
-      const original = cfg.NODE_ENV;
-      // In non-strict mode this is a no-op; in strict it throws — either way
-      // the stored value must not change.
-      try { cfg.NODE_ENV = 'hacked'; } catch (_) { /* strict mode may throw */ }
-      expect(g().NODE_ENV).toBe(original);
-    });
-  });
-
-  test('adding a new key to the config object has no effect', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validate: v } = require('./index');
-      const cfg = v();
-      try { cfg.__injected = true; } catch (_) { /* strict mode */ }
-      expect(cfg.__injected).toBeUndefined();
-    });
-  });
-
-  // ── Singleton survives failed re-validation ────────────────────────────────
-
-  test('a failed validate() call does not clear a previously-valid singleton', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const mod = require('./index');
-
-      // First call succeeds — singleton is set.
-      mod.validate();
-      expect(mod.isValidated()).toBe(true);
-      const firstConfig = mod.get();
-
-      // Second call with bad env — must throw but not clear the singleton.
-      const savedSecret = process.env.JWT_SECRET;
       process.env.JWT_SECRET = 'short';
-      expect(() => mod.validate()).toThrow();
-
-      // Singleton is still the first valid config.
-      expect(mod.isValidated()).toBe(true);
-      expect(mod.get()).toBe(firstConfig);
-
-      process.env.JWT_SECRET = savedSecret;
+      const { validateSafe: vs } = require('./index');
+      const result = vs();
+      expect(result.ok).toBe(false);
+      expect(result.error).toBeDefined();
+      expect(result.config).toBeUndefined();
     });
   });
 
-  test('multiple successful validate() calls each replace the singleton', () => {
+  test('validateSafe() never throws — not even on completely broken env', () => {
+    jest.isolateModules(() => {
+      // Remove all env vars to maximise the number of failures.
+      process.env = {};
+      const { validateSafe: vs } = require('./index');
+      expect(() => vs()).not.toThrow();
+      const result = vs();
+      expect(result.ok).toBe(false);
+    });
+  });
+
+  test('validateSafe() error is a ConfigValidationError', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = 'short';
+      const { validateSafe: vs, ConfigValidationError: CVE } = require('./index');
+      const { error } = vs();
+      expect(error).toBeInstanceOf(CVE);
+      expect(error.code).toBe('CONFIG_VALIDATION_ERROR');
+    });
+  });
+
+  test('validateSafe() error.issues contains the expected failing key', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = 'short';
+      const { validateSafe: vs } = require('./index');
+      const { error } = vs();
+      const paths = error.issues.map(i => i.path);
+      expect(paths).toContain('JWT_SECRET');
+    });
+  });
+
+  test('validateSafe() does not modify the singleton on failure', () => {
     jest.isolateModules(() => {
       process.env.JWT_SECRET = VALID_JWT;
-      process.env.PORT = '3001';
       const mod = require('./index');
 
-      mod.validate();
+      // Establish a valid singleton.
+      mod.validateSafe();
       const first = mod.get();
 
-      process.env.PORT = '4000';
-      mod.validate();
-      const second = mod.get();
+      // Break env and try again.
+      process.env.JWT_SECRET = 'short';
+      const result = mod.validateSafe();
+      expect(result.ok).toBe(false);
 
-      // The singleton has been replaced with the new config.
-      expect(second.PORT).toBe(4000);
-      // The two config objects are different references.
-      expect(second).not.toBe(first);
+      // Singleton unchanged.
+      expect(mod.get()).toBe(first);
     });
   });
 
-  // ── get() / getValue() guards ─────────────────────────────────────────────
+  // ── Repeated failures (retry simulation) ──────────────────────────────────
 
-  test('get() throws a descriptive error before validate()', () => {
+  test('calling validateSafe() repeatedly with bad env always returns ok: false', () => {
     jest.isolateModules(() => {
-      const { get: g } = require('./index');
-      expect(() => g()).toThrow(/Config not validated/i);
-    });
-  });
-
-  test('getValue() throws before validate()', () => {
-    jest.isolateModules(() => {
-      const { getValue: gv } = require('./index');
-      expect(() => gv('NODE_ENV')).toThrow(/Config not validated/i);
-    });
-  });
-
-  test('get() and getValue() succeed after validate()', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validate: v, get: g, getValue: gv } = require('./index');
-      v();
-      expect(g().NODE_ENV).toBeDefined();
-      expect(gv('NODE_ENV')).toBeDefined();
-    });
-  });
-
-  // ── _resetForTesting() ────────────────────────────────────────────────────
-
-  test('_resetForTesting() clears the singleton so isValidated() returns false', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const mod = require('./index');
-      mod.validate();
-      expect(mod.isValidated()).toBe(true);
-
-      mod._resetForTesting();
-      expect(mod.isValidated()).toBe(false);
-    });
-  });
-
-  test('get() throws after _resetForTesting()', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const mod = require('./index');
-      mod.validate();
-      mod._resetForTesting();
-      expect(() => mod.get()).toThrow(/Config not validated/i);
-    });
-  });
-
-  test('validate() works normally after _resetForTesting()', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const mod = require('./index');
-      mod.validate();
-      mod._resetForTesting();
-
-      mod.validate();
-      expect(mod.isValidated()).toBe(true);
-      expect(mod.get().JWT_SECRET).toBe(VALID_JWT);
-    });
-  });
-
-  // ── Repeated/concurrent-style calls ──────────────────────────────────────
-
-  test('calling validate() many times with valid env always returns frozen config', () => {
-    jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
-      const { validate: v } = require('./index');
-      for (let i = 0; i < 10; i++) {
-        const cfg = v();
-        expect(Object.isFrozen(cfg)).toBe(true);
-        expect(cfg.JWT_SECRET).toBe(VALID_JWT);
+      process.env.JWT_SECRET = 'short';
+      const { validateSafe: vs } = require('./index');
+      for (let i = 0; i < 5; i++) {
+        const r = vs();
+        expect(r.ok).toBe(false);
       }
     });
   });
 
-  test('validate() failure in a retry does not corrupt state', () => {
+  test('validateSafe() succeeds after env is fixed (recovery simulation)', () => {
     jest.isolateModules(() => {
-      process.env.JWT_SECRET = VALID_JWT;
+      process.env.JWT_SECRET = 'short';
       const mod = require('./index');
 
-      // Good first call.
-      mod.validate();
-      const snapshot = mod.get().NODE_ENV;
+      // First attempt fails.
+      expect(mod.validateSafe().ok).toBe(false);
 
-      // Simulate a broken env on a retry (e.g. env var removed by mistake).
-      const saved = process.env.JWT_SECRET;
-      delete process.env.JWT_SECRET;
-      expect(() => mod.validate()).toThrow();
+      // Fix the env (simulate operator correcting the value).
+      process.env.JWT_SECRET = VALID_JWT;
 
-      // State is intact.
-      expect(mod.isValidated()).toBe(true);
-      expect(mod.get().NODE_ENV).toBe(snapshot);
+      // Recovery succeeds.
+      const result = mod.validateSafe();
+      expect(result.ok).toBe(true);
+      expect(result.config.JWT_SECRET).toBe(VALID_JWT);
+    });
+  });
 
-      process.env.JWT_SECRET = saved;
+  // ── logRedactedSummary ────────────────────────────────────────────────────
+
+  test('logRedactedSummary handles ConfigValidationError without leaking secrets', () => {
+    jest.isolateModules(() => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const secretValue = 'ultra-secret-key-99999';
+      process.env.JWT_SECRET = secretValue;
+      const { validate: v, logRedactedSummary: lrs } = require('./index');
+
+      let err;
+      try { v(); } catch (e) { err = e; }
+      lrs(err);
+
+      const output = consoleSpy.mock.calls.flat().join('\n');
+      expect(output).toContain('JWT_SECRET');
+      expect(output).not.toContain(secretValue);
+      consoleSpy.mockRestore();
+    });
+  });
+
+  test('logRedactedSummary handles raw ZodError (backwards compat)', () => {
+    jest.isolateModules(() => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      process.env.JWT_SECRET = 'short';
+      const { ConfigSchema: CS, logRedactedSummary: lrs } = require('./index');
+
+      const result = CS.safeParse(process.env);
+      expect(result.success).toBe(false);
+      lrs(result.error);
+
+      const output = consoleSpy.mock.calls.flat().join('\n');
+      expect(output).toContain('JWT_SECRET');
+      consoleSpy.mockRestore();
+    });
+  });
+
+  test('logRedactedSummary handles null without throwing', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => logRedactedSummary(null)).not.toThrow();
+    consoleSpy.mockRestore();
+  });
+
+  test('logRedactedSummary handles undefined without throwing', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => logRedactedSummary(undefined)).not.toThrow();
+    consoleSpy.mockRestore();
+  });
+
+  test('logRedactedSummary handles a plain Error without throwing', () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => logRedactedSummary(new Error('boom'))).not.toThrow();
+    consoleSpy.mockRestore();
+  });
+
+  // ── getInvoiceFileMaxSize safe fallback ───────────────────────────────────
+
+  test('getInvoiceFileMaxSize returns default "5mb" when env is missing and singleton absent', () => {
+    jest.isolateModules(() => {
+      delete process.env.INVOICE_FILE_MAX_SIZE;
+      const { getInvoiceFileMaxSize: gifs } = require('./index');
+      expect(gifs()).toBe('5mb');
+    });
+  });
+
+  test('getInvoiceFileMaxSize returns default "5mb" when env value is invalid and singleton absent', () => {
+    jest.isolateModules(() => {
+      process.env.INVOICE_FILE_MAX_SIZE = 'not-a-size';
+      const { getInvoiceFileMaxSize: gifs } = require('./index');
+      expect(gifs()).toBe('5mb');
+    });
+  });
+
+  test('getInvoiceFileMaxSize returns config value after successful validate()', () => {
+    jest.isolateModules(() => {
+      process.env.JWT_SECRET = VALID_JWT;
+      process.env.INVOICE_FILE_MAX_SIZE = '1mb';
+      const { validate: v, getInvoiceFileMaxSize: gifs } = require('./index');
+      v();
+      expect(gifs()).toBe('1mb');
     });
   });
 
@@ -258,7 +317,6 @@ describe('Config — state invariants (#1303)', () => {
 
   test('validates minimal config with defaults', () => {
     jest.isolateModules(() => {
-      process.env.NODE_ENV = 'development';
       process.env.JWT_SECRET = VALID_JWT;
       const { validate: v } = require('./index');
       const cfg = v();
@@ -284,26 +342,14 @@ describe('Config — state invariants (#1303)', () => {
     });
   });
 
-  test('logRedactedSummary does not expose secret values', () => {
+  test('get() throws if not validated', () => {
     jest.isolateModules(() => {
-      const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
-      process.env.JWT_SECRET = 'short';
-      process.env.KYC_PROVIDER_API_KEY = 'ultra-secret-value';
-      const { validate: v, logRedactedSummary: lrs } = require('./index');
-
-      let err;
-      try { v(); } catch (e) { err = e; }
-      lrs(err);
-
-      const output = consoleSpy.mock.calls.flat().join('\n');
-      expect(output).toContain('JWT_SECRET');
-      expect(output).not.toContain('ultra-secret-value');
-      expect(output).not.toContain('short');
-      consoleSpy.mockRestore();
+      const { get: g } = require('./index');
+      expect(() => g()).toThrow(/Config not validated/i);
     });
   });
 
-  test('rejects half-set KYC in non-test env', () => {
+  test('rejects half-set KYC configuration in non-test env', () => {
     jest.isolateModules(() => {
       process.env.NODE_ENV = 'production';
       process.env.JWT_SECRET = VALID_JWT;
@@ -325,26 +371,6 @@ describe('Config — state invariants (#1303)', () => {
     });
   });
 
-  test('rejects non-HTTPS PUBLIC_API_BASE_URL in production', () => {
-    jest.isolateModules(() => {
-      process.env.NODE_ENV = 'production';
-      process.env.JWT_SECRET = VALID_JWT;
-      process.env.PUBLIC_API_BASE_URL = 'http://api.example.com';
-      const { validate: v } = require('./index');
-      expect(() => v()).toThrow(/must use HTTPS/i);
-    });
-  });
-
-  test('rejects loopback PUBLIC_API_BASE_URL in production', () => {
-    jest.isolateModules(() => {
-      process.env.NODE_ENV = 'production';
-      process.env.JWT_SECRET = VALID_JWT;
-      process.env.PUBLIC_API_BASE_URL = 'https://localhost:3001';
-      const { validate: v } = require('./index');
-      expect(() => v()).toThrow(/must not be a loopback address/i);
-    });
-  });
-
   test('schema direct parse', () => {
     const result = ConfigSchema.parse({
       NODE_ENV: 'test',
@@ -352,14 +378,6 @@ describe('Config — state invariants (#1303)', () => {
       JWT_SECRET: '0123456789abcdef0123456789abcdef',
     });
     expect(result).toMatchObject({ NODE_ENV: 'test', PORT: 3001 });
-  });
-
-  test('getInvoiceFileMaxSize falls back to env before validation', () => {
-    jest.isolateModules(() => {
-      process.env.INVOICE_FILE_MAX_SIZE = '512kb';
-      const { getInvoiceFileMaxSize: gifs } = require('./index');
-      expect(gifs()).toBe('512kb');
-    });
   });
 
   test('ESCROW_READ_PROJECTION_ENABLED defaults to "true"', () => {

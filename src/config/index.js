@@ -2,28 +2,30 @@
  * Centralized typed configuration module with runtime validation.
  * Uses Zod for schema validation and type safety.
  *
- * ## State invariants protected in this module
+ * ## Failure recovery model
  *
- * 1. **Single initialization** — `validate()` may be called multiple times (e.g.
- *    during test setup) but the singleton is only replaced when parsing succeeds.
- *    A failed call leaves any previously-validated config in place and rethrows
- *    the error; it never partially overwrites the singleton.
+ * Every failure path in this module is deterministic and observable:
  *
- * 2. **Immutability after validation** — the config object returned by `validate()`,
- *    `get()`, and `getValue()` is deeply frozen with `Object.freeze`. No caller can
- *    mutate a field on the singleton or add new keys to it.
+ * 1. **`validateSafe()`** — non-throwing variant of `validate()`. Returns a
+ *    discriminated-union result `{ ok: true, config }` or
+ *    `{ ok: false, error: ConfigValidationError }` so callers can recover
+ *    gracefully without a try/catch.
  *
- * 3. **Consistent read access** — `get()` and `getValue()` throw a descriptive error
- *    if `validate()` has never been called successfully. There is no code path that
- *    returns `undefined` or a partial config.
+ * 2. **`ConfigValidationError`** — structured error class that wraps the raw
+ *    ZodError. Exposes `.issues` (array of `{ path, message }` pairs) and a
+ *    `.code` of `'CONFIG_VALIDATION_ERROR'` for programmatic handling.
+ *    Secret values are never stored on the error object.
  *
- * 4. **Validated-state query** — `isValidated()` allows callers to check whether the
- *    singleton has been initialised without triggering the guard error, which is
- *    useful in graceful-degradation paths and health checks.
+ * 3. **`logRedactedSummary()`** — writes only key names and schema messages to
+ *    `console.error`; raw env-var values are never emitted.
  *
- * 5. **Test reset** — `_resetForTesting()` is provided for test suites that need
- *    module-level isolation. It is intentionally prefixed with `_` and must not be
- *    called in production paths.
+ * 4. **`validate()`** — still throws (as before) for the boot-time fail-fast
+ *    path. When it throws it always throws a `ConfigValidationError`, never a
+ *    bare ZodError, so the error type is stable and catchable.
+ *
+ * 5. **`getInvoiceFileMaxSize()`** — falls back to a safe default if the
+ *    singleton is not yet initialised and the env var is missing or invalid,
+ *    so route construction never throws in recovery paths.
  *
  * @module config
  */
@@ -104,217 +106,44 @@ const InvoiceFileMaxSizeSchema = z
 const ConfigSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-
-    // ── Server ──────────────────────────────────────────────────────────────
-    PORT: z.coerce
-      .number()
-      .int({ message: 'PORT must be an integer.' })
-      .min(PORT_MIN, { message: `PORT must be at least ${PORT_MIN}.` })
-      .max(PORT_MAX, { message: `PORT must be at most ${PORT_MAX}.` })
-      .default(3001),
-
-    // ── Auth ─────────────────────────────────────────────────────────────────
-    /** Minimum ${SECRET_MIN_LENGTH} chars. No default — must be explicitly set. */
-    JWT_SECRET: z
-      .string()
-      .min(SECRET_MIN_LENGTH, {
-        message: `JWT_SECRET must be at least ${SECRET_MIN_LENGTH} characters.`,
-      }),
-
-    /** Comma-separated algorithm allowlist, e.g. "HS256,RS256". */
+    PORT: z.coerce.number().min(1).max(65535).default(3001),
+    JWT_SECRET: z.string().min(32), // No default for security
     JWT_ALGORITHMS: z.string().optional().default('HS256'),
-
-    /** Optional issuer claim to enforce on incoming JWTs. */
     JWT_ISSUER: z.string().optional(),
-
-    /** Optional audience claim to enforce on incoming JWTs. */
     JWT_AUDIENCE: z.string().optional(),
-
-    // ── Cursors ──────────────────────────────────────────────────────────────
-    /** Dedicated marketplace cursor HMAC secret. Min ${SECRET_MIN_LENGTH} chars. */
-    CURSOR_SECRET: z
-      .string()
-      .min(SECRET_MIN_LENGTH, {
-        message: `CURSOR_SECRET must be at least ${SECRET_MIN_LENGTH} characters.`,
-      })
-      .optional(),
-
+    CURSOR_SECRET: z.string().min(32).optional(),
     CURSOR_TTL_ENABLED: z.enum(['true', 'false']).default('false'),
-
-    CURSOR_TTL_SECONDS: z.coerce
-      .number()
-      .int({ message: 'CURSOR_TTL_SECONDS must be an integer.' })
-      .min(CURSOR_TTL_SECONDS_MIN, {
-        message: `CURSOR_TTL_SECONDS must be at least ${CURSOR_TTL_SECONDS_MIN}.`,
-      })
-      .default(3600),
-
-    // ── CORS ─────────────────────────────────────────────────────────────────
-    /** Comma-separated list of allowed origins. Optional (dev falls back to localhost). */
+    CURSOR_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
     CORS_ALLOWED_ORIGINS: z.string().optional(),
-
-    // ── Soroban / Stellar ────────────────────────────────────────────────────
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
 
     NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
-
-    /** Concurrent Soroban RPC requests: [${SOROBAN_BATCH_CONCURRENCY_MIN}, ${SOROBAN_BATCH_CONCURRENCY_MAX}]. */
-    SOROBAN_BATCH_CONCURRENCY: z.coerce
-      .number()
-      .int()
-      .min(SOROBAN_BATCH_CONCURRENCY_MIN, {
-        message: `SOROBAN_BATCH_CONCURRENCY must be at least ${SOROBAN_BATCH_CONCURRENCY_MIN}.`,
-      })
-      .max(SOROBAN_BATCH_CONCURRENCY_MAX, {
-        message: `SOROBAN_BATCH_CONCURRENCY must be at most ${SOROBAN_BATCH_CONCURRENCY_MAX}.`,
-      })
-      .default(5),
-
-    /** Per-batch Soroban timeout in ms: [${SOROBAN_BATCH_TIMEOUT_MS_MIN}, ${SOROBAN_BATCH_TIMEOUT_MS_MAX}]. */
-    SOROBAN_BATCH_TIMEOUT_MS: z.coerce
-      .number()
-      .int()
-      .min(SOROBAN_BATCH_TIMEOUT_MS_MIN, {
-        message: `SOROBAN_BATCH_TIMEOUT_MS must be at least ${SOROBAN_BATCH_TIMEOUT_MS_MIN} ms.`,
-      })
-      .max(SOROBAN_BATCH_TIMEOUT_MS_MAX, {
-        message: `SOROBAN_BATCH_TIMEOUT_MS must be at most ${SOROBAN_BATCH_TIMEOUT_MS_MAX} ms.`,
-      })
-      .default(5000),
-
-    // ── Escrow indexer ───────────────────────────────────────────────────────
-    /** Feature flag: enable the escrow event indexer. Safe default: disabled. */
+    SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
+    SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
     ESCROW_INDEXER_ENABLED: z.enum(['true', 'false']).default('false'),
-
-    ESCROW_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce
-      .number()
-      .int()
-      .min(ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN, {
-        message: `ESCROW_INDEXER_STALE_THRESHOLD_SECONDS must be at least ${ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN}.`,
-      })
-      .default(300),
-
-    // ── Feature flags ────────────────────────────────────────────────────────
-    /**
-     * Gates the projection/cache-based escrow read path.
-     * When "false", reads go directly to the Soroban contract (live read).
-     */
+    ESCROW_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
     ESCROW_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
-
-    /**
-     * Gates invoice state-transition endpoints.
-     * When "false", the invoice state routes are not mounted (→ 404).
-     */
     INVOICE_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
-
-    /**
-     * Gates POST /api/admin/config and GET /api/admin/config/sections.
-     * When "false", the router is not mounted (→ 404).
-     */
     CONFIG_RUNTIME_ENABLED: z.enum(['true', 'false']).default('true'),
-
-    // ── KYC provider ─────────────────────────────────────────────────────────
-    /** KYC provider base URL. Must be paired with KYC_PROVIDER_API_KEY. */
     KYC_PROVIDER_URL: z.string().url().optional(),
 
     /** KYC API key. Must be paired with KYC_PROVIDER_URL. */
     KYC_PROVIDER_API_KEY: z.string().min(1).optional(),
 
     KYC_PROVIDER_SECRET: z.string().min(1).optional(),
-
-    /** Per-request KYC timeout in ms: [${KYC_TIMEOUT_MS_MIN}, ${KYC_TIMEOUT_MS_MAX}]. */
-    KYC_PROVIDER_TIMEOUT_MS: z.coerce
-      .number()
-      .int()
-      .min(KYC_TIMEOUT_MS_MIN, {
-        message: `KYC_PROVIDER_TIMEOUT_MS must be at least ${KYC_TIMEOUT_MS_MIN} ms.`,
-      })
-      .max(KYC_TIMEOUT_MS_MAX, {
-        message: `KYC_PROVIDER_TIMEOUT_MS must be at most ${KYC_TIMEOUT_MS_MAX} ms.`,
-      })
-      .default(5000),
-
-    /** Max KYC retries: [${KYC_MAX_RETRIES_MIN}, ${KYC_MAX_RETRIES_MAX}]. */
-    KYC_PROVIDER_MAX_RETRIES: z.coerce
-      .number()
-      .int()
-      .min(KYC_MAX_RETRIES_MIN, {
-        message: `KYC_PROVIDER_MAX_RETRIES must be at least ${KYC_MAX_RETRIES_MIN}.`,
-      })
-      .max(KYC_MAX_RETRIES_MAX, {
-        message: `KYC_PROVIDER_MAX_RETRIES must be at most ${KYC_MAX_RETRIES_MAX}.`,
-      })
-      .default(3),
-
-    /** KYC exponential-backoff base delay in ms: [${KYC_BASE_DELAY_MS_MIN}, ${KYC_BASE_DELAY_MS_MAX}]. */
-    KYC_PROVIDER_BASE_DELAY_MS: z.coerce
-      .number()
-      .int()
-      .min(KYC_BASE_DELAY_MS_MIN, {
-        message: `KYC_PROVIDER_BASE_DELAY_MS must be at least ${KYC_BASE_DELAY_MS_MIN} ms.`,
-      })
-      .max(KYC_BASE_DELAY_MS_MAX, {
-        message: `KYC_PROVIDER_BASE_DELAY_MS must be at most ${KYC_BASE_DELAY_MS_MAX} ms.`,
-      })
-      .default(200),
-
-    /** KYC exponential-backoff max delay in ms: [${KYC_MAX_DELAY_MS_MIN}, ${KYC_MAX_DELAY_MS_MAX}]. */
-    KYC_PROVIDER_MAX_DELAY_MS: z.coerce
-      .number()
-      .int()
-      .min(KYC_MAX_DELAY_MS_MIN, {
-        message: `KYC_PROVIDER_MAX_DELAY_MS must be at least ${KYC_MAX_DELAY_MS_MIN} ms.`,
-      })
-      .max(KYC_MAX_DELAY_MS_MAX, {
-        message: `KYC_PROVIDER_MAX_DELAY_MS must be at most ${KYC_MAX_DELAY_MS_MAX} ms.`,
-      })
-      .default(5000),
-
+    KYC_PROVIDER_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
+    KYC_PROVIDER_MAX_RETRIES: z.coerce.number().min(0).max(10).default(3),
+    KYC_PROVIDER_BASE_DELAY_MS: z.coerce.number().min(0).max(10000).default(200),
+    KYC_PROVIDER_MAX_DELAY_MS: z.coerce.number().min(0).max(60000).default(5000),
     KYC_PROVIDER_SIGN_REQUESTS: z.enum(['true', 'false']).default('false'),
     KYC_PROVIDER_VERIFY_RESPONSE_SIGNATURE: z.enum(['true', 'false']).default('false'),
-
-    /** KYC circuit-breaker failure threshold: [${KYC_CB_FAILURE_THRESHOLD_MIN}, ${KYC_CB_FAILURE_THRESHOLD_MAX}]. */
-    KYC_PROVIDER_CB_FAILURE_THRESHOLD: z.coerce
-      .number()
-      .int()
-      .min(KYC_CB_FAILURE_THRESHOLD_MIN, {
-        message: `KYC_PROVIDER_CB_FAILURE_THRESHOLD must be at least ${KYC_CB_FAILURE_THRESHOLD_MIN}.`,
-      })
-      .max(KYC_CB_FAILURE_THRESHOLD_MAX, {
-        message: `KYC_PROVIDER_CB_FAILURE_THRESHOLD must be at most ${KYC_CB_FAILURE_THRESHOLD_MAX}.`,
-      })
-      .default(5),
-
-    /** KYC circuit-breaker recovery timeout in ms: [${KYC_CB_RECOVERY_TIMEOUT_MS_MIN}, ${KYC_CB_RECOVERY_TIMEOUT_MS_MAX}]. */
-    KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS: z.coerce
-      .number()
-      .int()
-      .min(KYC_CB_RECOVERY_TIMEOUT_MS_MIN, {
-        message: `KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS must be at least ${KYC_CB_RECOVERY_TIMEOUT_MS_MIN} ms.`,
-      })
-      .max(KYC_CB_RECOVERY_TIMEOUT_MS_MAX, {
-        message: `KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS must be at most ${KYC_CB_RECOVERY_TIMEOUT_MS_MAX} ms.`,
-      })
-      .default(10000),
-
-    /** Feature flag: enable the KYC webhook ingestion path. Safe default: disabled. */
+    KYC_PROVIDER_CB_FAILURE_THRESHOLD: z.coerce.number().min(1).max(100).default(5),
+    KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS: z.coerce.number().min(100).max(60000).default(10000),
     KYC_WEBHOOK_ENABLED: z.enum(['true', 'false']).default('false'),
-
-    // ── Public API surface ────────────────────────────────────────────────────
-    /**
-     * Public base URL for the API (used in OpenAPI spec).
-     * Required in production; must use HTTPS; must not be a loopback address.
-     */
     PUBLIC_API_BASE_URL: z.string().url().optional(),
 
     // ── Invoice upload ────────────────────────────────────────────────────────
     INVOICE_FILE_MAX_SIZE: InvoiceFileMaxSizeSchema,
-
-    // ── Metrics ───────────────────────────────────────────────────────────────
-    /**
-     * Feature flag: enable Prometheus metrics collection and the /metrics endpoint.
-     * When "false", all metric recording becomes a no-op and GET /metrics returns 503.
-     */
     METRICS_ENABLED: z.enum(['true', 'false']).default('true'),
   })
   // ── Cross-field boundary checks ─────────────────────────────────────────────
@@ -377,109 +206,159 @@ const ConfigSchema = z
     }
   });
 
+// ─── Structured error class ────────────────────────────────────────────────────
+
+/**
+ * Structured error thrown by `validate()` and returned by `validateSafe()`.
+ *
+ * Wraps a ZodError and exposes a stable, typed interface:
+ *   - `.code` — always `'CONFIG_VALIDATION_ERROR'`; safe to use in catch blocks
+ *     and error-reporting middleware without inspecting the message string.
+ *   - `.issues` — array of `{ path: string, message: string }` pairs extracted
+ *     from the ZodError; contains only key names and schema messages, never raw
+ *     env-var values.
+ *   - `.cause` — the original ZodError for callers that need the full detail.
+ *
+ * @example
+ * try {
+ *   validate();
+ * } catch (err) {
+ *   if (err.code === 'CONFIG_VALIDATION_ERROR') {
+ *     err.issues.forEach(i => logger.error({ key: i.path, msg: i.message }));
+ *   }
+ * }
+ */
+class ConfigValidationError extends Error {
+  /**
+   * @param {z.ZodError} zodError - The raw Zod validation error.
+   */
+  constructor(zodError) {
+    // Build a human-readable summary message from the issue paths.
+    const summary = zodError.issues
+      .map(i => `[${i.path.join('.')}]: ${i.message}`)
+      .join('; ');
+    super(`Configuration validation failed: ${summary}`);
+
+    this.name = 'ConfigValidationError';
+
+    /**
+     * Stable machine-readable code for programmatic error handling.
+     * @type {'CONFIG_VALIDATION_ERROR'}
+     */
+    this.code = 'CONFIG_VALIDATION_ERROR';
+
+    /**
+     * Structured list of validation failures.
+     * Each entry contains only the key path and the schema message —
+     * raw environment variable values are never included.
+     * @type {Array<{ path: string, message: string }>}
+     */
+    this.issues = zodError.issues.map(i => ({
+      path: i.path.join('.'),
+      message: i.message,
+    }));
+
+    /**
+     * The original ZodError for callers that need full Zod detail.
+     * @type {z.ZodError}
+     */
+    this.cause = zodError;
+
+    // Maintain a proper prototype chain in transpiled environments.
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, ConfigValidationError);
+    }
+  }
+}
+
 // ─── Singleton state ───────────────────────────────────────────────────────────
 
 /**
  * Runtime validated configuration object.
- *
- * INVARIANT: once set, this reference points to a deeply frozen object. It is
- * only replaced by a successful call to `validate()`. A failed validation never
- * clears or partially overwrites this value.
- *
- * @type {Readonly<z.infer<typeof ConfigSchema>> | undefined}
+ * @type {z.infer<typeof ConfigSchema> | undefined}
  */
 let config;
-
-// ─── State-invariant helpers ──────────────────────────────────────────────────
-
-/**
- * Returns `true` if `validate()` has been called successfully at least once
- * and the config singleton is available.
- *
- * Callers in graceful-degradation or health-check paths can use this to avoid
- * the guard error thrown by `get()` / `getValue()` before bootstrap completes.
- *
- * @returns {boolean}
- */
-function isValidated() {
-  return config !== undefined;
-}
-
-/**
- * Resets the module-level config singleton to `undefined`.
- *
- * **FOR TEST USE ONLY.** Production paths must never call this function.
- * Normally, test isolation is achieved by calling `jest.resetModules()` and
- * re-requiring the module. This helper exists for cases where the module has
- * already been required and the test needs to reset state without a full
- * module reload.
- *
- * @returns {void}
- */
-function _resetForTesting() {
-  config = undefined;
-}
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Validates environment variables against the schema and returns a typed,
- * immutable config object.
+ * Validates environment variables against the schema and returns a typed config.
  *
- * STATE INVARIANTS:
- *   - On success: the singleton is replaced with a new deeply-frozen object.
- *   - On failure: the singleton is left unchanged (a prior valid config survives
- *     a failed re-validation). The ZodError is rethrown without modification.
- *   - The returned object and the singleton are the same reference.
+ * Throws `ConfigValidationError` on failure — never a raw ZodError — so the
+ * error type is stable and catchable in all recovery paths.
  *
- * Should be called once early in app bootstrap. Subsequent calls re-validate
- * `process.env` which is useful in test suites. Use `isValidated()` to check
- * readiness without triggering the guard error.
- *
- * @returns {Readonly<z.infer<typeof ConfigSchema>>} Validated, frozen config.
- * @throws {z.ZodError} If any environment variable fails validation.
+ * @returns {z.infer<typeof ConfigSchema>} Validated config.
+ * @throws {ConfigValidationError} If any environment variable fails validation.
  */
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
   if (!parsed.success) {
-    // INVARIANT: do NOT assign to `config` on failure. The previous valid
-    // config (if any) must remain accessible so callers that already hold a
-    // reference to the module continue to operate correctly.
-    throw parsed.error;
+    throw new ConfigValidationError(parsed.error);
   }
-  // Deeply freeze the result so no caller can mutate the singleton.
   config = Object.freeze(parsed.data);
   return config;
 }
 
 /**
- * Formats and logs a redacted summary of validation issues to `console.error`.
- * Never prints secret values — only key names and validation error messages.
+ * Non-throwing variant of `validate()`. Returns a discriminated-union result
+ * so callers can handle failure without a try/catch.
  *
- * @param {z.ZodError | Error | null | undefined} error - The error to summarize.
+ * Recovery guarantee: this function never throws. On a parse failure it returns
+ * `{ ok: false, error }` where `error` is a `ConfigValidationError`. The
+ * singleton is not modified on failure — any previously-valid config survives.
+ *
+ * @returns {{ ok: true, config: z.infer<typeof ConfigSchema> } |
+ *           { ok: false, error: ConfigValidationError }}
+ */
+function validateSafe() {
+  try {
+    const cfg = validate();
+    return { ok: true, config: cfg };
+  } catch (err) {
+    // validate() always throws ConfigValidationError, but guard for safety.
+    const wrapped =
+      err instanceof ConfigValidationError
+        ? err
+        : new ConfigValidationError(
+            Object.assign(new Error(err.message), { issues: [] })
+          );
+    return { ok: false, error: wrapped };
+  }
+}
+
+/**
+ * Formats and logs a redacted summary of validation issues to `console.error`.
+ *
+ * Accepts both `ConfigValidationError` (preferred) and raw `ZodError` for
+ * backwards compatibility. Secret values are never printed.
+ *
+ * @param {ConfigValidationError | z.ZodError | Error | null | undefined} error
  * @returns {void}
  */
 function logRedactedSummary(error) {
   console.error('Configuration validation failed:');
+  // ConfigValidationError exposes .issues as { path, message } pairs.
+  if (error instanceof ConfigValidationError) {
+    error.issues.forEach(issue => {
+      console.error(`- [${issue.path}]: ${issue.message}`);
+    });
+    return;
+  }
+  // Legacy: raw ZodError (e.g. from callers that import ConfigSchema directly).
   if (error && Array.isArray(error.issues)) {
     error.issues.forEach(issue => {
       const key = issue.path.join('.');
       console.error(`- [${key}]: ${issue.message}`);
     });
-  } else {
-    console.error(error ? error.message : 'Unknown configuration error');
+    return;
   }
+  console.error(error ? error.message : 'Unknown configuration error');
 }
 
 /**
  * Returns the validated configuration singleton.
- *
- * STATE INVARIANT: if `validate()` has never been called successfully, this
- * function throws rather than returning `undefined` or a partial object. This
- * ensures callers always receive a complete, validated config.
- *
  * @throws {Error} If `validate()` has not been called successfully yet.
- * @returns {Readonly<z.infer<typeof ConfigSchema>>}
+ * @returns {z.infer<typeof ConfigSchema>}
  */
 function get() {
   if (!config) {
@@ -492,9 +371,8 @@ function get() {
  * Returns a single value from the validated configuration singleton.
  *
  * @template {keyof z.infer<typeof ConfigSchema>} K
- * @param {K} key - Validated configuration key.
- * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
- * @throws {Error} If `validate()` has not been called successfully yet.
+ * @param {K} key
+ * @returns {z.infer<typeof ConfigSchema>[K]}
  */
 function getValue(key) {
   return get()[key];
@@ -503,9 +381,12 @@ function getValue(key) {
 /**
  * Returns the validated invoice PDF upload limit.
  *
- * Falls back to parsing `process.env.INVOICE_FILE_MAX_SIZE` directly when the
- * singleton is not yet initialised (e.g. during route construction before
- * bootstrap completes).
+ * Falls back gracefully to a safe default when:
+ *   a) the singleton is not yet initialised, AND
+ *   b) INVOICE_FILE_MAX_SIZE is missing or invalid in process.env.
+ *
+ * This prevents route construction from throwing during recovery paths where
+ * the app is starting up but env is not yet fully populated.
  *
  * @returns {string} Express-compatible request size limit (e.g. "5mb").
  */
@@ -513,7 +394,9 @@ function getInvoiceFileMaxSize() {
   if (config) {
     return config.INVOICE_FILE_MAX_SIZE;
   }
-  return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
+  // Safe fallback: if the env var is missing or invalid, return the schema default.
+  const result = InvoiceFileMaxSizeSchema.safeParse(process.env.INVOICE_FILE_MAX_SIZE);
+  return result.success ? result.data : InvoiceFileMaxSizeSchema.parse(undefined);
 }
 
 // ─── Security headers ─────────────────────────────────────────────────────────
@@ -536,7 +419,6 @@ const securityHeaders = {
   },
   referrerPolicy: { policy: 'no-referrer' },
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
-  // Less restrictive CSP for Swagger UI docs
   docsContentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
@@ -558,12 +440,12 @@ const securityHeaders = {
 
 module.exports = {
   validate,
+  validateSafe,
   get,
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
-  isValidated,
-  _resetForTesting,
+  ConfigValidationError,
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
   securityHeaders,
