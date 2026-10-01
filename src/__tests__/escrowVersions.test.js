@@ -24,6 +24,8 @@ const {
   isValidContractId,
   compareVersions,
   getOnChainSchemaVersion,
+  assertRegistryInvariants,
+  freezeRegistry,
 } = require('../config/escrowVersions');
 
 const {
@@ -79,6 +81,77 @@ describe('REGISTRY', () => {
     expect(REGISTRY['1.0.0']).toBe(1);
     expect(REGISTRY['1.1.0']).toBe(2);
     expect(REGISTRY['1.2.0']).toBe(3);
+  });
+
+  it('is frozen so callers cannot mutate the shared registry', () => {
+    expect(Object.isFrozen(REGISTRY)).toBe(true);
+    expect(() => {
+      REGISTRY['9.9.9'] = 999;
+    }).toThrow();
+    expect(REGISTRY['9.9.9']).toBeUndefined();
+  });
+
+  it('maps each schema version to exactly one semver (no duplicates)', () => {
+    const seen = new Map();
+    for (const [semver, schemaVersion] of Object.entries(REGISTRY)) {
+      expect(seen.has(schemaVersion)).toBe(false);
+      seen.set(schemaVersion, semver);
+    }
+  });
+
+  it('has strictly increasing schema versions in ascending semver order', () => {
+    const entries = Object.entries(REGISTRY).sort((a, b) =>
+      a[0].localeCompare(b[0], undefined, { numeric: true })
+    );
+    for (let i = 1; i < entries.length; i += 1) {
+      expect(entries[i][1]).toBeGreaterThan(entries[i - 1][1]);
+    }
+  });
+});
+
+// ─── escrowVersions: assertRegistryInvariants / freezeRegistry ───────────────
+
+describe('assertRegistryInvariants', () => {
+  it('accepts the shipped REGISTRY', () => {
+    expect(() => assertRegistryInvariants(REGISTRY)).not.toThrow();
+  });
+
+  it('rejects an empty registry', () => {
+    expect(() => assertRegistryInvariants({})).toThrow(/non-empty/i);
+  });
+
+  it('rejects non-integer schema versions', () => {
+    expect(() => assertRegistryInvariants({ '1.0.0': 1.5 })).toThrow(/integer/i);
+  });
+
+  it('rejects non-positive schema versions', () => {
+    expect(() => assertRegistryInvariants({ '1.0.0': 0 })).toThrow(/positive/i);
+  });
+
+  it('rejects duplicate schema versions', () => {
+    expect(() => assertRegistryInvariants({ '1.0.0': 1, '1.1.0': 1 })).toThrow(/duplicate/i);
+  });
+
+  it('rejects non-monotonic schema versions', () => {
+    expect(() => assertRegistryInvariants({ '1.0.0': 2, '1.1.0': 1 })).toThrow(/monotonic/i);
+  });
+
+  it('rejects malformed semver keys', () => {
+    expect(() => assertRegistryInvariants({ 'not-semver': 1 })).toThrow(/semver/i);
+  });
+});
+
+describe('freezeRegistry', () => {
+  it('returns a frozen copy and does not mutate the input', () => {
+    const input = { '1.0.0': 1 };
+    const frozen = freezeRegistry(input);
+    expect(Object.isFrozen(frozen)).toBe(true);
+    expect(Object.isFrozen(input)).toBe(false);
+    expect(frozen).not.toBe(input);
+  });
+
+  it('throws when given an invalid registry', () => {
+    expect(() => freezeRegistry({ '1.0.0': -1 })).toThrow();
   });
 });
 
@@ -249,6 +322,22 @@ describe('compareVersions', () => {
     expect(result.status).toBe('unknown');
     expect(result.knownVersion).toBeNull();
   });
+
+  it('rejects non-integer on-chain versions', () => {
+    expect(() => compareVersions(1.5)).toThrow(/integer/i);
+    expect(() => compareVersions('3')).toThrow(/integer/i);
+    expect(() => compareVersions(null)).toThrow(/integer/i);
+  });
+
+  it('rejects negative on-chain versions', () => {
+    expect(() => compareVersions(-1)).toThrow(/non-negative/i);
+  });
+
+  it('is deterministic across repeated calls', () => {
+    const a = compareVersions(3);
+    const b = compareVersions(3);
+    expect(a).toEqual(b);
+  });
 });
 
 // ─── escrowVersions: getOnChainSchemaVersion ─────────────────────────────────
@@ -289,6 +378,27 @@ describe('getOnChainSchemaVersion', () => {
     const version = await getOnChainSchemaVersion(VALID_ID);
     expect(version).toBe(3);
   });
+
+  it('rejects with INVALID_SCHEMA_VERSION when RPC returns a non-integer', async () => {
+    callSorobanContract.mockResolvedValueOnce('3');
+    await expect(getOnChainSchemaVersion(VALID_ID)).rejects.toMatchObject({
+      code: 'INVALID_SCHEMA_VERSION',
+    });
+  });
+
+  it('rejects with INVALID_SCHEMA_VERSION when RPC returns a negative value', async () => {
+    callSorobanContract.mockResolvedValueOnce(-1);
+    await expect(getOnChainSchemaVersion(VALID_ID)).rejects.toMatchObject({
+      code: 'INVALID_SCHEMA_VERSION',
+    });
+  });
+
+  it('rejects with INVALID_SCHEMA_VERSION when RPC returns null', async () => {
+    callSorobanContract.mockResolvedValueOnce(null);
+    await expect(getOnChainSchemaVersion(VALID_ID)).rejects.toMatchObject({
+      code: 'INVALID_SCHEMA_VERSION',
+    });
+  });
 });
 
 // ─── contractListRefresh: runContractListRefresh ──────────────────────────────
@@ -323,6 +433,22 @@ describe('runContractListRefresh', () => {
     const result = await runContractListRefresh(VALID_ID);
     expect(result.onChainVersion).toBe(2);
     expect(result.status).toBe('unknown'); // 2 < 3 (max) and matches 1.1.0
+  });
+
+  it('propagates INVALID_SCHEMA_VERSION for malformed RPC payloads', async () => {
+    process.env.ESCROW_CONTRACT_ID = VALID_ID;
+    callSorobanContract.mockResolvedValueOnce('not-a-number');
+    await expect(runContractListRefresh()).rejects.toMatchObject({
+      code: 'INVALID_SCHEMA_VERSION',
+    });
+  });
+
+  it('is idempotent for repeated identical calls', async () => {
+    process.env.ESCROW_CONTRACT_ID = VALID_ID;
+    callSorobanContract.mockResolvedValue(3);
+    const first = await runContractListRefresh();
+    const second = await runContractListRefresh();
+    expect(first).toEqual(second);
   });
 });
 
@@ -365,6 +491,14 @@ describe('POST /api/admin/escrow/refresh', () => {
 
   it('returns 502 on RPC failure', async () => {
     callSorobanContract.mockRejectedValueOnce(new Error('timeout'));
+    const res = await request(app)
+      .post('/api/admin/escrow/refresh')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(502);
+  });
+
+  it('returns 502 when RPC returns a malformed schema version', async () => {
+    callSorobanContract.mockResolvedValueOnce('bad');
     const res = await request(app)
       .post('/api/admin/escrow/refresh')
       .set('Authorization', `Bearer ${adminToken}`);
@@ -422,6 +556,14 @@ describe('GET /api/admin/escrow/version', () => {
 
   it('returns 502 on RPC failure', async () => {
     callSorobanContract.mockRejectedValueOnce(new Error('rpc down'));
+    const res = await request(app)
+      .get('/api/admin/escrow/version')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(502);
+  });
+
+  it('returns 502 when RPC returns a malformed schema version', async () => {
+    callSorobanContract.mockResolvedValueOnce(-5);
     const res = await request(app)
       .get('/api/admin/escrow/version')
       .set('Authorization', `Bearer ${adminToken}`);
