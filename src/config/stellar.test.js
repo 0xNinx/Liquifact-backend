@@ -196,4 +196,70 @@ describe('config/stellar', () => {
       expect(NETWORK_PASSPHRASE_MAP.FUTURENET).toBe('Test SDF Future Network ; October 2022');
     });
   });
+
+  describe('Concurrency safety (v1.0)', () => {
+    it('concurrent calls to getStellarConfig return identical results', () => {
+      const { getStellarConfig } = require('./stellar');
+      const config = require('./index');
+
+      // Mock config.get to return consistent values
+      jest.mock('./index', () => ({
+        get: jest.fn(() => ({
+          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
+          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+        })),
+      }));
+
+      // Clear cache to test fresh concurrent access
+      jest.resetModules();
+      const { getStellarConfig: freshGetStellarConfig } = require('./stellar');
+
+      // Simulate concurrent calls
+      const results = Array.from({ length: 10 }, () => freshGetStellarConfig());
+
+      // All results should be deeply equal
+      results.forEach((result) => {
+        expect(result).toEqual(results[0]);
+      });
+
+      // Results should be frozen (immutable)
+      expect(Object.isFrozen(results[0])).toBe(true);
+    });
+
+    it('getStellarConfig is idempotent - returns same instance on repeated calls', () => {
+      const { getStellarConfig } = require('./stellar');
+      const config = require('./index');
+
+      // Mock config.get
+      jest.mock('./index', () => ({
+        get: jest.fn(() => ({
+          SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
+          NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+        })),
+      }));
+
+      jest.resetModules();
+      const { getStellarConfig: freshGetStellarConfig } = require('./stellar');
+
+      const first = freshGetStellarConfig();
+      const second = freshGetStellarConfig();
+      const third = freshGetStellarConfig();
+
+      // All calls return the same cached instance
+      expect(first).toBe(second);
+      expect(second).toBe(third);
+    });
+
+    it('network maps are frozen and immutable', () => {
+      expect(Object.isFrozen(NETWORK_RPC_MAP)).toBe(true);
+      expect(Object.isFrozen(NETWORK_PASSPHRASE_MAP)).toBe(true);
+      expect(Object.isFrozen(VALID_NETWORKS)).toBe(true);
+
+      // Attempting to mutate should fail silently in non-strict mode
+      // but the property should not actually change
+      const originalTestnetRpc = NETWORK_RPC_MAP.TESTNET;
+      NETWORK_RPC_MAP.TESTNET = 'https://malicious.example.com';
+      expect(NETWORK_RPC_MAP.TESTNET).toBe(originalTestnetRpc);
+    });
+  });
 });
