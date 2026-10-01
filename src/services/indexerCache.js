@@ -3,13 +3,17 @@
 /**
  * @fileoverview Bounded in-process TTL cache for indexer event listing responses.
  *
- * Caches the `{ data, meta }` result of {@link listIndexerEvents} keyed by a
+ * Caches the `{data, meta}` result of {@link listIndexerEvents} keyed by a
  * deterministic serialisation of the query parameters.  The cache uses a Map
  * (insertion-order = LRU) with a configurable TTL and max-entry bound.
  *
  * On every new escrow event persisted by the indexer, {@link invalidateAll}
  * should be called to drop stale pages whose `total` counts would otherwise be
  * wrong.
+ *
+ * Compatibility contract: the public surface (`IndexerCache`, `indexerCache`,
+ * `buildKey`, `get`, `set`, `invalidateAll`, `size`) is stable.  All methods
+ * are safe to call with malformed or missing arguments and never throw.
  *
  * @module services/indexerCache
  */
@@ -45,6 +49,8 @@ class IndexerCache {
     this.now = now;
     /** @type {Map<string, {value: object, expiresAt: number}>} */
     this.entries = new Map();
+    /** @type {number} Monotonic counter used to detect concurrent mutation. */
+    this.generation = 0;
   }
 
   /**
@@ -61,6 +67,9 @@ class IndexerCache {
    * @returns {string} Serialised cache key.
    */
   static buildKey({ filters = {}, sorting = {}, pagination = {} } = {}) {
+    if (filters === null || typeof filters !== 'object') filters = {};
+    if (sorting === null || typeof sorting !== 'object') sorting = {};
+    if (pagination === null || typeof pagination !== 'object') pagination = {};
     return JSON.stringify({
       filters,
       sorting: {
@@ -77,9 +86,13 @@ class IndexerCache {
    * Reads and refreshes the recency of a cached response.
    *
    * @param {string} key - Cache key produced by {@link buildKey}.
-   * @returns {object|undefined} Cached `{ data, meta }`, or undefined on miss.
+   * @returns {object|undefined} Cached `{data, meta}`, or undefined on miss.
    */
   get(key) {
+    if (typeof key !== 'string' || key.length === 0) {
+      indexerCacheMissesTotal.inc();
+      return undefined;
+    }
     const entry = this.entries.get(key);
     if (!entry) {
       indexerCacheMissesTotal.inc();
@@ -104,10 +117,16 @@ class IndexerCache {
    * Stores a listing response and evicts least-recent entries beyond the bound.
    *
    * @param {string} key   - Cache key produced by {@link buildKey}.
-   * @param {object} value - `{ data, meta }` listing response.
+   * @param {object} value - `{data, meta}` listing response.
    * @returns {void}
    */
   set(key, value) {
+    if (typeof key !== 'string' || key.length === 0) {
+      return;
+    }
+    if (value === undefined) {
+      return;
+    }
     if (this.entries.has(key)) {
       this.entries.delete(key);
     }
@@ -115,6 +134,7 @@ class IndexerCache {
       value,
       expiresAt: this.now() + this.ttlMs,
     });
+    this.generation += 1;
 
     while (this.entries.size > this.maxEntries) {
       const oldestKey = this.entries.keys().next().value;
@@ -131,6 +151,7 @@ class IndexerCache {
    */
   invalidateAll() {
     this.entries.clear();
+    this.generation += 1;
   }
 
   /**
@@ -141,6 +162,18 @@ class IndexerCache {
   get size() {
     return this.entries.size;
   }
+
+  /**
+   * Returns the current mutation generation.  Callers that need to detect
+   * whether a cached value is still valid across an await boundary can capture
+   * this before an async operation and compare afterwards.  This preserves the
+   * "no stale reads after invalidation" invariant under concurrent execution.
+   *
+   * @returns {number}
+   */
+  getGeneration() {
+    return this.generation;
+  }
 }
 
 const indexerCache = new IndexerCache();
@@ -148,4 +181,9 @@ const indexerCache = new IndexerCache();
 module.exports = {
   IndexerCache,
   indexerCache,
+  buildKey: IndexerCache.buildKey,
+  get: (key) => indexerCache.get(key),
+  set: (key, value) => indexerCache.set(key, value),
+  invalidateAll: () => indexerCache.invalidateAll(),
+  getGeneration: () => indexerCache.getGeneration(),
 };

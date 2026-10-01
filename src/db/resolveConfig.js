@@ -182,6 +182,7 @@ function resolveConfig(environment) {
       logFailure(err, normalized);
       throw err;
     }
+    validateConfigStructure(testConfig, environment);
     return testConfig;
   }
 
@@ -205,6 +206,7 @@ function resolveConfig(environment) {
       logFailure(err, normalized);
       throw err;
     }
+    validateConfigStructure(prodConfig, environment);
     return prodConfig;
   }
 

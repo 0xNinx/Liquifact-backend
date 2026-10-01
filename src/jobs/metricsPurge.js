@@ -15,6 +15,8 @@ const {
 const JOB_TYPE = 'metrics_purge';
 const DEFAULT_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MIN_INTERVAL_MS = 60_000;
+const MAX_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const MAX_CONCURRENT_PURGES = 1;
 
 function _counter(config) {
   const registry = getRegistry();
@@ -25,7 +27,7 @@ function _counter(config) {
   return new Counter({ ...config, registers: [registry] });
 }
 
-const metricsPurgeRowsDeletedTotal = _counter({
+const metricsPurgeRowsDeletedTotal = _counter( {
   name: 'liquifact_metrics_purge_rows_deleted_total',
   help: 'Total metric tombstones hard-deleted after their retention window',
 });
@@ -41,10 +43,25 @@ function getIntervalMs() {
   if (!Number.isFinite(parsed) || parsed < MIN_INTERVAL_MS) {
     return DEFAULT_INTERVAL_MS;
   }
+  if (parsed > MAX_INTERVAL_MS) {
+    return MAX_INTERVAL_MS;
+  }
   return parsed;
 }
 
+let _activePurge = null;
+
 async function runMetricsPurge(job = {}, options = {}) {
+  if (_activePurge) {
+    logger.warn(
+      { jobId: job.id },
+      'metricsPurge: run skipped, another purge is already in progress'
+    );
+    metricsPurgeRunsTotal.inc({ status: 'skipped' });
+    return { success: false, skipped: true, reason: 'already_running' };
+  }
+
+  _activePurge = (async () => {
   const startedAt = Date.now();
 
   try {
@@ -75,19 +92,29 @@ async function runMetricsPurge(job = {}, options = {}) {
     );
     throw error;
   }
+  })();
+
+  try {
+    return await _activePurge;
+  } finally {
+    _activePurge = null;
+  }
 }
 
 const purgeQueue = new JobQueue();
 const purgeWorker = new BackgroundWorker({
   jobQueue: purgeQueue,
-  maxConcurrency: 1,
+  maxConcurrency: MAX_CONCURRENT_PURGES,
   pollIntervalMs: 5000,
 });
 
-purgeWorker.registerHandler(JOB_TYPE, (job) => runMetricsPurge(job));
+purgeWorker.registerHandler(NJOB_TYPE, (job) => runMetricsPurge(job));
 
 function schedulePurge(options = {}) {
   const delayMs = options.delayMs ?? getIntervalMs();
+  if (!Number.isFinite(delayMs) || delayMs < 0) {
+    throw new TypeError('schedulePurge: delayMs must be a non-negative finite number');
+  }
   const jobId = purgeQueue.enqueue(JOB_TYPE, {}, { delayMs });
   logger.debug({ jobId, delayMs }, 'metricsPurge: scheduled run');
   return jobId;
@@ -106,6 +133,7 @@ function startPurgeWorker() {
 
 async function stopPurgeWorker(timeoutMs = 10000) {
   await purgeWorker.stop(timeoutMs);
+  _activePurge = null;
   logger.info('metricsPurge: worker stopped');
 }
 
@@ -117,6 +145,7 @@ function getStats() {
   return {
     worker: purgeWorker.getStats(),
     queue: purgeQueue.getStats(),
+    activePurge: _activePurge !== null,
     config: {
       retentionDays: getRetentionDays(),
       batchSize: getPurgeBatchSize(),
@@ -137,4 +166,5 @@ module.exports = {
   getIntervalMs,
   purgeQueue,
   purgeWorker,
+  MAX_INTERVAL_MS,
 };
