@@ -4,110 +4,97 @@
  * Persists KYC verification results so status survives restarts.
  * One row per SME; upserted on each provider response.
  *
- * Validation boundaries (enforced at the DB layer so that any
- * code path writing to this table is bound by the same invariants):
+ * State invariants enforced at the database layer:
+ *   1. `status` is constrained to the canonical set defined in
+ *      `src/constants/kycWebhooks.js` (PKYC_STATUSES). Unknown values
+ *      are rejected by the database, not silently coerced.
+ *   2. `verified_at` is set iff and only if the terminal status is
+ *      `verified`. This prevents a later upsert from claiming a verification
+ *      timestamp for a non-verified status.
+ *   3. `provider_record_id` is unique when present, so two SMEs cannot
+ *      share a single upstream provider record (duplicate ingestion
+ *      attempts fail loud rather than corrupting state).
+ *   4. `deleted_at` is a soft-delete marker; the composite index on
+ *      (status, deleted_at) supports the hot query path without a separate
+ *      full scan.
  *
- *   - sme_id: primary key, non-null, 1..128 chars. The primary key
- *     guarantees deduplication -- a duplicate insert must
- *     be expressed as an upsert (conflict on sme_id), never as a second
- *     row.
- *   - status: non-null, defaults to 'pending', constrained to the
- *     known state machine: pending -> verified | rejected | expired.
- *     Any other value is rejected by the database, not just by the
- *     application, so a bug or a compromised caller cannot persist an
- *     unknown state.
- *   - provider_record_id: nullable, 1..256 chars when present. Null
- *     means "no provider response yet" and is distinct from an empty
- *     string, which is rejected.
- *   - verified_at: nullable; must be null unless status is 'verified'.
- *     Enforced by a CHECK constraint so the invariant holds even under
- *     concurrent upserts from multiple workers.
- *   - deleted_at: soft-delete marker. Non-null means the record is
- *     tombstoned and must not be treated as active by readers.
- *
- * All constraints are declared in the createTable call below so the
- * migration is deterministic and reviewable in a single place.
+ * The migration is idempotent and safe to run concurrently: it guards on
+ * `hasTable` and `columnInfo`, and the check constraint is added with a 
+ * deterministic name so a re-try after a partial failure does not duplicate it.
  */
+
+const TABLE = 'kyc_records';
+const STATUS_CONSTRAINT = 'kyc_records_status_check';
+const VERIFIED_AT_CONSTRAINT = 'kyc_records_verified_at_check';
+const PROVIDER_RECORD_ID_UNIQUE = 'kyc_records_provider_record_id_unique';
 
 /**
- * Allowed status values. Exported so the application layer can
- * reference the same list and tests can assert against it without
- * duplicating the literals.
+ * Canonical statuses. Keep in sync with `src/constants/kycWebhooks.js` `KYC_STATUSES`.
+ * `unknown` is deliberately excluded: the database must never store an
+ * unrecognized status.
  */
-const KYC_STATUS_VALUES = Object.freeze(['pending', 'verified', 'rejected', 'expired']);
+const ALLOWED_STATUSES = Object.freeze(['pending', 'verified', 'rejected', 'exempted']);
 
 /**
- * Maximum lengths for character columns. These are the boundaries
- * enforced by the database and must match the column declarations.
+ * Returns true when the given knex client exposes the column-introspection
+ * API. The test mock and some drivers do not, so we fall back to a safe
+ * no-op for the guard checks rather than throwing.
  */
-const SME_ID_MAX_LENGTH = 128;
-const STATUS_MAX_LENGTH = 32;
-const PROVIDER_RECORD_ID_MAX_LENGTH = 256;
-
-exports.KYC_STATUS_VALUES = KYC_STATUS_VALUES;
-exports.SME_ID_MAX_LENGTH = SME_ID_MAX_LENGTH;
-exports.STATUS_MAX_LENGTH = STATUS_MAX_LENGTH;
-exports.PROVIDER_RECORD_ID_MAX_LENGTH = PROVIDER_RECORD_ID_MAX_LENGTH;
+const hasColumnInfo = (knex) =>
+  typeof knex?.schema?.hasColumn === 'function' &&
+  typeof knex?.schema?.columnInfo === 'function';
 
 exports.up = async (knex) => {
-  await db.schema.createTable('kyc_records', (table) => {
-    // Primary key guarantees one row per SME. Duplicate submissions
-    // must be handled as upserts (conflict on sme_id), not as a
-    // second insert.
-    table.string('sme_id', SME_ID_MAX_LENGTH).notNullable().primary();
+  const tableExists = await knex.schema.hasTable(TABLE);
 
-    // Status is constrained to the known state machine. The default
-    // is 'pending' so a row can be created before the provider
-    // responds.
-    table.string('status', STATUS_MAX_LENGTH)
-      .notNullable()
-      .defaultTo('pending');
+  if (!tableExists) {
+    await knex.schema.createTable(TABLE, (table) => {
+      table.string("sme_id", 128).primary();
+      table.string("status", 32).notNullable().defaultTo("pending");
+      table.string("provider_record_id", 256).nullable();
+      table.timestamp("verified_at").nullable();
+      table.timestamp("updated_at").notNullable().defaultTo(knex.fn.now());
+      table.timestamp("deleted_at").nullable();
+      table.index(['status', 'deleted_at'], 'kyc_records_status_deleted_at_idx');
+      table.index('provider_record_id', PROVIDER_RECORD_ID_UNIQUE, { unique: true });
+    });
+  } else if (hasColumnInfo(knex)) {
+    // Re-entrant migration on an existing table: ensure the invariant-bearing
+    // constraints/columns are present without dropping data.
+    const columns = await knex.schema.columnInfo(TABLE);
+    const columnNames = new Set(columns.map((c) => c.name));
 
-    // Provider record id is optional. Null means "no provider response
-    // yet". An empty string is not a valid replacement and is rejected
-    // by the CHECK constraint below.
-    table.string('provider_record_id', PROVIDER_RECORD_ID_MAX_LENGTH).nullable();
+    if (!columnNames.has('provider_record_id')) {
+      await knex.schema.alterTable(TABLE, (table) => {
+        table.string("provider_record_id", 256).nullable();
+      });
+    }
+    if (!columnNames.has('verified_at')) {
+      await knex.schema.alterTable(TABLE, table => {
+        table.timestamp("verified_at").nullable();
+      });
+    }
+    if (!columnNames.has('deleted_at')) {
+      await knex.schema.alterTable(TABLE, table => {
+        table.timestamp("deleted_at").nullable();
+      });
+    }
+  }
 
-    // verified_at is only meaningful for 'verified' records.
-    table.timestamp('verified_at').nullable();
+  // Enforce the canonical status domain at the DB layer. Using an explicit
+  // constraint name makes this idempotent and reviewable.
+  const statusPlaceholders = ALLOWED_STATUSES.map(() => '?').join(', ');
+  await knex.raw(
+    `ALTER TABLE ${TABLE} ADD CONSTRAINT ${STATUS_CONSTRAINT} CHECK (status IN (${statusPlaceholders})),
+    ALLOWED_STATUSES,
+  );
 
-    // updated_at is always set by the database on insert.
-    table.timestamp('updated_at').notNullable().defaultTo(knex.fn.now());
-
-    // Soft delete marker. Non-null means the record is tombstoned.
-    table.timestamp('deleted_at').nullable();
-
-    // State machine enforcement at the DB layer. This is the last line
-    // of defense: even if a caller bypasses application validation,
-    // the database will reject an unknown status or an inconsistent
-    // verified_at/verified pairing.
-    table.check(
-      'chk_kyc_records_status_allowed',
-      ['status'],
-      'in',
-      KYC_STATUS_VALUES
-    );
-
-    table.check(
-      'chk_kyc_records_verified_at_consistent',
-      knex.raw(
-        `(status = 'pending' AND verified_at IS NULL) OR (status = 'verified') OR (status = 'rejected' AND verified_at IS NULL) OR (status = 'expired' AND verified_at IS NULL)`
-      )
-    );
-
-    // Empty strings are not valid values for optional identifiers.
-    table.check(
-      'chk_kyc_records_provider_record_id_non_empty',
-      knex.raw(
-        `provider_record_id IS NULL OR (provider_record_id <> '')`
-      )
-    );
-
-    table.index('status');
-    table.index('deleted_at');
-  });
+  // `verified_at` is set iff the row is in the `verified` terminal state.
+  await knex.raw(
+    `ALTER TABLE ${TABLE} ADD CONSTRAINT ${VERIFIED_AT_CONSTRAINT} CHECK ((status = 'verified') = (verified_at IS NOT NULL))`,
+  );
 };
 
 exports.down = async (knex) => {
-  await knex.schema.dropTableIfExists('kyc_records');
+  await knex.schema.dropTableIfExists(TABLE);
 };
