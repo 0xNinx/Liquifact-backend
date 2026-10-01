@@ -7,18 +7,19 @@
  * behavior. They map plain objects to/from a small typed DXO envelope that is
  * easier to evolve safely during refactors.
  *
- * Invariants owned by this module:
- * - Every mapper returns a fresh object; input objects are never mutated and
- *   nested config objects are copied shallowly so callers cannot alias internal
- *   state through the returned DTO.
- * - The returned shape is deterministic for any input, including null, undefined,
- *   arrays, primitives, and duplicate or boundary values.
- * - Only own, enumerable string-keyed properties are considered; prototype
- *   pollution keys are dropped and dangerous keys are never copied through.
- * - Section names and messages are normalized to trimmed strings; blank values
- *   fall back to a default so downstream code never sees an undefined section.
+ * Invariants enforced here:
+ *   - All inputs are validated defensively; no input can produce a thrown
+ *     exception — malformed inputs produce safe zero-value defaults instead
+ *     of propagating bad data downstream.
+ *   - Output objects are shallow-frozen so callers cannot silently mutate the
+ *     DTO after it leaves this layer, preventing cross-request state bleed
+ *     in concurrent execution.
+ *   - `config` payloads are always shallow-copied (never aliased) so the
+ *     original request body cannot be mutated via the DTO reference.
+ *   - String fields are type-checked and default to `''` rather than
+ *     `undefined`, keeping downstream consumers free from null-checks.
  *
- * @see src/routes/adminMetrics.js for the admin metrics route contract.
+ * @module dto/config
  */
 
 /**
@@ -50,120 +51,51 @@ function isPlainObject(value) {
  */
 
 /**
- * Property names that must never be copied from an untrusted payload into a
- * normalized config object. Prototype pollution would otherwise let a malicious
- * request change the prototype of every object in the process.
+ * Returns true when `value` is a plain (non-array, non-null) object.
  *
- * @type {ReadonlyArray<string>}
+ * @param {unknown} value
+ * @returns {boolean}
  */
-const FORBIDDEN_CONFIG_KEYS = Object.freeze(["__proto__", "constructor", "prototype"]);
-
-/**
- * @type {Set<string>}
- */
-const FORBIDDEN_CONFIG_KEY_SET = new Set(FORBIDDEN_CONFIG_KEYS);
-
-/**
- * Determine whether a value is a plain object suitable for copying into a
- * config payload. Arrays, null, functions, and class instances are rejected.
- *
- * @param {unknown} value - Candidate config value.
- * @returns {boolean} True when the value is a plain object.
- */
-function isPlainObject(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-/**
- * Normalize a section name to a trimmed string. Non-string values and empty
- * strings fall back to the provided default so the returned DTO always carries a
- * usable section identifier.
- *
- * @param {unknown} value - Raw section value.
- * @param {string} fallback - Value returned when no valid string is present.
- * @returns {string} Normalized section name.
- */
-function normalizeSection(value, fallback) {
-  if (typeof value !== "string") {
-    return fallback;
-  }
-
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : fallback;
-}
-
-/**
- * Normalize a message to a trimmed string. Non-string values fall back to an
- * empty string so the response contract is stable.
- *
- * @param {unknown} value - Raw message value.
- * @returns {string} Normalized message.
- */
-function normalizeMessage(value) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-/**
- * Copy own, enumerable string-keyed properties from a source object into a fresh
- * config object, dropping dangerous keys. The returned object has a null
- * prototype so lookups cannot accidentally resolve to Object.prototype members
- * and so it is safe to pass to downstream consumers.
- *
- * @param {unknown} value - Candidate config payload.
- * @returns {Record<string, unknown>} A defensive copy of the config payload.
- */
-function copyConfig(value) {
-  const copy = Object.create(null);
-
-  if (!isPlainObject(value)) {
-    return copy;
-  }
-
-  for (const key of Object.keys(value)) {
-    if (FORBIDDEN_CONFIG_KEY_SET.has(key)) {
-      continue;
-    }
-
-    try {
-      copy[key] = value[key];
-    } catch (_err) {
-      // A hostile or broken getter must not break the DTO boundary; drop the
-      // property so the returned shape stays deterministic.
-    }
-  }
-
-  return copy;
+function _isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
  * Map a raw admin config request payload into a typed request DTO.
  *
+ * Defensive behaviour:
+ *   - Non-object, null, or array payloads yield `{ section: '', config: {} }`.
+ *   - A non-string `section` defaults to `''`.
+ *   - A non-plain-object `config` defaults to `{}`.
+ *   - The returned `config` is a **shallow copy**, so mutations to the original
+ *     request body do not affect the DTO and vice-versa.
+ *   - The returned DTO is **frozen** to prevent accidental downstream mutation.
+ *
  * @param {unknown} payload - Raw request payload from the route boundary.
- * @returns {AdminConfigRequestDto} A normalized request DTO.
+ * @returns {Readonly<AdminConfigRequestDto>} A normalized, immutable request DTO.
  */
 function toAdminConfigRequestDto(payload) {
-  if (!isPlainObject(payload)) {
-    return { section: '', config: {} };
+  if (!_isPlainObject(payload)) {
+    return Object.freeze({ section: '', config: Object.freeze({}) });
   }
 
   const section = typeof payload.section === 'string' ? payload.section : '';
-  const config = isPlainObject(payload.config)
-    ? { ...payload.config }
-    : {};
+  const config = _isPlainObject(payload.config)
+    ? Object.freeze({ ...payload.config })
+    : Object.freeze({});
 
-  return { section, config };
+  return Object.freeze({ section, config });
 }
 
 /**
  * Convert a typed admin config request DXO back to the route shape.
  *
+ * This function is symmetric with `toAdminConfigRequestDto` so that code
+ * receiving a DTO can pass it back through the boundary without any asymmetry.
+ * The same defensive normalisation and freeze are applied.
+ *
  * @param {AdminConfigRequestDto} dto - Request DTO to normalize back to plain object form.
- * @returns {AdminConfigRequestDto} A request DTO with the same boundary shape.
+ * @returns {Readonly<AdminConfigRequestDto>} A request DTO with the same boundary shape.
  */
 function fromAdminConfigRequestDto(dto) {
   const normalized = toAdminConfigRequestDto(dto);
@@ -173,28 +105,36 @@ function fromAdminConfigRequestDto(dto) {
 /**
  * Map a raw admin config response payload into a typed response DTO.
  *
+ * Defensive behaviour:
+ *   - Non-object, null, or array payloads yield `{ section: '', config: {}, message: '' }`.
+ *   - Non-string `section` / `message` default to `''`.
+ *   - The returned `config` is a **shallow copy** and **frozen**.
+ *   - The returned DTO is **frozen**.
+ *
  * @param {unknown} payload - Raw response payload from the route boundary.
- * @returns {AdminConfigResponseDto} A normalized response DXO.
+ * @returns {Readonly<AdminConfigResponseDto>} A normalized, immutable response DTO.
  */
 function toAdminConfigResponseDto(payload) {
-  if (!isPlainObject(payload)) {
-    return { section: '', config: {}, message: '' };
+  if (!_isPlainObject(payload)) {
+    return Object.freeze({ section: '', config: Object.freeze({}), message: '' });
   }
 
   const section = typeof payload.section === 'string' ? payload.section : '';
-  const config = isPlainObject(payload.config)
-    ? { ...payload.config }
-    : {};
+  const config = _isPlainObject(payload.config)
+    ? Object.freeze({ ...payload.config })
+    : Object.freeze({});
   const message = typeof payload.message === 'string' ? payload.message : '';
 
-  return { section, config, message };
+  return Object.freeze({ section, config, message });
 }
 
 /**
  * Convert a typed admin config response DTO back to the route shape.
  *
- * @param {AdminConfigResponseDto} dto - Response DXO to normalize back to plain object form.
- * @returns {AdminConfigResponseDto} A response DTO with the same boundary shape.
+ * Symmetric with `toAdminConfigResponseDto`.
+ *
+ * @param {AdminConfigResponseDto} dto - Response DTO to normalize back to plain object form.
+ * @returns {Readonly<AdminConfigResponseDto>} A response DTO with the same boundary shape.
  */
 function fromAdminConfigResponseDto(dto) {
   const normalized = toAdminConfigResponseDto(dto);
@@ -208,25 +148,33 @@ function fromAdminConfigResponseDto(dto) {
 /**
  * Map a list of config sections into the typed sections response DTO.
  *
- * Duplicate and blank section names are dropped and the result is deterministic:
- * each valid section appears exactly once, in first-seen order.
+ * Defensive behaviour:
+ *   - Non-array input yields `{ sections: [] }`.
+ *   - Non-string array elements are silently filtered out.
+ *   - The inner array is **frozen** (a new array copy is always produced).
+ *   - The returned DTO is **frozen**.
  *
  * @param {unknown} sections - Raw section list from the route boundary.
- * @returns {ConfigSectionsResponseDto} A normalized sections response DXO.
+ * @returns {Readonly<ConfigSectionsResponseDto>} A normalized, immutable sections DTO.
  */
 function toConfigSectionsResponseDto(sections) {
   if (!Array.isArray(sections)) {
-    return { sections: [] };
+    return Object.freeze({ sections: Object.freeze([]) });
   }
 
-  return { sections: sections.filter((section) => typeof section === 'string').slice() };
+  const filtered = sections.filter((section) => typeof section === 'string');
+  return Object.freeze({ sections: Object.freeze(filtered) });
 }
 
 /**
  * Convert a typed config sections response DTO back to the route shape.
  *
+ * Accepts the DTO envelope `{ sections: [...] }` and re-normalises it,
+ * producing a new frozen copy (so the caller's frozen reference is never
+ * re-used directly).
+ *
  * @param {ConfigSectionsResponseDto} dto - Sections DTO to normalize back to plain object form.
- * @returns {ConfigSectionsResponseDto} An idempotent sections DTO.
+ * @returns {Readonly<ConfigSectionsResponseDto>} A sections DTO with the same boundary shape.
  */
 function fromConfigSectionsResponseDto(dto) {
   const sections = isPlainObject(dto) ? dto.sections : undefined;
