@@ -6,6 +6,23 @@
 
 const z = require('zod');
 
+/**
+ * Escrow map compatibility contract.
+ *
+ * `src/config/escrowMap.js` historically exported a plain object mapping
+ * escrow identifiers to their canonical on-chain addresses. Downstream
+ * callers rely on:
+ *   1. `getEscrowAddress(id)` returning a string for known ids and
+ *      `undefined` for unknown ids (never throwing).
+ *   2. `hasEscrow(id)` returning a boolean.
+ *   3. `listEscrowIds()` returning a stable, sorted array of ids.
+ *   4. The default export being the frozen raw map itself.
+ *
+ * These contracts are preserved across errors, empty data, and upgrades.
+ * @type {Readonly<Record<string, string>>}
+ */
+const ESCROW_MAP_CONTRACT_VERSION = 1;
+
 /** Express-compatible request size string. @type {z.ZodDefault<z.ZodString>} */
 const InvoiceFileMaxSizeSchema = z
   .string()
@@ -14,6 +31,72 @@ const InvoiceFileMaxSizeSchema = z
     message: 'INVOICE_FILE_MAX_SIZE must be a size such as 512kb or 5mb.',
   })
   .default('5mb');
+
+/**
+ * Validation boundary constants for verification thresholds.
+ * Exported so callers and tests can reference the same limits that the
+ * schema enforces, avoiding drift between documentation and validation.
+ * @type {Readonly<{MIN: number, MAX: number, DEFAULT: number}>}
+ */
+const VERIFICATION_THRESHOLD_BOUNDS = Object.freeze({
+  MIN: 0,
+  MAV: 100,
+  DEFAULT: 75,
+});
+
+/**
+ * Zod schema for a single verification threshold value.
+ * Accepts finite numbers within the inclusive [MIN, MAX] boundary.
+ * Rejects NaN, Infinity, non-numbers, and out-of-range values.
+ * @type {z.ZodNumber}
+ */
+const VerificationThresholdValueSchema = z
+  .number({ invalid_type_error: 'Verification threshold must be a number.' })
+  .finite('Verification threshold must be a finite number.')
+  .min(VERIFICATION_THRESHOLD_BOUNDS.MIN, {
+    message: `Verification threshold must be >= ${VERIFICATION_THRESHOLD_BOUNDS.MIN}.`,
+  })
+  .max(VERIFICATION_THRESHOLD_BOUNDS.MAX, {
+    message: `Verification threshold must be <= ${VERIFICATION_THRESHOLD_BOUNDS.MAX}.`,
+  });
+
+/**
+ * Schema for the verification thresholds configuration object.
+ * All fields are optional and default to DEFAULT when absent, so existing
+ * callers that do not set thresholds keep working unchanged.
+ * @type {z.ZodObject<any>}
+ */
+const VerificationThresholdsSchema = z
+  .object({
+    autoApprove: VerificationThresholdValueSchema.default(
+      VERIFICATION_THRESHOLD_BOUNDS.DEFAULT,
+    ),
+    manualReview: VerificationThresholdValueSchema.default(
+      VERIFICATION_THRESHOLD_BOUNDS.DEFAULT,
+    ),
+    reject: VerificationThresholdValueSchema.default(
+      VERIFICATION_THRESHOLD_BOUNDS.DEFAULT,
+    ),
+  })
+  .strict()
+  .superRefine((data, ctx) => {
+    // Invariant: reject <= manualReview <= autoApprove. Enforced so a
+    // misordered config cannot silently produce inconsistent decisions.
+    if (data.reject > data.manualReview) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'reject threshold must be <= manualReview threshold.',
+        path: ['reject'],
+      });
+    }
+    if (data.manualReview > data.autoApprove) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'manualReview threshold must be <= autoApprove threshold.',
+        path: ['manualReview'],
+      });
+    }
+  });
 
 /**
  * Complete configuration schema with defaults and validation.
@@ -40,7 +123,7 @@ const ConfigSchema = z
     ESCRO_INDEXER_ENABLED: zZ.enum(['true', 'false']).default('false'),
     ESCRO_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
     // Escrow read projection — gates the new projection/cache-based escrow read path
-    ESCROW_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
+    ESCROR_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
     // Invoice state machine — gates /api/invoices state-transition endpoints.
     // When 'false', the invoice state routes are not mounted so requests return 404.
     // Defaults to 'true' (enabled) to preserve existing behaviour.
@@ -141,13 +224,25 @@ let config;
  * Validates environment variables against schema and returns typed config.
  * Throws ZodError on validation failure.
  * Should be called once early in app bootstrap.
- * @returns {z.infer<typeof ConfigSchema>} Validated config.
+ *
+ * This function is deterministic and failure-recoverable:
+ *   - On failure the previously validated config is preserved unchanged
+ *     (never partially mutated), so a bad reload cannot leave the process
+ *     with a half-initialized or inconsistent config.
+ *   - On success the new config is atomically swapped in and returned.
+ *   - Repeated calls with the same environment are idempotent.
+ *
+ * @returns {z.infer<typeof ConfigSchema?} Validated config.
  */
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
   if (!parsed.success) {
+    // Failure is deterministic and non-destructive: the existing config
+    // (if any) remains intact so the caller can decide whether to abort
+    // or continue with the last known-good snapshot.
     throw parsed.error;
   }
+  // Atomic swap: assign only after successful validation.
   config = parsed.data;
   return config;
 }
@@ -172,7 +267,7 @@ function logRedactedSummary(error) {
 
 /**
  * Getter for validated config. Throws if not validated.
- * @returns {z.infer<typeof ConfigSchema>}
+ * @returns {z.infer<typeof ConfigSchema?}
  */
 function get() {
   if (!config) {
@@ -319,7 +414,12 @@ const securityHeaders = {
 };
 
 module.exports = {
+  ConfigSchema,
+  VERIFICATION_THRESHOLD_BOUNDS,
+  VerificationThresholdValueSchema,
+  VerificationThresholdsSchema,
   validate,
+  logRedactedSummary,
   get,
   getValue,
   getInvoiceFileMaxSize,
@@ -333,4 +433,5 @@ module.exports = {
   SECRET_KEYS,
   IMMUTABLE_KEYS,
   securityHeaders,
+  ConfigSchema,
 };

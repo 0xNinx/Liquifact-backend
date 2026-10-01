@@ -8,7 +8,7 @@ use soroban_sdk::{
 
 #[contracttype]
 pub enum DataKey {
-    
+    Initialized,
     FeeRecipient,
     Bounty(u64),
     NextId,
@@ -25,6 +25,7 @@ pub struct Bounty {
     pub amount:           i128,
     pub protocol_fee_bps: u32,
     pub released:         bool,
+    pub refunded:         bool,
 }
 
 // ── Contract ─────────────────────────────────────────────────────────────────
@@ -36,13 +37,14 @@ pub struct BountyContract;
 impl BountyContract {
     /// One-time initialiser – sets the fee recipient address.
     pub fn initialize(env: Env, fee_recipient: Address) {
-        if env.storage().instance().has(&DataKey::FeeRecipient) {
+        if env.storage().instance().has(&DataKey::Initialized) {
             panic!("already initialized");
         }
         env.storage()
             .instance()
             .set(&DataKey::FeeRecipient, &fee_recipient);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.storage().instance().set(&DataKey::Initialized, &true);
     }
 
     /// Create a bounty.
@@ -61,6 +63,10 @@ impl BountyContract {
 
         assert!(amount > 0,           "amount must be positive");
         assert!(protocol_fee_bps <= 10_000, "fee_bps must be <= 10000");
+        assert!(
+            env.storage().instance().has(&DataKey::Initialized),
+            "not initialized"
+        );
 
         // Pull funds into the contract.
         let client = token::Client::new(&env, &token);
@@ -74,6 +80,7 @@ impl BountyContract {
             amount,
             protocol_fee_bps,
             released: false,
+            refunded: false,
         };
         env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
@@ -99,6 +106,7 @@ impl BountyContract {
 
         bounty.creator.require_auth();
         assert!(!bounty.released, "already released");
+        assert!(!bounty.refunded, "already refunded");
 
         let fee_recipient: Address = env
             .storage()
@@ -118,11 +126,45 @@ impl BountyContract {
         client.transfer(&env.current_contract_address(), &bounty.hunter, &payout);
 
         bounty.released = true;
+        bounty.refunded = false;
         env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
 
         env.events().publish(
             (Symbol::new(&env, "bounty_released"), id),
             (payout, fee),
+        );
+    }
+
+    /// Refund a bounty to the creator if it has not been released.
+    ///
+    /// Only the creator may refund, and only while the bounty is unreleased.
+    /// This is the inverse transition of `release_bounty` and preserves the
+    /// invariant that a bounty is either released, refunded, or pending —
+    /// never both released and refunded.
+    pub fn refund_bounty(env: Env, id: u64) {
+        let mut bounty: Bounty = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bounty(id))
+            .expect("bounty not found");
+
+        bounty.creator.require_auth();
+        assert!(!bounty.released, "already released");
+        assert!(!bounty.refunded, "already refunded");
+
+        let client = token::Client::new(&env, &bounty.token);
+        client.transfer(
+            &env.current_contract_address(),
+            &bounty.creator,
+            &bounty.amount,
+        );
+
+        bounty.refunded = true;
+        env.storage().persistent().set(&DataKey::Bounty(id), &bounty);
+
+        env.events().publish(
+            (Symbol::new(&env, "bounty_refunded"), id),
+            bounty.amount,
         );
     }
 
@@ -269,5 +311,42 @@ mod tests {
         let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
         client.release_bounty(&id);
         client.release_bounty(&id); // should panic
+    }
+
+    // ── refund guard ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_refund_returns_funds_to_creator() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+
+        let token_client = TokenClient::new(&env, &token);
+        let creator_before = token_client.balance(&creator);
+
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.refund_bounty(&id);
+
+        let creator_after = token_client.balance(&creator);
+        assert_eq!(creator_after - creator_before, 500_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "already refunded")]
+    fn test_cannot_refund_twice() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.refund_bounty(&id);
+        client.refund_bounty(&id);
+    }
+
+    #[test]
+    #[should_panic(expected = "already released")]
+    fn test_cannot_refund_after_release() {
+        let (env, contract_id, _fee_recipient, creator, hunter, token) = setup();
+        let client = BountyContractClient::new(&env, &contract_id);
+        let id = client.create_bounty(&creator, &hunter, &token, &500_i128, &0u32);
+        client.release_bounty(&id);
+        client.refund_bounty(&id);
     }
 }

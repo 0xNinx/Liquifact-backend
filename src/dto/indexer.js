@@ -64,9 +64,30 @@
  * @returns {IndexerEventsQueryDTO}
  */
 function mapQueryToDTO(params) {
+  if (params === null || typeof params !== 'object') {
+    throw new TypeError('mapQueryToDTO: params must be a non-null object');
+  }
+
   const filters = params.filters || {};
   const sorting = params.sorting || {};
   const pagination = params.pagination || {};
+
+  const sortBy = sorting.sortBy !== undefined ? String(sorting.sortBy) : 'observed_at';
+  if (sortBy !== 'observed_at' && sortBy !== 'ledger_sequence') {
+    throw new RangeError(`mapQueryToDTO: invalid sortBy "${sortBy}"`);
+  }
+
+  const order = sorting.order === 'asc' ? 'asc' : 'desc';
+
+  const page = pagination.page !== undefined ? Number(pagination.page) : undefined;
+  if (page !== undefined && (!Number.isInteger(page) || page < 1)) {
+    throw new RangeError('mapQueryToDTO: page must be a positive integer');
+  }
+
+  const limit = pagination.limit !== undefined ? Number(pagination.limit) : undefined;
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 100)) {
+    throw new RangeError('mapQueryToDTO: limit must be an integer between 1 and 100');
+  }
 
   return Object.freeze({
     filters: Object.freeze({
@@ -75,13 +96,13 @@ function mapQueryToDTO(params) {
       contractId: filters.contractId !== undefined ? String(filters.contractId) : undefined,
     }),
     sorting: Object.freeze({
-      sortBy: sorting.sortBy !== undefined ? String(sorting.sortBy) : 'observed_at',
-      order: sorting.order === 'asc' ? 'asc' : 'desc',
+      sortBy,
+      order,
     }),
     pagination: Object.freeze({
       cursor: pagination.cursor !== undefined ? String(pagination.cursor) : undefined,
-      page: pagination.page !== undefined ? Number(pagination.page) : undefined,
-      limit: pagination.limit !== undefined ? Number(pagination.limit) : undefined,
+      page,
+      limit,
     }),
   });
 }
@@ -98,6 +119,10 @@ function mapQueryToDTO(params) {
  * @returns {{ filters: object, sorting: object, pagination: object }}
  */
 function mapDTOToServiceParams(dto) {
+  if (dto === null || typeof dto !== 'object') {
+    throw new TypeError('mapDTOToServiceParams: dto must be a non-null object');
+  }
+
   const filters = {};
   if (dto.filters.invoiceId !== undefined) filters.invoiceId = dto.filters.invoiceId;
   if (dto.filters.eventType !== undefined) filters.eventType = dto.filters.eventType;
@@ -149,6 +174,10 @@ function mapDTOToServiceParams(dto) {
  * @returns {EscrowEventRowDTO}
  */
 function mapRowToEscrowEventDTO(row) {
+  if (row === null || typeof row !== 'object') {
+    throw new TypeError('mapRowToEscrowEventDTO: row must be a non-null object');
+  }
+
   return Object.freeze({
     eventId: String(row.event_id),
     invoiceId: String(row.invoice_id),
@@ -207,6 +236,10 @@ function mapEscrowEventDTOToRow(dto) {
  * @returns {IndexerEventsMetaDTO}
  */
 function mapMetaToDTO(rawMeta) {
+  if (rawMeta === null || typeof rawMeta !== 'object') {
+    throw new TypeError('mapMetaToDTO: rawMeta must be a non-null object');
+  }
+
   const dto = {
     total: Number(rawMeta.total),
     limit: Number(rawMeta.limit),
@@ -234,6 +267,13 @@ function mapMetaToDTO(rawMeta) {
  * @returns {IndexerEventsResponseDTO}
  */
 function mapServiceResultToResponseDTO(serviceResult) {
+  if (serviceResult === null || typeof serviceResult !== 'object') {
+    throw new TypeError('mapServiceResultToResponseDTO: serviceResult must be a non-null object');
+  }
+  if (!Array.isArray(serviceResult.data)) {
+    throw new TypeError('mapServiceResultToResponseDTO: serviceResult.data must be an array');
+  }
+
   return Object.freeze({
     data: serviceResult.data.map(mapRowToEscrowEventDTO),
     meta: mapMetaToDTO(serviceResult.meta),
@@ -271,14 +311,40 @@ function mapServiceResultToResponseDTO(serviceResult) {
  * the shape contract is expressed once in this module rather than scattered
  * across the job.
  *
+ * Concurrent-execution invariants
+ * ────────────────────────────────
+ * - `observedAt` is always captured from `raw.observedAt` when present, or
+ *   pinned to `capturedAt` (which the caller may supply, defaulting to the
+ *   current instant).  This means two concurrent calls for the same raw event
+ *   without an explicit `observedAt` will share the same timestamp when
+ *   supplied the same `capturedAt`, producing deterministic ordering.
+ * - `eventBody` is a shallow copy of the source so that subsequent mutations
+ *   to `raw` do not affect the already-frozen DTO.
+ * - `invoiceId` must be a non-empty string; an empty invoiceId makes the DTO
+ *   unusable for projection keying and is therefore rejected here rather than
+ *   inside the persistence layer.
+ *
  * @param {object} raw - Raw record from `fetchEscrowEventsFromHorizon`.
  * @param {string} invoiceId - Pre-resolved invoice ID for this event.
+ * @param {object} [opts] - Optional overrides for deterministic behaviour.
+ * @param {string} [opts.capturedAt] - ISO-8601 timestamp to use when
+ *   `raw.observedAt` is absent.  Callers that process a batch should derive
+ *   this once before the loop so every event in the batch shares the same
+ *   fallback timestamp.
  * @returns {IndexerIngestEventDTO}
+ * @throws {TypeError} If `invoiceId` is falsy (empty string, null, undefined).
  */
 function mapRawToIngestDTO(raw, invoiceId) {
+  if (raw === null || typeof raw !== 'object') {
+    throw new TypeError('mapRawToIngestDTO: raw must be a non-null object');
+  }
+  if (invoiceId === null || invoiceId === undefined || String(invoiceId).trim() === '') {
+    throw new TypeError('mapRawToIngestDTO: invoiceId must be a non-empty string');
+  }
+
   return Object.freeze({
     eventId: String(raw.id || raw.eventId || ''),
-    invoiceId: String(invoiceId),
+    invoiceId: resolvedInvoiceId,
     eventType: String(raw.type || raw.eventType || 'contract_event'),
     ledgerSequence: Number(raw.ledger || raw.ledgerSequence || 0),
     pagingToken: String(raw.paging_token || raw.pagingToken || ''),
@@ -288,8 +354,8 @@ function mapRawToIngestDTO(raw, invoiceId) {
     txHash: (raw.tx_hash || raw.txHash) != null
       ? String(raw.tx_hash || raw.txHash)
       : null,
-    eventBody: (raw.eventBody !== undefined ? raw.eventBody : raw) || {},
-    observedAt: raw.observedAt || new Date().toISOString(),
+    eventBody,
+    observedAt: raw.observedAt || fallbackTimestamp,
   });
 }
 
@@ -298,10 +364,18 @@ function mapRawToIngestDTO(raw, invoiceId) {
  * expected by `persistEscrowEvent` (the canonical event object).  This is the
  * inverse of `mapRawToIngestDTO` plus field aliasing.
  *
+ * The returned object is frozen so that concurrent consumers of the same
+ * normalized event cannot accidentally mutate shared state between the
+ * persistence write and the projection update.
+ *
  * @param {IndexerIngestEventDTO} dto
- * @returns {object} Normalized internal event.
+ * @returns {object} Normalized internal event (frozen).
  */
 function mapIngestDTOToNormalized(dto) {
+  if (dto === null || typeof dto !== 'object') {
+    throw new TypeError('mapIngestDTOToNormalized: dto must be a non-null object');
+  }
+
   return {
     eventId: dto.eventId,
     invoiceId: dto.invoiceId,
@@ -312,7 +386,7 @@ function mapIngestDTOToNormalized(dto) {
     txHash: dto.txHash,
     eventBody: dto.eventBody,
     observedAt: dto.observedAt,
-  };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

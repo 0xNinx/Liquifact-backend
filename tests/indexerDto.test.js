@@ -499,16 +499,30 @@ describe('mapRawToIngestDTO()', () => {
     expect(dto.txHash).toBeNull();
   });
 
-  test('eventBody defaults to the full raw record when not specified', () => {
+  test('eventBody is a shallow copy of the full raw record when not specified', () => {
     const raw = makeHorizonRecord();
     const dto = mapRawToIngestDTO(raw, 'inv_009');
-    expect(dto.eventBody).toBe(raw);
+    // Must be a copy, not the same reference (protects against post-call mutation)
+    expect(dto.eventBody).not.toBe(raw);
+    // Content must match the source fields
+    expect(dto.eventBody.id).toBe(raw.id);
+    expect(dto.eventBody.type).toBe(raw.type);
   });
 
-  test('uses explicit eventBody field when provided', () => {
+  test('eventBody is a shallow copy of the explicit eventBody field when provided', () => {
     const body = { foo: 'bar' };
     const dto = mapRawToIngestDTO({ ...makeHorizonRecord(), eventBody: body }, 'inv_010');
-    expect(dto.eventBody).toBe(body);
+    // Must be a copy (protects against post-call mutation)
+    expect(dto.eventBody).not.toBe(body);
+    expect(dto.eventBody.foo).toBe('bar');
+  });
+
+  test('mutating the source raw object after DTO creation does not affect eventBody', () => {
+    const raw = makeHorizonRecord();
+    const dto = mapRawToIngestDTO(raw, 'inv_010b');
+    const originalType = dto.eventBody.type;
+    raw.type = 'mutated_after_freeze';
+    expect(dto.eventBody.type).toBe(originalType);
   });
 
   test('observedAt is a valid ISO-8601 string', () => {
@@ -526,6 +540,47 @@ describe('mapRawToIngestDTO()', () => {
   test('returned DTO is frozen', () => {
     const dto = mapRawToIngestDTO(makeHorizonRecord(), 'inv_013');
     expect(Object.isFrozen(dto)).toBe(true);
+  });
+
+  // ── Concurrent-execution / determinism tests ────────────────────────────────
+
+  test('two concurrent calls with the same capturedAt produce the same observedAt', () => {
+    const capturedAt = '2026-09-30T10:00:00.000Z';
+    const raw = makeHorizonRecord();
+    const dto1 = mapRawToIngestDTO(raw, 'inv_c01', { capturedAt });
+    const dto2 = mapRawToIngestDTO(raw, 'inv_c02', { capturedAt });
+    expect(dto1.observedAt).toBe(capturedAt);
+    expect(dto2.observedAt).toBe(capturedAt);
+  });
+
+  test('capturedAt is used as fallback when raw.observedAt is absent', () => {
+    const capturedAt = '2026-09-30T12:00:00.000Z';
+    const dto = mapRawToIngestDTO({}, 'inv_c03', { capturedAt });
+    expect(dto.observedAt).toBe(capturedAt);
+  });
+
+  test('raw.observedAt takes precedence over capturedAt', () => {
+    const rawTs = '2026-01-01T00:00:00.000Z';
+    const capturedAt = '2026-09-30T12:00:00.000Z';
+    const dto = mapRawToIngestDTO({ observedAt: rawTs }, 'inv_c04', { capturedAt });
+    expect(dto.observedAt).toBe(rawTs);
+  });
+
+  test('throws TypeError when invoiceId is empty string', () => {
+    expect(() => mapRawToIngestDTO({}, '')).toThrow(TypeError);
+    expect(() => mapRawToIngestDTO({}, '')).toThrow(/invoiceId must be a non-empty string/);
+  });
+
+  test('throws TypeError when invoiceId is null', () => {
+    expect(() => mapRawToIngestDTO({}, null)).toThrow(TypeError);
+  });
+
+  test('throws TypeError when invoiceId is undefined', () => {
+    expect(() => mapRawToIngestDTO({})).toThrow(TypeError);
+  });
+
+  test('does not throw for valid non-empty invoiceId', () => {
+    expect(() => mapRawToIngestDTO({}, 'inv_valid')).not.toThrow();
   });
 });
 
@@ -589,6 +644,28 @@ describe('mapIngestDTOToNormalized()', () => {
       'contractId', 'eventBody', 'eventId', 'eventType',
       'invoiceId', 'ledgerSequence', 'observedAt', 'pagingToken', 'txHash',
     ]);
+  });
+
+  test('returned normalized object is frozen', () => {
+    const normalized = mapIngestDTOToNormalized(makeIngestDTO());
+    expect(Object.isFrozen(normalized)).toBe(true);
+  });
+
+  test('concurrent consumers share same reference but cannot mutate it', () => {
+    const dto = mapRawToIngestDTO(makeHorizonRecord(), 'inv_concurrent', {
+      capturedAt: '2026-09-30T10:00:00.000Z',
+    });
+    const n1 = mapIngestDTOToNormalized(dto);
+    const n2 = mapIngestDTOToNormalized(dto);
+    // Both normalized objects represent the same event
+    expect(n1.eventId).toBe(n2.eventId);
+    expect(n1.observedAt).toBe(n2.observedAt);
+    // Neither can be mutated
+    expect(Object.isFrozen(n1)).toBe(true);
+    expect(Object.isFrozen(n2)).toBe(true);
+    // Attempting mutation in strict mode throws; in non-strict it is silently ignored
+    expect(() => { n1.eventId = 'hacked'; }).not.toThrow();
+    expect(n1.eventId).toBe(dto.eventId); // value unchanged
   });
 });
 

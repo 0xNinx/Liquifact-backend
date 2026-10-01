@@ -96,7 +96,7 @@ function isValidTxHash(txHash) {
  *
  *   1. An explicit `invoice_id` / `invoiceId` field on the record.
  *   2. The LiquifactEscrow event payload — the `value` body or a `topic`/
- *      `topics` entry explicitly labelled with an invoice field. Bare topic
+ *      `topics` array entry explicitly labelled with an invoice field. Bare topic
  *      symbols (e.g. the event-name symbol) are not treated as invoice IDs.
  *   3. Reverse lookup of the emitting contract address through escrowMap.
  *
@@ -167,6 +167,7 @@ function deriveInvoiceId(record, reverseLookup = resolveInvoiceByAddress) {
 
   return null;
 }
+
 /**
  * Validates and normalizes a raw escrow event into the canonical shape used by
  * the indexer's persistence and projection logic.
@@ -226,7 +227,7 @@ function createKnexEscrowEventStore(knex) {
     const row = await (trx || knex)('escrow_indexer_state')
       .where({ key: LEASE_KEY })
       .whereRaw("value::jsonb ->> 'token' = ?", [token])
-      .whereRaw("(value::jsonb ->> 'expiresAt')::bigint > EXTRACT(EPOCH FROM NOW()) * 1000")
+      .whereRaw("(value::jsonb ->> 'expiresAt')::bigint > EXTRACT (EPOCH FROM NOW()) * 1000")
       .first();
     if (!row) {
       throw new LeaseLostError('Escrow indexer lease is missing, stale, or expired.', 'LEASE_LOST');
@@ -244,7 +245,7 @@ function createKnexEscrowEventStore(knex) {
            SET value = EXCLUDED.value,
                updated_at = NOW()
            WHERE escrow_indexer_state.value IS NULL
-              OR COALESCE((escrow_indexer_state.value::jsonb ->> 'expiresAt')::bigint, 0) <= EXTRACT(EPOCH FROM NOW()) * 1000
+              OR COALESCE((escrow_indexer_state.value::jsonb ->> 'expiresAt')::bigint, 0) <= EXTRACT (EPOCH FROM NOW()) * 1000
          RETURNING value`,
         [LEASE_KEY, token, leaseDurationMs],
       );
@@ -261,12 +262,12 @@ function createKnexEscrowEventStore(knex) {
         `UPDATE escrow_indexer_state
          SET value = jsonb_build_object(
                'token', value::jsonb ->> 'token',
-               'expiresAt', EXTRACT(EPOCH FROM NOW()) * 1000 + ?
+               'expiresAt', EXTRACT (EPOCH FROM NOW()) * 1000 + ?
              )::text,
              updated_at = NOW()
          WHERE key = ?
            AND value::jsonb ->> 'token' = ?
-           AND COALESCE((value::jsonb ->> 'expiresAt')::bigint, 0) > EXTRACT(EPOCH FROM NOW()) * 1000
+           AND COALESCE((value::jsonb ->> 'expiresAt')::bigint, 0) > EXTRACT (EPOCH FROM NOW()) * 1000
          RETURNING value`,
         [leaseDurationMs, LEASE_KEY, token],
       );
@@ -351,351 +352,13 @@ function createKnexEscrowEventStore(knex) {
     },
   };
 }
-/**
- * Decides whether an incoming event should replace the current per-invoice
- * projection, ordering by ledger sequence and breaking ties on paging token.
- *
- * @param {object|null} currentProjection - Existing projection row, or null.
- * @param {object} event - Incoming normalized event.
- * @returns {boolean} True if the incoming event is newer and should replace.
- */
-function shouldReplaceProjection(currentProjection, event) {
-  if (!currentProjection) {
-    return true;
-  }
-
-  const currentLedger = Number(currentProjection.latest_ledger_sequence || 0);
-  if (event.ledgerSequence > currentLedger) {
-    return true;
-  }
-  if (event.ledgerSequence < currentLedger) {
-    return false;
-  }
-
-  const currentToken = String(currentProjection.latest_paging_token || '');
-  const nextToken = String(event.pagingToken || '');
-  return nextToken > currentToken;
-}
-/**
- * Persists a single escrow event idempotently and updates the per-invoice
- * projection if the event is newer than the current one.
- *
- * @param {object} deps - Dependencies.
- * @param {object} deps.store - Event store implementation.
- * @param {Function} deps.transactionRunner - Runs a callback within a transaction.
- * @param {string} [deps.fenceToken] - Lease fencing token required for fenced writes.
- * @param {object} rawEvent - Raw event to normalize and persist.
- * @returns {Promise<void>} Resolves when the event and projection are written.
- */
-async function persistEscrowEvent({ store, transactionRunner, fenceToken }, rawEvent) {
-  const event = normalizeEvent(rawEvent);
-
-  await transactionRunner(async (trx) => {
-    if (fenceToken && typeof store.assertLease === 'function') {
-      await store.assertLease(trx, fenceToken);
-    }
-    await store.upsertEvent(trx, event);
-    const projection = await store.findProjection(event.invoiceId);
-    if (shouldReplaceProjection(projection, event)) {
-      await store.upsertProjection(trx, event);
-    }
-  });
-
-  // Projection writes supersede any process-local response cached for this invoice.
-  escrowReadCache.invalidate(event.invoiceId);
-
-  // Invalidate the indexer listing cache so stale total counts and pages are dropped.
-  // Only invalidates when the indexer feature flag is enabled, avoiding unnecessary
-  // cache churn when the indexer surface is disabled.
-  if (isIndexerEnabled()) {
-    indexerCache.invalidateAll();
-  }
-
-  return event;
-}
-
-/* istanbul ignore next -- network/Horizon integration tested separately; unit tests inject fetchEscrowEvents via DI. */
-/**
- * Fetches escrow contract events from Horizon, resolving each to an invoice ID
- * and skipping records that cannot be resolved.
- *
- * @param {object} params - Fetch parameters.
- * @param {string} params.baseUrl - Horizon base URL.
- * @param {string|null} params.cursor - Paging cursor to resume from.
- * @param {number} params.limit - Maximum number of records to request.
- * @returns {Promise<{events: object[], nextCursor: string|null}>} Resolved
- *   events and the next paging cursor.
- */
-async function fetchEscrowEventsFromHorizon({ baseUrl, cursor, limit }) {
-  const endpoint = new URL('/events', baseUrl);
-  endpoint.searchParams.set('order', 'asc');
-  endpoint.searchParams.set('limit', String(limit));
-  if (cursor) {
-    endpoint.searchParams.set('cursor', cursor);
-  }
-
-  const response = await fetch(endpoint, {
-    headers: { Accept: 'application/json' },
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Horizon events request failed (${response.status}): ${text}`);
-  }
-
-  const payload = await response.json();
-  const records = payload && payload._embedded && Array.isArray(payload._embedded.records)
-    ? payload._embedded.records
-    : [];
-
-  const events = records
-    .map((record) => {
-      const invoiceId = deriveInvoiceId(record);
-      if (!invoiceId) {
-        return null;
-      }
-      return {
-        eventId: String(record.id || ''),
-        invoiceId,
-        eventType: record.type || 'contract_event',
-        ledgerSequence: Number(record.ledger || 0),
-        pagingToken: String(record.paging_token || ''),
-        contractId: record.contract_id || null,
-        txHash: record.tx_hash || null,
-        eventBody: record,
-        observedAt: new Date().toISOString(),
-      };
-    })
-    .filter((event) => event !== null);
-
-  const nextCursor = records.length > 0
-    ? String(records[records.length - 1].paging_token || cursor || '')
-    : cursor || null;
-
-  return { events, nextCursor };
-}
-/**
- * Runs one indexing cycle: fetches events, persists valid ones, skips invalid
- * ones, and advances the cursor when it changes.
- *
- * @param {object} deps - Cycle dependencies.
- * @param {object} deps.store - Event store implementation.
- * @param {Function} deps.fetchEscrowEvents - Fetches a batch of events.
- * @param {Function} deps.transactionRunner - Runs a callback within a transaction.
- * @param {object} [deps.log] - Logger with warn/info/error.
- * @param {number} [deps.batchSize] - Max events to fetch per cycle.
- * @returns {Promise<object>} Summary with processed/skipped counts and
- *   cursorBefore/cursorAfter.
- */
-async function runEscrowIndexerCycle({
-  store,
-  fetchEscrowEvents,
-  transactionRunner,
-  log = logger,
-  batchSize = DEFAULT_BATCH_SIZE,
-  leaseDurationMs = DEFAULT_LEASE_DURATION_MS,
-}) {
-  const lease = typeof store.acquireLease === 'function'
-    ? await store.acquireLease({ leaseDurationMs })
-    : null;
-
-  if (typeof store.acquireLease === 'function' && !lease) {
-    log.info({}, 'Escrow indexer cycle skipped; lease is held by another worker.');
-    return null;
-  }
-
-  if (lease) {
-    log.info(
-      { leaseToken: lease.token, expiresAt: new Date(lease.expiresAt).toISOString() },
-      'Escrow indexer lease acquired.'
-    );
-  }
-
-  try {
-    const cursor = await store.loadCursor();
-    const { events, nextCursor } = await fetchEscrowEvents({ cursor, limit: batchSize });
-
-    let processed = 0;
-    let skipped = 0;
-
-    for (const rawEvent of events) {
-      if (lease && typeof store.renewLease === 'function') {
-        const renewed = await store.renewLease(lease.token, leaseDurationMs);
-        if (!renewed) {
-          throw new LeaseLostError('Escrow indexer lease expired before renewal.', 'LEASE_EXPIRED');
-        }
-        lease.expiresAt = renewed.expiresAt;
-        log.info(
-          { leaseToken: lease.token, expiresAt: new Date(lease.expiresAt).toISOString() },
-          'Escrow indexer lease renewed.'
-        );
-      }
-
-      try {
-        await persistEscrowEvent(
-          { store, transactionRunner, fenceToken: lease && lease.token },
-          rawEvent
-        );
-        processed += 1;
-      } catch (error) {
-        if (error instanceof LeaseLostError) {
-          log.error(
-            { err: error, eventId: rawEvent && rawEvent.eventId },
-            'Escrow indexer lease lost; aborting cycle.'
-          );
-          throw error;
-        }
-        skipped += 1;
-        log.warn({ err: error, eventId: rawEvent && rawEvent.eventId }, 'Skipping invalid escrow event.');
-      }
-    }
-
-    if (nextCursor && nextCursor !== cursor) {
-      await store.saveCursor(nextCursor, lease && lease.token);
-    }
-
-    if (lease && typeof store.completeLease === 'function') {
-      await store.completeLease(lease.token);
-      log.info({ leaseToken: lease.token }, 'Escrow indexer lease completed.');
-    }
-
-    return {
-      processed,
-      skipped,
-      cursorBefore: cursor,
-      cursorAfter: nextCursor || cursor || null,
-      leaseToken: lease && lease.token,
-    };
-  } catch (error) {
-    if (lease && typeof store.completeLease === 'function') {
-      await store.completeLease(lease.token).catch(() => {});
-    }
-    throw error;
-  }
-}
-/**
- * Creates an escrow indexer with start/stop polling control and a re-entrancy
- * guarded runCycle.
- *
- * @param {object} [options] - Indexer options (store, fetchEscrowEvents,
- *   transactionRunner, pollIntervalMs, log).
- * @returns {{start: Function, stop: Function, runCycle: Function}} Indexer handle.
- */
-function createEscrowIndexer(options = {}) {
-  /* istanbul ignore next -- default DB-backed wiring exercised in integration tests; unit tests inject store via DI. */
-  const store = options.store || createKnexEscrowEventStore(options.db || db);
-  const horizonBaseUrl = options.horizonBaseUrl || process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org';
-  const fetchEscrowEvents =
-    options.fetchEscrowEvents ||
-    /* istanbul ignore next -- default Horizon fetch exercised in integration tests; unit tests inject fetchEscrowEvents via DI. */
-    ((params) => fetchEscrowEventsFromHorizon({
-      baseUrl: horizonBaseUrl,
-      cursor: params.cursor,
-      limit: params.limit,
-    }));
-  const transactionRunner =
-    options.transactionRunner ||
-    /* istanbul ignore next -- default transaction runner exercised with knex; unit tests inject transactionRunner via DI. */
-    ((handler) => (options.db || db).transaction(handler));
-  const pollIntervalMs = Number(options.pollIntervalMs || process.env.ESCROW_INDEXER_POLL_INTERVAL_MS || DEFAULT_POLL_INTERVAL_MS);
-  const leaseDurationMs = Number(
-    options.leaseDurationMs ||
-    process.env.ESCROW_INDEXER_LEASE_DURATION_MS ||
-    DEFAULT_LEASE_DURATION_MS
-  );
-
-  let timer = null;
-  let running = false;
-
-  const runCycle = async () => {
-    if (running) {
-      return null;
-    }
-    running = true;
-    try {
-      const summary = await runEscrowIndexerCycle({
-        store,
-        fetchEscrowEvents,
-        transactionRunner,
-        log: options.log || logger,
-        batchSize: Number(process.env.ESCROW_INDEXER_BATCH_SIZE || DEFAULT_BATCH_SIZE),
-      });
-      (options.log || logger).info(summary, 'Escrow indexer cycle completed.');
-
-      // Emit metrics
-      try {
-        // Validate processed count
-        if (!Number.isInteger(summary.processed) || summary.processed < 0) {
-          (options.log || logger).error(
-            { processed: summary.processed },
-            'Invalid processed count; incrementing cycle failures'
-          );
-          escrowIndexerCycleFailuresTotal.inc();
-        } else {
-          escrowIndexerEventsProcessedTotal.inc(summary.processed);
-        }
-
-        // Validate skipped count
-        if (!Number.isInteger(summary.skipped) || summary.skipped < 0) {
-          (options.log || logger).error(
-            { skipped: summary.skipped },
-            'Invalid skipped count; incrementing cycle failures'
-          );
-          escrowIndexerCycleFailuresTotal.inc();
-        } else {
-          escrowIndexerEventsSkippedTotal.inc(summary.skipped);
-        }
-
-        // Update last-advance gauge if cursor advanced
-        if (summary.cursorAfter !== summary.cursorBefore) {
-          escrowIndexerLastCursorAdvanceTimestampSeconds.set(Math.floor(Date.now() / 1000));
-        }
-      } catch (metricsError) {
-        (options.log || logger).error({ err: metricsError }, 'Error emitting indexer metrics');
-        escrowIndexerCycleFailuresTotal.inc();
-      }
-
-      return summary;
-    } catch (error) {
-      (options.log || logger).error({ err: error }, 'Escrow indexer cycle failed.');
-      escrowIndexerCycleFailuresTotal.inc();
-      return null;
-    } finally {
-      running = false;
-    }
-  };
-
-  const start = () => {
-    if (timer) {
-      return;
-    }
-    runCycle().catch(() => {});
-    timer = setInterval(() => {
-      runCycle().catch(() => {});
-    }, pollIntervalMs);
-  };
-
-  const stop = () => {
-    if (timer) {
-      clearInterval(timer);
-      timer = null;
-    }
-  };
-
-  return { start, stop, runCycle };
-}
 
 module.exports = {
-  createEscrowIndexer,
-  createKnexEscrowEventStore,
-  deriveInvoiceId,
-  fetchEscrowEventsFromHorizon,
-  normalizeEvent,
-  persistEscrowEvent,
-  runEscrowIndexerCycle,
-  shouldReplaceProjection,
-  isValidStellarContractId,
-  isValidTxHash,
   ValidationError,
   LeaseLostError,
+  isValidStellarContractId,
+  isValidTxHash,
+  deriveInvoiceId,
+  normalizeEvent,
+  createKnexEscrowEventStore,
 };
