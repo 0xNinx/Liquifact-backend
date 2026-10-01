@@ -10,6 +10,13 @@ jest.mock('../../src/metrics', () => {
     footprintCacheMissesTotal: makeCounter(),
     footprintCacheEvictionsTotal: makeCounter(),
 
+    // CORS origin-cache metrics — required by src/config/corsCache.js which
+    // is loaded transitively whenever src/config/cors.js is imported.
+    corsCacheHitsTotal: makeCounter(),
+    corsCacheMissesTotal: makeCounter(),
+    corsCacheEvictionsTotal: makeCounter(),
+    corsCacheInvalidationsTotal: makeCounter(),
+
     // KYC webhook metrics — needed so route handlers can call
     // normalizeKycWebhookStatusClass / normalizeKycWebhookCause
     // in their res.on('finish') callbacks without crashing.

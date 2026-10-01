@@ -12,8 +12,8 @@
  * invalidation.
  *
  * Configuration (environment variables):
- * - `CORS_CACHE_TTL_SECONDS` – entry lifetime in seconds (default 5, clamped 1–60).
- * - `CORS_CACHE_MAX_ENTRIES` – hard cap on cached entries (default 256, clamped 16–4096).
+ * - `CORS_CACHE_TTL_SECONDS` – entry lifetime in seconds (default 5, clamped 1-60).
+ * - `CORS_CACHE_MAX_ENTRIES` – hard cap on cached entries (default 256, clamped 16-4096).
  *
  * @module config/corsCache
  */
