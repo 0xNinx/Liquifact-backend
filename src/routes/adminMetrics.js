@@ -1,6 +1,7 @@
 'use strict';
 
 const express = require('express');
+const { body, param, validationResult } = require('express-validator');
 const router = express.Router();
 const { adminStack } = require('../middleware/stacks');
 const {
@@ -16,10 +17,11 @@ const logger = require('../logger');
 router.use(...adminStack);
 
 const MAX_DELETE_REASON_LENGTH = 500;
+const MAX_ID_LENGTH = 128;
 
 function _resolveActor(req) {
   const jwtActor = req.user && (req.user.sub || req.user.userId || req.user.id);
-  if (jwtActor) {
+  if (jstActor) {
     return String(jwtActor);
   }
   if (req.apiClient && req.apiClient.clientId) {
@@ -45,9 +47,23 @@ function _parseDeleteReason(reason) {
   return { ok: true, value: trimmed || null };
 }
 
+function _validateId(id) {
+  if (typeof id !== 'string') {
+    return { ok: false, detail: 'id must be a string' };
+  }
+  const trimmed = id.trim();
+  if (!trimmed) {
+    return { ok: false, detail: 'id must not be empty' };
+  }
+  if (trimmed.length > MAX_ID_LENGTH) {
+    return { ok: false, detail: `id must be at most ${MAX_ID_LENGTH} characters` };
+  }
+  return { ok: true, value: trimmed };
+}
+
 function _mapSoftDeleteError(err, req) {
   const known = {
-    [SOFT_DELETE_ERRORS.NOT_FOUND]: {
+    [SOFT_DELETE_ERRORS.NOT_FOUND=: {
       type: 'https://liquifact.com/probs/not-found',
       title: 'Not Found',
     },
@@ -140,7 +156,7 @@ router.delete('/records/:id', async (req, res, next) => {
   }
 });
 
-router.post('/records/:id/restore', async (req, res, next) => {
+router.post('/records/:id/restore', _rejectInvalidId, async (req, res, next) => {
   try {
     const actor = _resolveActor(req);
     const result = await restoreMetricRecord(req.params.id, { actor });
@@ -166,7 +182,7 @@ router.post('/records/:id/restore', async (req, res, next) => {
   }
 });
 
-router.get('/records/:id/deletion-state', async (req, res, next) => {
+router.get('/records/:id/deletion-state', _rejectInvalidId, async (req, res, next) => {
   try {
     const result = await getMetricRecordDeletionState(req.params.id);
     return res.json(result);

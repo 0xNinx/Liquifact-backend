@@ -101,6 +101,8 @@
  * @property {number}                   statusCode      - Final HTTP status code.
  * @property {number}                   durationSeconds - Request wall-clock duration in seconds.
  * @property {PersistenceCause}         cause           - Normalised error cause label.
+ * @property {boolean}                  success         - Whether the request completed without error.
+ * @property {number}                   errorCount      - 1 when the request failed, 0 otherwise.
  * @property {import('express').Request} [req]          - Express request (for scoped logging).
  */
 
@@ -113,6 +115,11 @@
  *
  * Every field is coerced to a safe integer.  Unknown keys on the raw object
  * are silently stripped.  This function never throws.
+ *
+ * ## Invariants
+ * - All four fields are non-negative safe integers (`Number.isSafeInteger`).
+ * - Non-finite, negative, fractional, or non-numeric inputs collapse to `0`.
+ * - The returned object always has exactly the four declared keys.
  *
  * @param {unknown} raw - Raw counts object from the invoice service or DB query.
  * @returns {SmeMetricsResponse} Normalised DTO with all four keys guaranteed.
@@ -129,6 +136,30 @@ function toSmeMetricsResponse(raw) {
     settled: toCount(obj.settled),
     defaulted: toCount(obj.defaulted),
   };
+  return {
+    open: toCount(obj.open),
+    funded: toCount(obj.funded),
+    settled: toCount(obj.settled),
+    defaulted: toCount(obj.defaulted),
+  };
+}
+
+/**
+ * Coerces an arbitrary value to a non-negative safe integer.
+ *
+ * Returns `0` for `NaN`, `Infinity`, `-Infinity`, negatives, non-numbers,
+ * and values outside the safe-integer range.  Fractional values are floored.
+ *
+ * @param {unknown} value - Value to coerce.
+ * @returns {number} A non-negative safe integer.
+ */
+function toNonNegativeInt(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    return 0;
+  }
+  const floored = Math.floor(n);
+  return Number.isSafeInteger(floored) ? floored : 0;
 }
 
 /**
@@ -136,6 +167,12 @@ function toSmeMetricsResponse(raw) {
  *
  * Optional pagination fields are preserved when present on the raw input;
  * otherwise they are omitted from the returned meta object.
+ *
+ * ## Invariants
+ * - `timestamp` and `version` are always non-empty strings.
+ * - `total` and `limit`, when present, are non-negative safe integers.
+ * - `hasMore`, when present, is a boolean.
+ * - `nextCursor`, when present, is either a string or `null`.
  *
  * @param {unknown} raw - Raw meta-like object (e.g. from invoice service or
  *   a manually constructed meta block in the route handler).
@@ -160,8 +197,11 @@ function toSmeMetricsMeta(raw) {
   if (Array.isArray(obj.invoices)) {
     meta.invoices = obj.invoices;
   }
-  if (typeof obj.total === 'number' && Number.isFinite(obj.total)) {
-    meta.total = Math.max(0, Math.floor(obj.total));
+  if (typeof obj.total === 'number' && Number.isFinite(obj.total) && obj.total >= 0) {
+    const total = Math.floor(obj.total);
+    if (Number.isSafeInteger(total)) {
+      meta.total = total;
+    }
   }
   if (typeof obj.limit === 'number' && Number.isFinite(obj.limit) && obj.limit > 0) {
     meta.limit = obj.limit;
@@ -171,7 +211,9 @@ function toSmeMetricsMeta(raw) {
   }
   // Explicitly handle nextCursor — null is a valid terminal value.
   if (Object.prototype.hasOwnProperty.call(obj, 'nextCursor')) {
-    meta.nextCursor = obj.nextCursor === undefined ? null : obj.nextCursor;
+    meta.nextCursor = (typeof obj.nextCursor === 'string' || obj.nextCursor === null)
+      ? obj.nextCursor
+      : null;
   }
 
   return /** @type {SmeMetricsMeta} */ (meta);
@@ -183,6 +225,13 @@ function toSmeMetricsMeta(raw) {
  * This is a pure composition helper — it does not inspect or validate its
  * arguments beyond basic type safety.
  *
+ * ## Invariants
+ * - `data` is always a valid {@link SmeMetricsResponse} (normalised via
+ *   {@link toSmeMetricsResponse}).
+ * - `meta` is always a valid {@link SmeMetricsMeta} (normalised via
+ *   {@link toSmeMetricsMeta}).
+ * - `error` is either `null` or a plain object.
+ *
  * @param {SmeMetricsResponse} data      - Aggregated invoice counts.
  * @param {SmeMetricsMeta}     meta      - Response metadata block.
  * @param {Object|null}       [error]   - Optional error detail object.
@@ -190,9 +239,9 @@ function toSmeMetricsMeta(raw) {
  */
 function toSmeMetricsApiResponse(data, meta, error = null) {
   return {
-    data,
-    meta,
-    error,
+    data: toSmeMetricsResponse(data),
+    meta: toSmeMetricsMeta(meta),
+    error: (error && typeof error === 'object' && !Array.isArray(error)) ? error : null,
     timestamp: new Date().toISOString(),
   };
 }
@@ -209,11 +258,19 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  * {@link module:metrics}).  This function validates the shape and provides safe
  * defaults for any missing fields.
  *
+ * ## Invariants
+ * - `endpoint` is a non-empty string; unknown values collapse to `'unknown'`.
+ * - `statusCode` is an integer in `[100, 599]`; invalid values collapse to `200`.
+ * - `durationSeconds` is a non-negative finite number; invalid values collapse to `0`.
+ * - `cause` is one of `'validation' | 'storage' | 'internal' | 'none'`.
+ *
  * @param {Object} raw                          - Raw outcome data.
  * @param {string} raw.endpoint                 - Endpoint label (already normalised).
  * @param {number} raw.statusCode               - HTTP status code.
  * @param {number} raw.durationSeconds          - Wall-clock duration in seconds.
  * @param {string} [raw.cause='none']           - Error cause label (already normalised).
+ * @param {boolean} [raw.success]               - Whether the request succeeded.
+ * @param {number} [raw.errorCount]             - Error count (0 or 1).
  * @param {import('express').Request} [raw.req] - Express request for scoped logging.
  * @returns {PersistenceRecordParams} Normalised DTO.
  */
@@ -264,7 +321,7 @@ function isValidSmeMetricsResponse(value) {
  * @param {unknown} value - Value to inspect.
  * @returns {boolean} `true` when the value has the expected shape.
  */
-function isValidPersistenceRecordParams(value) {
+function isSmeMetricsResponse(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }
@@ -279,15 +336,10 @@ function isValidPersistenceRecordParams(value) {
 }
 
 module.exports = {
-  // SME metrics mapping
   toSmeMetricsResponse,
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
-
-  // Persistence instrumentation mapping
   toPersistenceRecordParams,
-
-  // Validation helpers
-  isValidSmeMetricsResponse,
-  isValidPersistenceRecordParams,
+  toNonNegativeInt,
+  isSmeMetricsResponse,
 };

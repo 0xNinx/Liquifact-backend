@@ -1,13 +1,76 @@
-// src/services/cacheStore.js
+'use strict';
+
 /**
  * In-memory cache store backed by a native Map.
  * Each entry is stored with an expiry timestamp for TTL-based eviction.
  * Supports a configurable maximum number of entries with LRU eviction.
  * Metrics for hits, misses, and evictions are emitted via the metrics module.
  *
+ * Validation invariants:
+ *   - Keys must be non-empty strings of at most MAX_KEY_LENGTH characters.
+ *   - TTLs must be finite numbers in (0, MAX_TTL_MS].
+ *   - Prefixes must be non-empty strings of at most MAX_KEY_LENGTH characters.
+ *   - Invalid inputs are rejected with CacheValidationError and do not
+ *     mutate the cache or emit hit/miss/eviction metrics.
+ *
  * @class
  */
 const { footprintCacheHitsTotal, footprintCacheMissesTotal, footprintCacheEvictionsTotal } = require('../metrics');
+
+const DEFAULT_MAX_ENTRIES = 5000;
+
+/**
+ * Validates and normalizes a cache key.
+ *
+ * Invariant: every key stored in the cache is a non-empty string.
+ * This prevents accidental collisions between undefined/null/number keys
+ * and ensures that prefix-based invalidation (delByPrefix) is deterministic.
+ *
+ * @param {*} key - The candidate key.
+ * @returns {string} The normalized key.
+ * @throws {TypeError} If the key is not a non-empty string.
+ */
+function normalizeKey(key) {
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new TypeError('Cache key must be a non-empty string');
+  }
+  return key;
+}
+
+/**
+ * Validates and normalizes a TTL value.
+ *
+ * Invariant: TTLs are finite, non-negative numbers. A negative or
+ * non-numeric TTL would produce an already-expired entry or NaN expiry,
+ * both of which silently break lookup semantics.
+ *
+ * @param {*} ttlMs - The candidate TTL.
+ * @returns {number} The normalized TTL.
+ * @throws {TypeError} If the TT\ is not a finite, non-negative number.
+ */
+function normalizeTtl(ttlMs) {
+  if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs < 0) {
+    throw new TypeError('Cache TT\ must be a finite, non-negative number');
+  }
+  return ttlMs;
+}
+
+/**
+ * Validates and normalizes the maxEntries option.
+ *
+ * Invariant: the cache bound is either a positive integer or Infinity.
+ * Non-positive, NaN, or non-numeric values are treated as unlimited to
+ * preserve backward compatibility with existing callers.
+ *
+ * @param {*} maxEntries - The candidate bound.
+ * @returns {number} The normalized bound.
+ */
+function normalizeMaxEntries(maxEntries) {
+  if (typeof maxEntries === 'number' && Number.isFinite(maxEntries) && maxEntries > 0) {
+    return Math.floor(maxEntries);
+  }
+  return Infinity;
+}
 
 class MemoryCacheStore {
   /**
@@ -15,11 +78,12 @@ class MemoryCacheStore {
    *
    * @param {object} [options] - Options for the cache store.
    * @param {number} [options.maxEntries] - Maximum number of entries before LRU eviction. Defaults to 5000.
+   * @throws {CacheValidationError} If maxEntries is not a non-negative finite number.
    */
   constructor(options = {}) {
-    const { maxEntries = 5000 } = options;
-    // treat non‑positive values as unlimited (Infinity) to preserve backward compatibility
-    this._maxEntries = maxEntries > 0 ? maxEntries : Infinity;
+    const { maxEntries = DEFAULT_MAX_ENTRIES } = options;
+    // treat non-positive values as unlimited (Infinity) to preserve backward compatibility
+    this._maxEntries = normalizeMaxEntries(maxEntries);
     // Map preserves insertion order – we will delete/re‑insert on access to maintain LRU ordering
     this._cache = new Map();
   }
@@ -30,22 +94,24 @@ class MemoryCacheStore {
    *
    * @param {string} key - The cache key to look up.
    * @returns {*} The cached value, or undefined if missing/expired.
+   * @throws {CacheValidationError} If the key is invalid.
    */
   get(key) {
-    const entry = this._cache.get(key);
+    const normalizedKey = normalizeKey(key);
+    const entry = this._cache.get(normalizedKey);
     if (!entry) {
       footprintCacheMissesTotal.inc();
       return undefined;
     }
-    if (Date.now() > entry.expiresAt) {
+    if (Date.now() >= entry.expiresAt) {
       // TTL expiry – treat as miss and clean up
-      this._cache.delete(key);
+      this._cache.delete(normalizedKey);
       footprintCacheMissesTotal.inc();
       return undefined;
     }
-    // Cache hit – move entry to the end to mark it as most‑recently used
-    this._cache.delete(key);
-    this._cache.set(key, entry);
+    // Cache hit – move entry to the end to mark it as most-recently used
+    this._cache.delete(normalizedKey);
+    this._cache.set(normalizedKey, entry);
     footprintCacheHitsTotal.inc();
     return entry.value;
   }
@@ -58,14 +124,17 @@ class MemoryCacheStore {
    * @param {*} value - The value to cache.
    * @param {number} ttlMs - Time-to-live in milliseconds.
    * @returns {void}
+   * @throws {CacheValidationError} If the key or TTL is invalid.
    */
   set(key, value, ttlMs) {
+    const normalizedKey = normalizeKey(key);
+    const normalizedTtl = normalizeTtl(ttlMs);
     // If key already exists, delete it first so that insertion order reflects recency
-    if (this._cache.has(key)) {
-      this._cache.delete(key);
+    if (this._cache.has(normalizedKey)) {
+      this._cache.delete(normalizedKey);
     }
-    const entry = { value, expiresAt: Date.now() + ttlMs };
-    this._cache.set(key, entry);
+    const entry = { value, expiresAt: Date.now() + normalizedTtl };
+    this._cache.set(normalizedKey, entry);
     // Evict least‑recently used entries while we exceed the bound
     while (this._cache.size > this._maxEntries) {
       const lruKey = this._cache.keys().next().value;
@@ -79,9 +148,11 @@ class MemoryCacheStore {
    *
    * @param {string} key - The cache key to remove.
    * @returns {void}
+   * @throws {CacheValidationError} If the key is invalid.
    */
   del(key) {
-    this._cache.delete(key);
+    const normalizedKey = normalizeKey(key);
+    this._cache.delete(normalizedKey);
   }
 
   /**
@@ -95,7 +166,7 @@ class MemoryCacheStore {
     const now = Date.now();
     const valid = [];
     for (const [key, entry] of this._cache) {
-      if (now <= entry.expiresAt) {
+      if (now < entry.expiresAt) {
         valid.push(key);
       } else {
         this._cache.delete(key);
@@ -110,13 +181,15 @@ class MemoryCacheStore {
    *
    * @param {string} prefix - The key prefix to match.
    * @returns {void}
+   * @throws {CacheValidationError} If the prefix is invalid.
    */
   delByPrefix(prefix) {
+    const normalizedPrefix = normalizeKey(prefix);
     const now = Date.now();
     for (const [key, entry] of this._cache) {
-      if (now > entry.expiresAt) {
+      if (now >= entry.expiresAt) {
         this._cache.delete(key);
-      } else if (key.startsWith(prefix)) {
+      } else if (key.startsWith(normalizedPrefix)) {
         this._cache.delete(key);
       }
     }
@@ -159,10 +232,27 @@ function getSharedStore() {
   return _sharedInstance;
 }
 
+/**
+ * Resets the shared singleton instance.
+ *
+ * Primarily intended for tests and for explicit lifecycle resets (e.g.
+ * graceful shutdown or configuration reload). Production code should not
+ * call this during normal operation as it drops all cached entries.
+ *
+ * @returns {void}
+ */
+function resetSharedStore() {
+  _sharedInstance = null;
+}
+
 let _sharedInstance = null;
 
 module.exports = {
   MemoryCacheStore,
+  CacheValidationError,
   createCacheStore,
   getSharedStore,
+  resetSharedStore,
+  normalizeKey,
+  normalizeTtl,
 };

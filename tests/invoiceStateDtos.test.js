@@ -622,3 +622,122 @@ describe('Mapper determinism', () => {
     ).not.toThrow();
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Contract compliance tests - verify @contract guarantees           */
+/* ------------------------------------------------------------------ */
+describe('Contract compliance (v1.0)', () => {
+  describe('Request mappers - empty object fallback', () => {
+    it('mapTransitionRequest returns stable shape for null/undefined/array body', () => {
+      const nullOut = mapTransitionRequest(null);
+      const undefOut = mapTransitionRequest(undefined);
+      const arrOut = mapTransitionRequest([1, 2, 3]);
+      const emptyOut = mapTransitionRequest({});
+
+      expect(nullOut).toEqual(emptyOut);
+      expect(undefOut).toEqual(emptyOut);
+      expect(arrOut).toEqual(emptyOut);
+      expect('targetState' in emptyOut).toBe(true);
+      expect('reason' in emptyOut).toBe(true);
+    });
+
+    it('mapApproveRequest returns stable shape for null/undefined/array body', () => {
+      const nullOut = mapApproveRequest(null);
+      const undefOut = mapApproveRequest(undefined);
+      const arrOut = mapApproveRequest([1, 2, 3]);
+      const emptyOut = mapApproveRequest({});
+
+      expect(nullOut).toEqual(emptyOut);
+      expect(undefOut).toEqual(emptyOut);
+      expect(arrOut).toEqual(emptyOut);
+      expect('reason' in emptyOut).toBe(true);
+    });
+  });
+
+  describe('Response mappers - undefined fields omitted (not null)', () => {
+    it('toTransitionResponse omits reason when undefined', () => {
+      const dto = toTransitionResponse({
+        invoiceId: INVOICE_ID,
+        result: makeServiceResult(),
+        reason: undefined,
+      });
+      expect('reason' in dto).toBe(false);
+      expect(jsonRoundTrip(dto)).not.toHaveProperty('reason');
+    });
+
+    it('toHistoryEntryDto omits optional fields when undefined', () => {
+      const minimalLog = { id: 'audit-1', timestamp: TS, actor: ACTOR };
+      const dto = toHistoryEntryDto(minimalLog);
+      expect('fromState' in dto).toBe(false);
+      expect('toState' in dto).toBe(false);
+      expect('reason' in dto).toBe(false);
+      expect('ipAddress' in dto).toBe(false);
+    });
+  });
+
+  describe('Response mappers - array copy prevents mutation', () => {
+    it('toInvoiceStateResponse copies allowedTransitions array', () => {
+      const inputArray = ['approved', 'rejected'];
+      const dto = toInvoiceStateResponse({
+        invoiceId: INVOICE_ID,
+        currentState: 'pending',
+        allowedTransitions: inputArray,
+      });
+      dto.allowedTransitions.push('cancelled');
+      expect(inputArray).toEqual(['approved', 'rejected']);
+    });
+  });
+
+  describe('Response mappers - safe defaults for malformed inputs', () => {
+    it('toInvoiceStateResponse handles non-array allowedTransitions', () => {
+      const dto1 = toInvoiceStateResponse({
+        invoiceId: INVOICE_ID,
+        currentState: 'pending',
+        allowedTransitions: null,
+      });
+      expect(Array.isArray(dto1.allowedTransitions)).toBe(true);
+      expect(dto1.allowedTransitions).toEqual([]);
+
+      const dto2 = toInvoiceStateResponse({
+        invoiceId: INVOICE_ID,
+        currentState: 'pending',
+        allowedTransitions: 'not-an-array',
+      });
+      expect(Array.isArray(dto2.allowedTransitions)).toBe(true);
+    });
+
+    it('toInvoiceHistoryResponse handles non-array transitions', () => {
+      const dto1 = toInvoiceHistoryResponse({
+        invoiceId: INVOICE_ID,
+        currentState: 'pending',
+        transitions: null,
+      });
+      expect(Array.isArray(dto1.transitions)).toBe(true);
+      expect(dto1.totalTransitions).toBe(0);
+
+      const dto2 = toInvoiceHistoryResponse({
+        invoiceId: INVOICE_ID,
+        currentState: 'pending',
+        transitions: 'invalid',
+      });
+      expect(Array.isArray(dto2.transitions)).toBe(true);
+    });
+
+    it('toTransitionResponse handles missing auditLog', () => {
+      const dto = toTransitionResponse({
+        invoiceId: INVOICE_ID,
+        result: makeServiceResult({ auditLog: null }),
+      });
+      expect(dto.auditLogId).toBe('');
+    });
+
+    it('toLinkEscrowResponse handles non-string escrowId', () => {
+      const dto = toLinkEscrowResponse({
+        invoiceId: INVOICE_ID,
+        result: makeServiceResult(),
+        escrowId: 12345,
+      });
+      expect(dto.escrowId).toBeNull();
+    });
+  });
+});
