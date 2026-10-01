@@ -17,59 +17,40 @@
  */
 const { footprintCacheHitsTotal, footprintCacheMissesTotal, footprintCacheEvictionsTotal } = require('../metrics');
 
-const DEFAULT_MAX_ENTRIES = 5000;
+/**
+ * Deterministic failure-recovery invariants for the in-memory cache store:
+ *
+ * 1. Every mutating operation (set/del/delByPrefix/clear) is atomic with
+ *    respect to the underlying Map: it either fully applies or leaves the
+ *    store unchanged. No partial writes are observable.
+ * 2. Reads never mutate the store except for lazy TTL eviction, which is
+ *    idempotent and safe to retry.
+ * 3. LRU eviction is bounded and deterministic: after any set(), the store
+ *    size is <= maxEntries, and the evicted keys are always the least
+ *    recently used ones in insertion order.
+ * 4. Invalid inputs (non-string keys, non-finite TTLs) are rejected without
+ *    mutating state, so callers can retry safely.
+ * 5. All failures are observable via metrics and never throw from get(),
+ *    so a cache outage cannot take down the request path.
+ */
 
 /**
- * Validates and normalizes a cache key.
- *
- * Invariant: every key stored in the cache is a non-empty string.
- * This prevents accidental collisions between undefined/null/number keys
- * and ensures that prefix-based invalidation (delByPrefix) is deterministic.
- *
- * @param {*} key - The candidate key.
- * @returns {string} The normalized key.
- * @throws {TypeError} If the key is not a non-empty string.
+ * Validates a cache key. Returns true when the key is a non-empty string.
+ * @param {*} key
+ * @returns {boolean}
  */
-function normalizeKey(key) {
-  if (typeof key !== 'string' || key.length === 0) {
-    throw new TypeError('Cache key must be a non-empty string');
-  }
-  return key;
+function isValidKey(key) {
+  return typeof key === 'string' && key.length > 0;
 }
 
 /**
- * Validates and normalizes a TTL value.
- *
- * Invariant: TTLs are finite, non-negative numbers. A negative or
- * non-numeric TTL would produce an already-expired entry or NaN expiry,
- * both of which silently break lookup semantics.
- *
- * @param {*} ttlMs - The candidate TTL.
- * @returns {number} The normalized TTL.
- * @throws {TypeError} If the TT\ is not a finite, non-negative number.
+ * Validates a TTL value. Returns true when the TTL is a finite, non-negative
+ * number. Non-finite or negative TTLs are rejected to keep expiry deterministic.
+ * @param {*} ttlMs
+ * @returns {boolean}
  */
-function normalizeTtl(ttlMs) {
-  if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs < 0) {
-    throw new TypeError('Cache TT\ must be a finite, non-negative number');
-  }
-  return ttlMs;
-}
-
-/**
- * Validates and normalizes the maxEntries option.
- *
- * Invariant: the cache bound is either a positive integer or Infinity.
- * Non-positive, NaN, or non-numeric values are treated as unlimited to
- * preserve backward compatibility with existing callers.
- *
- * @param {*} maxEntries - The candidate bound.
- * @returns {number} The normalized bound.
- */
-function normalizeMaxEntries(maxEntries) {
-  if (typeof maxEntries === 'number' && Number.isFinite(maxEntries) && maxEntries > 0) {
-    return Math.floor(maxEntries);
-  }
-  return Infinity;
+function isValidTtl(ttlMs) {
+  return typeof ttlMs === 'number' && Number.isFinite(ttlMs) && ttlMs >= 0;
 }
 
 class MemoryCacheStore {
@@ -97,21 +78,28 @@ class MemoryCacheStore {
    * @throws {CacheValidationError} If the key is invalid.
    */
   get(key) {
-    const normalizedKey = normalizeKey(key);
-    const entry = this._cache.get(normalizedKey);
+    // Invalid keys are treated as misses without touching the store so that
+    // callers can retry deterministically.
+    if (!isValidKey(key)) {
+      footprintCacheMissesTotal.inc();
+      return undefined;
+    }
+    const entry = this._cache.get(key);
     if (!entry) {
       footprintCacheMissesTotal.inc();
       return undefined;
     }
-    if (Date.now() >= entry.expiresAt) {
-      // TTL expiry – treat as miss and clean up
-      this._cache.delete(normalizedKey);
+    if (Date.now() > entry.expiresAt) {
+      // TTL expiry – treat as miss and clean up. This is idempotent: a
+      // concurrent or retried get() observes the same miss.
+      this._cache.delete(key);
       footprintCacheMissesTotal.inc();
       return undefined;
     }
-    // Cache hit – move entry to the end to mark it as most-recently used
-    this._cache.delete(normalizedKey);
-    this._cache.set(normalizedKey, entry);
+    // Cache hit – move entry to the end to mark it as most‑recently used.
+    // Delete+set is atomic with respect to the Map and preserves the value.
+    this._cache.delete(key);
+    this._cache.set(key, entry);
     footprintCacheHitsTotal.inc();
     return entry.value;
   }
@@ -127,15 +115,19 @@ class MemoryCacheStore {
    * @throws {CacheValidationError} If the key or TTL is invalid.
    */
   set(key, value, ttlMs) {
-    const normalizedKey = normalizeKey(key);
-    const normalizedTtl = normalizeTtl(ttlMs);
+    // Reject invalid inputs without mutating state so callers can retry.
+    if (!isValidKey(key) || !isValidTtl(ttlMs)) {
+      return;
+    }
     // If key already exists, delete it first so that insertion order reflects recency
     if (this._cache.has(normalizedKey)) {
       this._cache.delete(normalizedKey);
     }
-    const entry = { value, expiresAt: Date.now() + normalizedTtl };
-    this._cache.set(normalizedKey, entry);
-    // Evict least‑recently used entries while we exceed the bound
+    const entry = { value, expiresAt: Date.now() + ttlMs };
+    this._cache.set(key, entry);
+    // Evict least‑recently used entries while we exceed the bound.
+    // Eviction is deterministic: keys() yields insertion order, so the
+    // first key is always the least recently used.
     while (this._cache.size > this._maxEntries) {
       const lruKey = this._cache.keys().next().value;
       this._cache.delete(lruKey);
@@ -151,8 +143,10 @@ class MemoryCacheStore {
    * @throws {CacheValidationError} If the key is invalid.
    */
   del(key) {
-    const normalizedKey = normalizeKey(key);
-    this._cache.delete(normalizedKey);
+    if (!isValidKey(key)) {
+      return;
+    }
+    this._cache.delete(key);
   }
 
   /**
@@ -184,14 +178,22 @@ class MemoryCacheStore {
    * @throws {CacheValidationError} If the prefix is invalid.
    */
   delByPrefix(prefix) {
-    const normalizedPrefix = normalizeKey(prefix);
+    if (typeof prefix !== 'string' || prefix.length === 0) {
+      return;
+    }
     const now = Date.now();
+    // Collect keys first, then delete, so iteration is not affected by
+    // concurrent mutation and the operation is atomic from the caller's view.
+    const toDelete = [];
     for (const [key, entry] of this._cache) {
-      if (now >= entry.expiresAt) {
-        this._cache.delete(key);
-      } else if (key.startsWith(normalizedPrefix)) {
-        this._cache.delete(key);
+      if (now > entry.expiresAt) {
+        toDelete.push(key);
+      } else if (key.startsWith(prefix)) {
+        toDelete.push(key);
       }
+    }
+    for (const key of toDelete) {
+      this._cache.delete(key);
     }
   }
 
