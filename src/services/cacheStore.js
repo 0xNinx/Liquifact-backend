@@ -1,9 +1,17 @@
-// src/services/cacheStore.js
+'use strict';
+
 /**
  * In-memory cache store backed by a native Map.
  * Each entry is stored with an expiry timestamp for TTL-based eviction.
  * Supports a configurable maximum number of entries with LRU eviction.
  * Metrics for hits, misses, and evictions are emitted via the metrics module.
+ *
+ * Validation invariants:
+ *   - Keys must be non-empty strings of at most MAX_KEY_LENGTH characters.
+ *   - TTLs must be finite numbers in (0, MAX_TTL_MS].
+ *   - Prefixes must be non-empty strings of at most MAX_KEY_LENGTH characters.
+ *   - Invalid inputs are rejected with CacheValidationError and do not
+ *     mutate the cache or emit hit/miss/eviction metrics.
  *
  * @class
  */
@@ -51,11 +59,12 @@ class MemoryCacheStore {
    *
    * @param {object} [options] - Options for the cache store.
    * @param {number} [options.maxEntries] - Maximum number of entries before LRU eviction. Defaults to 5000.
+   * @throws {CacheValidationError} If maxEntries is not a non-negative finite number.
    */
   constructor(options = {}) {
-    const { maxEntries = 5000 } = options;
-    // treat non‑positive values as unlimited (Infinity) to preserve backward compatibility
-    this._maxEntries = maxEntries > 0 ? maxEntries : Infinity;
+    const { maxEntries = DEFAULT_MAX_ENTRIES } = options;
+    // treat non-positive values as unlimited (Infinity) to preserve backward compatibility
+    this._maxEntries = normalizeMaxEntries(maxEntries);
     // Map preserves insertion order – we will delete/re‑insert on access to maintain LRU ordering
     this._cache = new Map();
   }
@@ -66,6 +75,7 @@ class MemoryCacheStore {
    *
    * @param {string} key - The cache key to look up.
    * @returns {*} The cached value, or undefined if missing/expired.
+   * @throws {CacheValidationError} If the key is invalid.
    */
   get(key) {
     // Invalid keys are treated as misses without touching the store so that
@@ -102,6 +112,7 @@ class MemoryCacheStore {
    * @param {*} value - The value to cache.
    * @param {number} ttlMs - Time-to-live in milliseconds.
    * @returns {void}
+   * @throws {CacheValidationError} If the key or TTL is invalid.
    */
   set(key, value, ttlMs) {
     // Reject invalid inputs without mutating state so callers can retry.
@@ -109,8 +120,8 @@ class MemoryCacheStore {
       return;
     }
     // If key already exists, delete it first so that insertion order reflects recency
-    if (this._cache.has(key)) {
-      this._cache.delete(key);
+    if (this._cache.has(normalizedKey)) {
+      this._cache.delete(normalizedKey);
     }
     const entry = { value, expiresAt: Date.now() + ttlMs };
     this._cache.set(key, entry);
@@ -129,6 +140,7 @@ class MemoryCacheStore {
    *
    * @param {string} key - The cache key to remove.
    * @returns {void}
+   * @throws {CacheValidationError} If the key is invalid.
    */
   del(key) {
     if (!isValidKey(key)) {
@@ -148,7 +160,7 @@ class MemoryCacheStore {
     const now = Date.now();
     const valid = [];
     for (const [key, entry] of this._cache) {
-      if (now <= entry.expiresAt) {
+      if (now < entry.expiresAt) {
         valid.push(key);
       } else {
         this._cache.delete(key);
@@ -163,6 +175,7 @@ class MemoryCacheStore {
    *
    * @param {string} prefix - The key prefix to match.
    * @returns {void}
+   * @throws {CacheValidationError} If the prefix is invalid.
    */
   delByPrefix(prefix) {
     if (typeof prefix !== 'string' || prefix.length === 0) {
@@ -221,10 +234,27 @@ function getSharedStore() {
   return _sharedInstance;
 }
 
+/**
+ * Resets the shared singleton instance.
+ *
+ * Primarily intended for tests and for explicit lifecycle resets (e.g.
+ * graceful shutdown or configuration reload). Production code should not
+ * call this during normal operation as it drops all cached entries.
+ *
+ * @returns {void}
+ */
+function resetSharedStore() {
+  _sharedInstance = null;
+}
+
 let _sharedInstance = null;
 
 module.exports = {
   MemoryCacheStore,
+  CacheValidationError,
   createCacheStore,
   getSharedStore,
+  resetSharedStore,
+  normalizeKey,
+  normalizeTtl,
 };

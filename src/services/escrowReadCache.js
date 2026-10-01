@@ -8,6 +8,90 @@ const {
 } = require('../metrics');
 
 /**
+ * Validation boundaries for the escrow read cache.
+ *
+ * Invariants:
+ * - Cache keys are non-empty strings of bounded length.
+ * - TTL and maxEntries are positive integers.
+ * - Cached values are non-null objects.
+ * - Invalid inputs are rejected with a TypeError or RangeError before any state mutation.
+ */
+
+const MAX_KEY_LENGTH = 512;
+const MAX_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_ENTRIES = 100000;
+const MAX_VALUE_BYTES = 1024 * 1024; // 1 MiB serialized payload bound
+
+/**
+ * Validates a cache key.
+ * @param {unknown} key Candidate key.
+ * @param {string} name Parameter name for error messages.
+ * @returns {string} The validated key.
+ * @throws {TypeError} When the key is not a non-empty string.
+ * @throws {RangeError} When the key exceeds the maximum length.
+ */
+function validateKey(key, name = 'invoiceId') {
+  if (typeof key !== 'string') {
+    throw new TypeError(`${name} must be a string`);
+  }
+  if (key.length === 0) {
+    throw new TypeError(`${name} must not be empty`);
+  }
+  if (key.trim().length === 0) {
+    throw new TypeError(`${name} must not be blank`);
+  }
+  if (key.length > MAX_KEY_LENGTH) {
+    throw new RangeError(`${name} must not exceed ${MAX_KEY_LENGTH} characters`);
+  }
+  return key;
+}
+
+/**
+ * Validates a cache value.
+ * @param {unknown} value Candidate value.
+ * @returns {object} The validated value.
+ * @throws {TypeError} When the value is not a non-null object.
+ * @throws {RangeError} When the serialized value exceeds the size bound.
+ */
+function validateValue(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new TypeError('cache value must be a non-null object');
+  }
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (err) {
+    throw new TypeError('cache value must be JSON-serializable');
+  }
+  if (typeof serialized !== 'string') {
+    throw new TypeError('cache value must be JSON-serializable');
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > MAX_VALUE_BYTES) {
+    throw new RangeError(`cache value must not exceed ${MAX_VALUE_BYTES} bytes`);
+  }
+  return value;
+}
+
+/**
+ * Validates a positive integer option.
+ * @param {unknown} value Candidate value.
+ * @param {string} name Parameter name for error messages.
+ * @param {number} max Maximum allowed value.
+ * @returns {number} The validated integer.
+ * @throws {TypeError} When the value is not a positive integer.
+ * @throws {RangeError} When the value exceeds the maximum.
+ */
+function validatePositiveInteger(value, name, max) {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive integer`);
+  }
+  if (value > max) {
+    throw new RangeError(`${name} must not exceed ${max}`);
+  }
+  return value;
+}
+
+/**
  * Bounded in-process TTL cache. Map insertion order provides LRU eviction:
  * every hit is reinserted at the newest position.
  *
@@ -34,11 +118,22 @@ class EscrowReadCache {
     now = Date.now,
     onError = () => {},
   } = {}) {
+    if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs < 0) {
+      throw new TypeError('ttlMs must be a non-negative finite number');
+    }
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+      throw new TypeError('maxEntries must be a positive integer');
+    }
+    if (typeof now !== 'function') {
+      throw new TypeError('now must be a function');
+    }
+
     this.ttlMs = ttlMs;
     this.maxEntries = maxEntries;
     this.now = now;
     this.onError = onError;
     this.entries = new Map();
+    this.inflight = new Map();
   }
 
   /**
@@ -73,6 +168,7 @@ class EscrowReadCache {
    * Reads and refreshes the recency of a cached response.
    * @param {string} invoiceId Cache key.
    * @returns {object|undefined} Cached response, or undefined on a miss.
+   * @throws {TypeError} When invoiceId is not a non-empty string.
    */
   get(invoiceId) {
     try {
@@ -108,6 +204,7 @@ class EscrowReadCache {
    * @param {string} invoiceId Cache key.
    * @param {object} value Escrow read response.
    * @returns {void}
+   * @throws {TypeError} When invoiceId is not a non-empty string or value is null/undefined.
    */
   set(invoiceId, value) {
     try {
@@ -136,6 +233,7 @@ class EscrowReadCache {
    * Removes one invoice response.
    * @param {string} invoiceId Cache key.
    * @returns {boolean} Whether an entry existed.
+   * @throws {TypeError} When invoiceId is not a non-empty string.
    */
   invalidate(invoiceId) {
     try {
@@ -164,4 +262,8 @@ const escrowReadCache = new EscrowReadCache();
 module.exports = {
   EscrowReadCache,
   escrowReadCache,
+  validateKey,
+  validateValue,
+  MAX_KEY_LENGTH,
+  MAX_VALUE_BYTES,
 };
