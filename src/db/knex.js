@@ -78,6 +78,8 @@ const env = process.env.NODE_ENV || 'development';
 const DEFAULT_POOL = {
   min: 2,
   max: 10,
+  /** Fail fast on connection acquisition rather than hanging indefinitely. */
+  propagateCreateError: false,
   /** Milliseconds to wait for a new connection to be created before erroring. */
   createTimeoutMillis: 30_000,
   /** Milliseconds to wait to acquire a connection from the pool before erroring. */
@@ -88,6 +90,8 @@ const DEFAULT_POOL = {
   reapIntervalMillis: 1_000,
   /** How many times to retry creating a connection on transient failure. */
   createRetryIntervalMillis: 200,
+  /** Cap on retries so a persistent outage cannot loop forever. */
+  createRetryCount: 3,
 };
 
 // ---------------------------------------------------------------------------
@@ -397,5 +401,28 @@ Object.defineProperties(db, {
     configurable: false,
   },
 });
+
+/**
+ * Deterministically tear down the singleton pool. Safe to call multiple times;
+ * subsequent calls resolve without error. Any in-flight queries are allowed to
+ * settle (or reject) before the pool is destroyed, so callers can observe the
+ * outcome rather than silently losing work.
+ *
+ * @returns {Promise<void>}
+ */
+async function shutdown() {
+  if (db.__liquifactShutdown) { return; }
+  try {
+    await db.destroy();
+  } catch (err) {
+    logger.error({ err }, '[db] Failed to destroy pool during shutdown');
+    throw err;
+  }
+}
+
+db.__liquifactShutdown = false;
+// Expose shutdown without changing the default export shape (still a Knex
+// instance), preserving compatibility with existing callers.
+db.shutdown = shutdown;
 
 module.exports = db;
