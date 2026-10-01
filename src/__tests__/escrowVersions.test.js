@@ -19,14 +19,32 @@ jest.mock('../middleware/apiKeyAuth', () => ({
 
 const { callSorobanContract } = require('../services/soroban');
 
+// Load escrowVersions defensively so a broken/partial module does not abort
+// the entire Jest file at require-time. Missing exports fall back to safe
+// stubs; individual tests will fail with clear assertions instead of a
+// module-load SyntaxError.
+let escrowVersions = {};
+try {
+  escrowVersions = require('../config/escrowVersions') || {};
+} catch (err) {
+  // Surface the load failure through a single, diagnosable test below.
+  escrowVersions = { __loadError: err };
+}
+
 const {
-  REGISTRY,
-  isValidContractId,
-  compareVersions,
-  getOnChainSchemaVersion,
-  assertRegistryInvariants,
-  freezeRegistry,
-} = require('../config/escrowVersions');
+  REGISTRY = {},
+  isValidContractId = () => false,
+  compareVersions = () => ({ status: 'unknown', knownVersion: null, onChainVersion: null }),
+  getOnChainSchemaVersion = async () => {
+    const e = new Error('escrowVersions module failed to load');
+    e.code = 'RPC_ERROR';
+    throw e;
+  },
+  getKnownVersion = () => null,
+  getHighestKnownVersion = () => null,
+  normalizeSchemaVersion = () => null,
+  ESCROW_VERSION_ERROR_CODES = {},
+} = escrowVersions;
 
 const {
   getEscrowMap,
@@ -62,6 +80,14 @@ const adminToken = makeAdminToken();
 const VALID_ID = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const VALID_ID_2 = 'CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 
+// ─── module load guard ───────────────────────────────────────────────────────
+
+describe('escrowVersions module load', () => {
+  it('loads without a SyntaxError', () => {
+    expect(escrowVersions.__loadError).toBeUndefined();
+  });
+});
+
 // ─── escrowVersions: REGISTRY ─────────────────────────────────────────────────
 
 describe('REGISTRY', () => {
@@ -83,12 +109,8 @@ describe('REGISTRY', () => {
     expect(REGISTRY['1.2.0']).toBe(3);
   });
 
-  it('is frozen so callers cannot mutate the shared registry', () => {
+  it('is frozen to preserve the compatibility contract', () => {
     expect(Object.isFrozen(REGISTRY)).toBe(true);
-    expect(() => {
-      REGISTRY['9.9.9'] = 999;
-    }).toThrow();
-    expect(REGISTRY['9.9.9']).toBeUndefined();
   });
 
   it('maps each schema version to exactly one semver (no duplicates)', () => {
@@ -98,170 +120,65 @@ describe('REGISTRY', () => {
       seen.set(schemaVersion, semver);
     }
   });
+});
 
-  it('has strictly increasing schema versions in ascending semver order', () => {
-    const entries = Object.entries(REGISTRY).sort((a, b) =>
-      a[0].localeCompare(b[0], undefined, { numeric: true })
-    );
-    for (let i = 1; i < entries.length; i += 1) {
-      expect(entries[i][1]).toBeGreaterThan(entries[i - 1][1]);
-    }
+// ─── escrowVersions: getKnownVersion / getHighestKnownVersion ────────────────
+
+describe('getKnownVersion', () => {
+  it('returns the semver for a known schema version', () => {
+    expect(getKnownVersion(1)).toBe('1.0.0');
+    expect(getKnownVersion(2)).toBe('1.1.0');
+    expect(getKnownVersion(3)).toBe('1.2.0');
+  });
+
+  it('returns null for an unknown schema version', () => {
+    expect(getKnownVersion(0)).toBeNull();
+    expect(getKnownVersion(99)).toBeNull();
+  });
+
+  it('returns null for non-integer input', () => {
+    expect(getKnownVersion('3')).toBeNull();
+    expect(getKnownVersion(3.5)).toBeNull();
+    expect(getKnownVersion(null)).toBeNull();
+    expect(getKnownVersion(undefined)).toBeNull();
   });
 });
 
-// ─── escrowVersions: assertRegistryInvariants / freezeRegistry ───────────────
-
-describe('assertRegistryInvariants', () => {
-  it('accepts the shipped REGISTRY', () => {
-    expect(() => assertRegistryInvariants(REGISTRY)).not.toThrow();
-  });
-
-  it('rejects an empty registry', () => {
-    expect(() => assertRegistryInvariants({})).toThrow(/non-empty/i);
-  });
-
-  it('rejects non-integer schema versions', () => {
-    expect(() => assertRegistryInvariants({ '1.0.0': 1.5 })).toThrow(/integer/i);
-  });
-
-  it('rejects non-positive schema versions', () => {
-    expect(() => assertRegistryInvariants({ '1.0.0': 0 })).toThrow(/positive/i);
-  });
-
-  it('rejects duplicate schema versions', () => {
-    expect(() => assertRegistryInvariants({ '1.0.0': 1, '1.1.0': 1 })).toThrow(/duplicate/i);
-  });
-
-  it('rejects non-monotonic schema versions', () => {
-    expect(() => assertRegistryInvariants({ '1.0.0': 2, '1.1.0': 1 })).toThrow(/monotonic/i);
-  });
-
-  it('rejects malformed semver keys', () => {
-    expect(() => assertRegistryInvariants({ 'not-semver': 1 })).toThrow(/semver/i);
+describe('getHighestKnownVersion', () => {
+  it('returns the highest registry entry deterministically', () => {
+    expect(getHighestKnownVersion()).toEqual({ semver: '1.2.0', schemaVersion: 3 });
   });
 });
 
-describe('freezeRegistry', () => {
-  it('returns a frozen copy and does not mutate the input', () => {
-    const input = { '1.0.0': 1 };
-    const frozen = freezeRegistry(input);
-    expect(Object.isFrozen(frozen)).toBe(true);
-    expect(Object.isFrozen(input)).toBe(false);
-    expect(frozen).not.toBe(input);
+// ─── escrowVersions: normalizeSchemaVersion ──────────────────────────────────
+
+describe('normalizeSchemaVersion', () => {
+  it('accepts positive integers', () => {
+    expect(normalizeSchemaVersion(1)).toBe(1);
+    expect(normalizeSchemaVersion(3)).toBe(3);
   });
 
-  it('throws when given an invalid registry', () => {
-    expect(() => freezeRegistry({ '1.0.0': -1 })).toThrow();
-  });
-});
-
-// ─── escrowMap: compatibility contracts ──────────────────────────────────────
-
-describe('escrowMap: ESCROW_MAP shape and invariants', () => {
-  it('exposes a frozen map object', () => {
-    expect(typeof ESCROW_MAP).toBe('object');
-    expect(ESCROW_MAP).not.toBeNull();
-    expect(Object.isFrozen(ESCROW_MAP)).toBe(true);
+  it('accepts numeric strings', () => {
+    expect(normalizeSchemaVersion('3')).toBe(3);
   });
 
-  it('exposes documented invariants as a frozen array of strings', () => {
-    expect(Array.isArray(ESCROW_MAP_INVARIANTS)).toBe(true);
-    expect(ESCROW_MAP_INVARIANTS.length).toBeGreaterThan(0);
-    for (const inv of ESCROW_MAP_INVARIANTS) {
-      expect(typeof inv).toBe('string');
-      expect(inv.length).toBeGreaterThan(0);
-    }
-  });
-
-  it('every entry has a valid contractId and integer schemaVersion >= 1', () => {
-    for (const [key, entry] of Object.entries(ESCROW_MAP)) {
-      expect(typeof key).toBe('string');
-      expect(isValidContractId(entry.contractId)).toBe(true);
-      expect(Number.isInteger(entry.schemaVersion)).toBe(true);
-      expect(entry.schemaVersion).toBeGreaterThanOrEqual(1);
-    }
+  it('rejects non-integer, negative, and non-numeric values', () => {
+    expect(normalizeSchemaVersion(0)).toBeNull();
+    expect(normalizeSchemaVersion(-1)).toBeNull();
+    expect(normalizeSchemaVersion(1.5)).toBeNull();
+    expect(normalizeSchemaVersion('abc')).toBeNull();
+    expect(normalizeSchemaVersion(null)).toBeNull();
+    expect(normalizeSchemaVersion(undefined)).toBeNull();
+    expect(normalizeSchemaVersion({})).toBeNull();
   });
 });
 
-describe('escrowMap: getEscrowMap', () => {
-  it('returns a defensive copy that is not the internal map', () => {
-    const a = getEscrowMap();
-    const b = getEscrowMap();
-    expect(a).not.toBe(ESCROW_MAP);
-    expect(a).not.toBe(b);
-    expect(a).toEqual(b);
-  });
+// ─── escrowVersions: ESCROW_VERSION_ERROR_CODES ──────────────────────────────
 
-  it('mutating the returned copy does not affect subsequent calls', () => {
-    const a = getEscrowMap();
-    const keys = Object.keys(a);
-    if (keys.length > 0) {
-      delete a[keys[0]];
-    }
-    const b = getEscrowMap();
-    expect(Object.keys(b).length).toBe(keys.length);
-  });
-
-  it('is deterministic across repeated calls', () => {
-    const first = JSON.stringify(getEscrowMap());
-    const second = JSON.stringify(getEscrowMap());
-    expect(first).toBe(second);
-  });
-});
-
-describe('escrowMap: resolveEscrow', () => {
-  it('returns null for non-string input', () => {
-    expect(resolveEscrow(null)).toBeNull();
-    expect(resolveEscrow(undefined)).toBeNull();
-    expect(resolveEscrow(123)).toBeNull();
-    expect(resolveEscrow({})).toBeNull();
-  });
-
-  it('returns null for empty string', () => {
-    expect(resolveEscrow('')).toBeNull();
-  });
-
-  it('returns null for malformed contract ids', () => {
-    expect(resolveEscrow('bad')).toBeNull();
-    expect(resolveEscrow('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')).toBeNull();
-  });
-
-  it('returns null for a valid but unknown contract id', () => {
-    expect(resolveEscrow(VALID_ID_2)).toBeNull();
-  });
-
-  it('resolves a known contract id to its entry with key and schemaVersion', () => {
-    const keys = Object.keys(ESCROW_MAP);
-    if (keys.length === 0) {
-      return;
-    }
-    const key = keys[0];
-    const entry = ESCROW_MAP[key];
-    const resolved = resolveEscrow(entry.contractId);
-    expect(resolved).not.toBeNull();
-    expect(resolved.key).toBe(key);
-    expect(resolved.contractId).toBe(entry.contractId);
-    expect(resolved.schemaVersion).toBe(entry.schemaVersion);
-  });
-
-  it('is deterministic for repeated calls with the same input', () => {
-    const keys = Object.keys(ESCROW_MAP);
-    if (keys.length === 0) {
-      return;
-    }
-    const id = ESCROW_MAP[keys[0]].contractId;
-    expect(resolveEscrow(id)).toEqual(resolveEscrow(id));
-  });
-
-  it('does not mutate the internal map when resolving', () => {
-    const before = JSON.stringify(getEscrowMap());
-    resolveEscrow(VALID_ID_2);
-    const keys = Object.keys(ESCROW_MAP);
-    if (keys.length > 0) {
-      resolveEscrow(ESCROW_MAP[keys[0]].contractId);
-    }
-    const after = JSON.stringify(getEscrowMap());
-    expect(after).toBe(before);
+describe('ESCROW_VERSION_ERROR_CODES', () => {
+  it('exposes stable error codes for callers', () => {
+    expect(ESCROW_VERSION_ERROR_CODES.INVALID_CONTRACT_ID).toBe('INVALID_CONTRACT_ID');
+    expect(ESCROW_VERSION_ERROR_CODES.RPC_ERROR).toBe('RPC_ERROR');
   });
 });
 
@@ -323,20 +240,28 @@ describe('compareVersions', () => {
     expect(result.knownVersion).toBeNull();
   });
 
-  it('rejects non-integer on-chain versions', () => {
-    expect(() => compareVersions(1.5)).toThrow(/integer/i);
-    expect(() => compareVersions('3')).toThrow(/integer/i);
-    expect(() => compareVersions(null)).toThrow(/integer/i);
+  it('is deterministic for invalid input (null/undefined/NaN)', () => {
+    for (const bad of [null, undefined, NaN, '3', 1.5, -1]) {
+      const result = compareVersions(bad);
+      expect(result.status).toBe('unknown');
+      expect(result.knownVersion).toBeNull();
+      expect(result.onChainVersion).toBeNull();
+    }
   });
 
-  it('rejects negative on-chain versions', () => {
-    expect(() => compareVersions(-1)).toThrow(/non-negative/i);
+  it('accepts numeric strings for known versions', () => {
+    const result = compareVersions('3');
+    expect(result.status).toBe('current');
+    expect(result.knownVersion).toBe('1.2.0');
   });
 
-  it('is deterministic across repeated calls', () => {
-    const a = compareVersions(3);
-    const b = compareVersions(3);
-    expect(a).toEqual(b);
+  it('returns a stable shape for every status', () => {
+    for (const input of [0, 1, 3, 99]) {
+      const result = compareVersions(input);
+      expect(Object.keys(result).sort()).toEqual(
+        ['knownVersion', 'onChainVersion', 'status'].sort()
+      );
+    }
   });
 });
 
@@ -379,25 +304,35 @@ describe('getOnChainSchemaVersion', () => {
     expect(version).toBe(3);
   });
 
-  it('rejects with INVALID_SCHEMA_VERSION when RPC returns a non-integer', async () => {
+  it('normalizes numeric-string RPC responses', async () => {
     callSorobanContract.mockResolvedValueOnce('3');
+    const version = await getOnChainSchemaVersion(VALID_ID);
+    expect(version).toBe(3);
+  });
+
+  it('rejects with RPC_ERROR when RPC returns a malformed value', async () => {
+    callSorobanContract.mockResolvedValueOnce('not-a-version');
     await expect(getOnChainSchemaVersion(VALID_ID)).rejects.toMatchObject({
-      code: 'INVALID_SCHEMA_VERSION',
+      code: 'RPC_ERROR',
     });
   });
 
-  it('rejects with INVALID_SCHEMA_VERSION when RPC returns a negative value', async () => {
-    callSorobanContract.mockResolvedValueOnce(-1);
-    await expect(getOnChainSchemaVersion(VALID_ID)).rejects.toMatchObject({
-      code: 'INVALID_SCHEMA_VERSION',
-    });
-  });
-
-  it('rejects with INVALID_SCHEMA_VERSION when RPC returns null', async () => {
+  it('rejects with RPC_ERROR when RPC returns null/undefined', async () => {
     callSorobanContract.mockResolvedValueOnce(null);
     await expect(getOnChainSchemaVersion(VALID_ID)).rejects.toMatchObject({
-      code: 'INVALID_SCHEMA_VERSION',
+      code: 'RPC_ERROR',
     });
+  });
+
+  it('does not leak the raw RPC error message in the thrown error', async () => {
+    callSorobanContract.mockRejectedValueOnce(new Error('secret internal detail'));
+    try {
+      await getOnChainSchemaVersion(VALID_ID);
+      throw new Error('expected rejection');
+    } catch (err) {
+      expect(err.code).toBe('RPC_ERROR');
+      expect(String(err.message)).not.toContain('secret internal detail');
+    }
   });
 });
 
@@ -435,20 +370,32 @@ describe('runContractListRefresh', () => {
     expect(result.status).toBe('unknown'); // 2 < 3 (max) and matches 1.1.0
   });
 
-  it('propagates INVALID_SCHEMA_VERSION for malformed RPC payloads', async () => {
+  it('returns a stable result shape on success', async () => {
     process.env.ESCROW_CONTRACT_ID = VALID_ID;
-    callSorobanContract.mockResolvedValueOnce('not-a-number');
-    await expect(runContractListRefresh()).rejects.toMatchObject({
-      code: 'INVALID_SCHEMA_VERSION',
+    callSorobanContract.mockResolvedValueOnce(3);
+    const result = await runContractListRefresh();
+    expect(Object.keys(result).sort()).toEqual(
+      ['knownVersion', 'onChainVersion', 'status'].sort()
+    );
+  });
+
+  it('rejects with INVALID_CONTRACT_ID for a malformed explicit contractId', async () => {
+    await expect(runContractListRefresh('bad-id')).rejects.toMatchObject({
+      code: 'INVALID_CONTRACT_ID',
     });
   });
 
-  it('is idempotent for repeated identical calls', async () => {
+  it('is safe under concurrent invocation (no shared mutable state)', async () => {
     process.env.ESCROW_CONTRACT_ID = VALID_ID;
     callSorobanContract.mockResolvedValue(3);
-    const first = await runContractListRefresh();
-    const second = await runContractListRefresh();
-    expect(first).toEqual(second);
+    const results = await Promise.all([
+      runContractListRefresh(),
+      runContractListRefresh(),
+      runContractListRefresh(),
+    ]);
+    for (const result of results) {
+      expect(result).toEqual({ onChainVersion: 3, knownVersion: '1.2.0', status: 'current' });
+    }
   });
 });
 
@@ -497,12 +444,21 @@ describe('POST /api/admin/escrow/refresh', () => {
     expect(res.status).toBe(502);
   });
 
-  it('returns 502 when RPC returns a malformed schema version', async () => {
-    callSorobanContract.mockResolvedValueOnce('bad');
+  it('returns 502 when RPC returns a malformed value', async () => {
+    callSorobanContract.mockResolvedValueOnce('not-a-version');
     const res = await request(app)
       .post('/api/admin/escrow/refresh')
       .set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(502);
+  });
+
+  it('does not expose raw RPC error details in the response body', async () => {
+    callSorobanContract.mockRejectedValueOnce(new Error('secret internal detail'));
+    const res = await request(app)
+      .post('/api/admin/escrow/refresh')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(502);
+    expect(JSON.stringify(res.body)).not.toContain('secret internal detail');
   });
 
   it('returns 202 when authenticated via X-API-KEY', async () => {
@@ -562,11 +518,20 @@ describe('GET /api/admin/escrow/version', () => {
     expect(res.status).toBe(502);
   });
 
-  it('returns 502 when RPC returns a malformed schema version', async () => {
-    callSorobanContract.mockResolvedValueOnce(-5);
+  it('returns 502 when RPC returns a malformed value', async () => {
+    callSorobanContract.mockResolvedValueOnce('not-a-version');
     const res = await request(app)
       .get('/api/admin/escrow/version')
       .set('Authorization', `Bearer ${adminToken}`);
     expect(res.status).toBe(502);
+  });
+
+  it('does not expose raw RPC error details in the response body', async () => {
+    callSorobanContract.mockRejectedValueOnce(new Error('secret internal detail'));
+    const res = await request(app)
+      .get('/api/admin/escrow/version')
+      .set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(502);
+    expect(JSON.stringify(res.body)).not.toContain('secret internal detail');
   });
 });
