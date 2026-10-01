@@ -11,6 +11,24 @@
  * exhaustively unit-tested in isolation from Express / Knex / audit-log
  * concerns, and gives us a typed boundary for safer refactors.
  *
+ * ## State invariants
+ *
+ * The mappers are the boundary, so their output *is* the contract. Every
+ * response DTO is frozen, and any array a DTO exposes is a fresh copy rather
+ * than a reference into caller-owned state. That gives two guarantees:
+ *
+ * 1. A DTO cannot be mutated after it has been classified. A route cannot
+ *    quietly rewrite `currentState` on a completed transition, because the
+ *    object it received is the same object every other consumer sees.
+ * 2. A derived scalar cannot drift from the data it describes.
+ *    `isTerminal` is snapshotted from the transition list, and
+ *    `totalTransitions` can never disagree with the length of `transitions`
+ *    because that array is a module-owned frozen copy.
+ *
+ * `allowedTransitions` is the one deliberate exception: it is still a fresh
+ * copy (the mapper is never poisoned by caller mutation) but it is left
+ * mutable, because callers are documented to build on it.
+ *
  * @module dtos/invoiceStateDtos
  * @version 1.0.0
  * @compatibility Contract version 1.0 - All mappers guarantee stable output shapes
@@ -297,12 +315,17 @@ function mapRejectRequest(body) {
  * @returns {InvoiceStateResponseDto}
  */
 function toInvoiceStateResponse({ invoiceId, currentState, allowedTransitions }) {
-  return {
+  const allowedCopy = Array.isArray(allowedTransitions) ? [...allowedTransitions] : [];
+  return Object.freeze({
     invoiceId,
     currentState,
-    allowedTransitions: Array.isArray(allowedTransitions) ? [...allowedTransitions] : [],
+    // A fresh copy, deliberately left mutable — see the module-level note.
+    allowedTransitions: allowedCopy,
+    // Snapshotted from the *input* array: a non-array value reports
+    // non-terminal rather than terminal, so malformed upstream data can never
+    // declare an invoice finished.
     isTerminal: Array.isArray(allowedTransitions) ? allowedTransitions.length === 0 : false,
-  };
+  });
 }
 
 /**
@@ -334,11 +357,11 @@ function toTransitionResponse({ invoiceId, result, reason }) {
   };
   if (reason !== undefined && reason !== null) {
     /** @type {TransitionResponseDto} */
-    const withReason = Object.assign({}, base, { reason });
+    const withReason = Object.freeze(Object.assign({}, base, { reason }));
     return withReason;
   }
   /** @type {TransitionResponseDto} */
-  const withoutReason = base;
+  const withoutReason = Object.freeze(base);
   return withoutReason;
 }
 
@@ -360,7 +383,7 @@ function toTransitionResponse({ invoiceId, result, reason }) {
  * @returns {LinkEscrowResponseDto}
  */
 function toLinkEscrowResponse({ invoiceId, result, escrowId }) {
-  return {
+  return Object.freeze({
     invoiceId,
     previousState: result.previousState,
     currentState: result.newState,
@@ -368,7 +391,7 @@ function toLinkEscrowResponse({ invoiceId, result, escrowId }) {
     transitionedAt: result.transitionedAt,
     transitionedBy: result.transitionedBy,
     auditLogId: result.auditLog && result.auditLog.id ? result.auditLog.id : '',
-  };
+  });
 }
 
 /**
@@ -405,7 +428,7 @@ function toHistoryEntryDto(log) {
   if (log.ipAddress !== undefined) {
     entry.ipAddress = log.ipAddress;
   }
-  return entry;
+  return Object.freeze(entry);
 }
 
 /**
@@ -432,13 +455,17 @@ function toHistoryEntryDto(log) {
  * @returns {InvoiceHistoryResponseDto}
  */
 function toInvoiceHistoryResponse({ invoiceId, currentState, transitions }) {
-  const safe = Array.isArray(transitions) ? transitions : [];
-  return {
+  const entries = Array.isArray(transitions) ? [...transitions] : [];
+  return Object.freeze({
     invoiceId,
     currentState,
-    transitions: safe,
-    totalTransitions: safe.length,
-  };
+    // Shallow copy (entry identity is preserved) that is frozen to match the
+    // DTO. Previously this array was the caller's own, so a later push or
+    // splice produced a response advertising `totalTransitions` alongside a
+    // different number of entries.
+    transitions: Object.freeze(entries),
+    totalTransitions: entries.length,
+  });
 }
 
 // ---------------------------------------------------------------------------
