@@ -67,6 +67,9 @@ function getIntervalMs() {
   if (!Number.isFinite(parsed) || parsed < MIN_INTERVAL_MS) {
     return DEFAULT_INTERVAL_MS;
   }
+  if (parsed > MAX_INTERVAL_MS) {
+    return MAX_INTERVAL_MS;
+  }
   return parsed;
 }
 
@@ -101,6 +104,16 @@ function _isRetryable(error) {
 }
 
 async function runMetricsPurge(job = {}, options = {}) {
+  if (_activePurge) {
+    logger.warn(
+      { jobId: job.id },
+      'metricsPurge: run skipped, another purge is already in progress'
+    );
+    metricsPurgeRunsTotal.inc({ status: 'skipped' });
+    return { success: false, skipped: true, reason: 'already_running' };
+  }
+
+  _activePurge = (async () => {
   const startedAt = Date.now();
   const maxAttempts = Math.max(1, options.maxAttempts ?? getMaxAttempts());
   const baseDelayMs = Math.max(0, options.retryDelayMs ?? 250);
@@ -171,14 +184,17 @@ async function runMetricsPurge(job = {}, options = {}) {
 const purgeQueue = new JobQueue();
 const purgeWorker = new BackgroundWorker({
   jobQueue: purgeQueue,
-  maxConcurrency: 1,
+  maxConcurrency: MAX_CONCURRENT_PURGES,
   pollIntervalMs: 5000,
 });
 
-purgeWorker.registerHandler(JOB_TYPE, (job) => runMetricsPurge(job));
+purgeWorker.registerHandler(NJOB_TYPE, (job) => runMetricsPurge(job));
 
 function schedulePurge(options = {}) {
   const delayMs = options.delayMs ?? getIntervalMs();
+  if (!Number.isFinite(delayMs) || delayMs < 0) {
+    throw new TypeError('schedulePurge: delayMs must be a non-negative finite number');
+  }
   const jobId = purgeQueue.enqueue(JOB_TYPE, {}, { delayMs });
   logger.debug({ jobId, delayMs }, 'metricsPurge: scheduled run');
   return jobId;
@@ -197,6 +213,7 @@ function startPurgeWorker() {
 
 async function stopPurgeWorker(timeoutMs = 10000) {
   await purgeWorker.stop(timeoutMs);
+  _activePurge = null;
   logger.info('metricsPurge: worker stopped');
 }
 
@@ -208,6 +225,7 @@ function getStats() {
   return {
     worker: purgeWorker.getStats(),
     queue: purgeQueue.getStats(),
+    activePurge: _activePurge !== null,
     config: {
       retentionDays: getRetentionDays(),
       batchSize: getPurgeBatchSize(),
@@ -230,4 +248,5 @@ module.exports = {
   getMaxAttempts,
   purgeQueue,
   purgeWorker,
+  MAX_INTERVAL_MS,
 };

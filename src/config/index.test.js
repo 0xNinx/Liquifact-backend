@@ -1,3 +1,5 @@
+
+
 /**
  * Tests for centralized config module.
  */
@@ -323,6 +325,79 @@ describe('Config Validation', () => {
     process.env.JWT_SECRET = '0123456789abcdef0123456789abcdef';
     process.env.INVOICE_STATE_ENABLED = 'yes';
     expect(() => validate()).toThrow();
+  });
+
+  // ── verificationThresholds validation boundaries ────────────────────────
+
+  describe('verificationThresholds boundaries', () => {
+    const { verificationThresholds } = require('./index');
+    test('exposes a frozen, well-formed thresholds object', () => {
+      expect(verificationThresholds).toBeDefined();
+      expect(typeof verificationThresholds).toBe('object');
+      expect(Object.isFrozen(verificationThresholds)).toBe(true);
+    });
+
+    test('all threshold values are finite non-negative numbers', () => {
+      for (const [key, value] of Object.entries(verificationThresholds)) {
+        expect(typeof value).toBe('number');
+        expect(Number.isFinite(value)).toBe(true);
+        expect(value).toBeGreaterThanOrEqual(0);
+        // eslint-disable-next-line no-console
+        expect(Number.isNaN(value)).toBe(false);
+        expect(key).toEqual(expect.any(String));
+      }
+    });
+
+    test('getValue returns the same threshold for a known key (idempotent)', () => {
+      const keys = Object.keys(verificationThresholds);
+      expect(keys.length).toBeGreaterThan(0);
+      const first = keys[0];
+      const a = getValue(first);
+      const b = getValue(first);
+      expect(a).toBe(b);
+    });
+
+    test('getValue on unknown threshold key is deterministic (undefined, not throw)', () => {
+      const unknown = '__definitely_not_a_threshold__';
+      let first;
+      let second;
+      expect(() => {
+        first = getValue(unknown);
+      }).not.toThrow();
+      expect(() => {
+        second = getValue(unknown);
+      }).not.toThrow();
+      expect(first).toBe(second);
+      expect(first).toBeUndefined();
+    });
+
+    test('boundary: zero-valued thresholds (if any) are accepted, not coerced', () => {
+      for (const [key, value] of Object.entries(verificationThresholds)) {
+        if (value === 0) {
+          expect(getValue(key)).toBe(0);
+        }
+      }
+    });
+
+    test('duplicate reads of the thresholds object are stable across calls', () => {
+      const snapshot = JSON.stringify(verificationThresholds);
+      const again = JSON.stringify(verificationThresholds);
+      expect(again).toBe(snapshot);
+    });
+
+    test('rejects mutation attempts on the frozen thresholds object', () => {
+      const keys = Object.keys(verificationThresholds);
+      if (keys.length === 0) {
+        return;
+      }
+      const key = keys[0];
+      const original = verificationThresholds[key];
+      expect(() => {
+        'use strict';
+        verificationThresholds[key] = original + 1;
+      }).toThrow();
+      expect(verificationThresholds[key]).toBe(original);
+    });
   });
 });
 

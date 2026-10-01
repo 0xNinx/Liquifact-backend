@@ -90,4 +90,93 @@ describe('AppError Unit Tests', () => {
     expect(error.retryHint).toBe('Wait and retry.');
     expect(error).not.toHaveProperty('retry_hint');
   });
+
+  describe('State invariants (v1.0)', () => {
+    test('rejects invalid status codes - non-number', () => {
+      expect(() => new AppError({ title: 'Test', status: '400' })).toThrow(TypeError);
+      expect(() => new AppError({ title: 'Test', status: null })).toThrow(TypeError);
+    });
+
+    test('rejects invalid status codes - out of range', () => {
+      expect(() => new AppError({ title: 'Test', status: 99 })).toThrow(RangeError);
+      expect(() => new AppError({ title: 'Test', status: 600 })).toThrow(RangeError);
+      expect(() => new AppError({ title: 'Test', status: 3.5 })).toThrow(RangeError);
+    });
+
+    test('rejects invalid type - non-string', () => {
+      expect(() => new AppError({ title: 'Test', type: 123 })).toThrow(TypeError);
+      expect(() => new AppError({ title: 'Test', type: null })).toThrow(TypeError);
+      expect(() => new AppError({ title: 'Test', type: {} })).toThrow(TypeError);
+    });
+
+    test('instance is frozen - prevents property mutation', () => {
+      const error = new AppError({
+        title: 'Test',
+        status: 404,
+        detail: 'Not found',
+      });
+
+      expect(Object.isFrozen(error)).toBe(true);
+
+      // Attempting to mutate should fail silently in non-strict mode
+      // but the property should not actually change
+      error.status = 500;
+      expect(error.status).toBe(404);
+
+      error.detail = 'Changed';
+      expect(error.detail).toBe('Not found');
+    });
+
+    test('accepts valid status codes within range', () => {
+      const error100 = new AppError({ title: 'Test', status: 100 });
+      expect(error100.status).toBe(100);
+
+      const error599 = new AppError({ title: 'Test', status: 599 });
+      expect(error599.status).toBe(599);
+
+      const error404 = new AppError({ title: 'Test', status: 404 });
+      expect(error404.status).toBe(404);
+    });
+
+    test('accepts valid string type', () => {
+      const error = new AppError({
+        title: 'Test',
+        type: 'https://example.com/error',
+      });
+      expect(error.type).toBe('https://example.com/error');
+    });
+
+    test('allows retryable without retryHint (logs warning)', () => {
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+      const error = new AppError({
+        title: 'Test',
+        status: 429,
+        retryable: true,
+      });
+
+      expect(error.retryable).toBe(true);
+      expect(error.retryHint).toBeUndefined();
+      expect(consoleWarnSpy).toHaveBeenCalledWith('[AppError] retryable=true without retryHint is discouraged');
+
+      consoleWarnSpy.mockRestore();
+    });
+
+    test('does not warn when retryable has retryHint', () => {
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+      const error = new AppError({
+        title: 'Test',
+        status: 429,
+        retryable: true,
+        retryHint: 'Wait 5 seconds',
+      });
+
+      expect(error.retryable).toBe(true);
+      expect(error.retryHint).toBe('Wait 5 seconds');
+      expect(consoleWarnSpy).not.toHaveBeenCalled();
+
+      consoleWarnSpy.mockRestore();
+    });
+  });
 });
