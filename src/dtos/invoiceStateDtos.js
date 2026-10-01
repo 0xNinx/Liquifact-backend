@@ -22,6 +22,11 @@
  *   rather than throwing or emitting undefined fields.
  *
  * @module dtos/invoiceStateDtos
+ * @version 1.0.0
+ * @compatibility Contract version 1.0 - All mappers guarantee stable output shapes
+ *                 for valid, invalid, and boundary-case inputs. Optional fields are
+ *                 omitted (not null) when undefined. Arrays are copied to prevent
+ *                 caller mutation. Malformed inputs fall back to safe defaults.
  */
 
 // ----------------------------------------------------------------------------
@@ -281,6 +286,12 @@ function normaliseTransitionResult(result) {
 /**
  * Pulls the typed transition fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with targetState and reason fields.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Extra keys ignored (prototype pollution defense)
+ *                 - Output shape is stable regardless of input validity
+ *
  * The mapper itself does NOT perform semantic validation — that remains the
  * responsibility of `invoiceStateMachine.validateTransition` and the Zod
  * schema in `schemas/invoiceState`.  The mapper only guarantees the returned
@@ -306,6 +317,11 @@ function mapTransitionRequest(body) {
 /**
  * Pulls the typed approval fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with reason field.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
+ *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ reason: string|undefined }}
  */
@@ -318,6 +334,12 @@ function mapApproveRequest(body) {
 
 /**
  * Pulls the typed link-escrow fields from an Express request body.
+ *
+ * @contract v1.0 - Returns object with escrowId and reason fields.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string escrowId → null
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
  *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ escrowId: string|null, reason: string|undefined }}
@@ -333,6 +355,11 @@ function mapLinkEscrowRequest(body) {
 
 /**
  * Pulls the typed rejection fields from an Express request body.
+ *
+ * @contract v1.0 - Returns object with reason field.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
  *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ reason: string|undefined }}
@@ -534,6 +561,21 @@ function mapBulkResponse(results) {
   };
 }
 
+/**
+ * @note Migration path for route adoption
+ *
+ * Current routes (src/routes/invoiceStateRoutes.js) access req.body directly
+ * instead of using these mappers. To adopt the mappers:
+ *
+ * 1. Replace direct req.body access with mapper calls in each route handler
+ * 2. Verify service layer returns shapes compatible with response mappers
+ * 3. Update response helpers to use mapper outputs
+ * 4. Run existing test suite to ensure no breaking changes
+ * 5. Increment contract version if output shapes change
+ *
+ * The mappers are production-ready and tested. Adoption is optional but
+ * recommended for consistency and defensive boundary handling.
+ */
 module.exports = {
   mapTransitionRequest,
   mapApproveRequest,
