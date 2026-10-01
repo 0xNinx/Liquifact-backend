@@ -96,7 +96,7 @@ function isValidTxHash(txHash) {
  *
  *   1. An explicit `invoice_id` / `invoiceId` field on the record.
  *   2. The LiquifactEscrow event payload — the `value` body or a `topic`/
- *      `topics` body explicitly labelled with an invoice field. Bare topic
+ *      `topics` array entry explicitly labelled with an invoice field. Bare topic
  *      symbols (e.g. the event-name symbol) are not treated as invoice IDs.
  *   3. Reverse lookup of the emitting contract address through escrowMap.
  *
@@ -227,7 +227,7 @@ function createKnexEscrowEventStore(knex) {
     const row = await (trx || knex)('escrow_indexer_state')
       .where({ key: LEASE_KEY })
       .whereRaw("value::jsonb ->> 'token' = ?", [token])
-      .whereRaw("(value::jsonb ->> 'expiresAt')::bigint > EXTRACT(EPOCH FROM NOW()) * 1000")
+      .whereRaw("(value::jsonb ->> 'expiresAt')::bigint > EXTRACT (EPOCH FROM NOW()) * 1000")
       .first();
     if (!row) {
       throw new LeaseLostError('Escrow indexer lease is missing, stale, or expired.', 'LEASE_LOST');
@@ -245,7 +245,7 @@ function createKnexEscrowEventStore(knex) {
            SET value = EXCLUDED.value,
                updated_at = NOW()
            WHERE escrow_indexer_state.value IS NULL
-              OR COALESCE((escrow_indexer_state.value::jsonb ->> 'expiresAt')::bigint, 0) <= EXTRACT(EPOCH FROM NOW()) * 1000
+              OR COALESCE((escrow_indexer_state.value::jsonb ->> 'expiresAt')::bigint, 0) <= EXTRACT (EPOCH FROM NOW()) * 1000
          RETURNING value`,
         [LEASE_KEY, token, leaseDurationMs],
       );
@@ -262,12 +262,12 @@ function createKnexEscrowEventStore(knex) {
         `UPDATE escrow_indexer_state
          SET value = jsonb_build_object(
                'token', value::jsonb ->> 'token',
-               'expiresAt', EXTRACT(EPOCH FROM NOW()) * 1000 + ?
+               'expiresAt', EXTRACT (EPOCH FROM NOW()) * 1000 + ?
              )::text,
              updated_at = NOW()
          WHERE key = ?
            AND value::jsonb ->> 'token' = ?
-           AND COALESCE((value::jsonb ->> 'expiresAt')::bigint, 0) > EXTRACT(EPOCH FROM NOW()) * 1000
+           AND COALESCE((value::jsonb ->> 'expiresAt')::bigint, 0) > EXTRACT (EPOCH FROM NOW()) * 1000
          RETURNING value`,
         [leaseDurationMs, LEASE_KEY, token],
       );
@@ -353,120 +353,6 @@ function createKnexEscrowEventStore(knex) {
   };
 }
 
-/**
- * Defines the validation boundaries for an escrow indexer event.
- *
- * This is the single source of truth for what constitutes a valid, invalid,
- * duplicate, or boundary-case input to the indexer. It combines the
- * structural schema validation with the domain-specific checks (Stellar
- * contract ID, transaction hash, cursor monotonicity) that the schema alone
- * cannot express.
- *
- * The returned object is deterministic for a given input and is safe to
- * log -- it never echoes sensitive raw payload bytes, only field names and
- * machine-readable codes.
- *
- * @param {unknown} rawEvent - Raw event payload.
- * @param {object} [options]
- * @param {string|null} [options.cursor] - Last persisted cursor (paging token).
- * @param {Set<string>|Array<string>} [options.seenEventIds] - Already-processed event IDs.
- * @returns {object} Validation result with `ok`, `code`, `event`, and `details`.
- */
-function validateEscrowEvent(rawEvent, options = {}) {
-  const { cursor = null, seenEventIds = null } = options;
-
-  // Boundary: null, undefined, and non-object payloads are rejected before
-  // any field access so the error is deterministic and does not leak internals.
-  if (!rawEvent || typeof rawEvent !== 'object' || Array.isArray(rawEvent)) {
-    return {
-      ok: false,
-      code: 'INVALID_PAYLOAD',
-      event: null,
-      details: null,
-    };
-  }
-
-  let normalized;
-  try {
-    normalized = normalizeEvent(rawEvent);
-  } catch (err) {
-    if (err instanceof ValidationError) {
-      return {
-        ok: false,
-        code: err.code,
-        event: null,
-        details: err.details,
-      };
-    }
-    throw err;
-  }
-
-  // Domain boundary: contract ID must be a valid Stellar contract address.
-  if (normalized.contractId !== null && !isValidStellarContractId(normalized.contractId)) {
-    return {
-      ok: false,
-      code: 'INVALID_CONTRACT_ID',
-      event: null,
-      details: { contractId: 'must be a valid Stellar contract ID' },
-    };
-  }
-
-  // Domain boundary: transaction hash must be 64 hex characters.
-  if (normalized.txHash !== null && !isValidTxHash(normalized.txHash)) {
-    return {
-      ok: false,
-      code: 'INVALID_TX_HASH',
-      event: null,
-      details: { txHash: 'must be 64 hexadecimal characters' },
-    };
-  }
-
-  // Duplicate boundary: event IDs are idempotent. A duplicate is not an
-  // error -- it is skipped with a stable code so the caller can advance
-  // the cursor without reinserting data.
-  if (seenEventIds) {
-    const seen = seenEventIds instanceof Set ? seenEventIds : new Set(seenEventIds);
-    if (seen.has(normalized.eventId)) {
-      return {
-        ok: false,
-        code: 'DUPLICATE_EVENT',
-        event: normalized,
-        details: { eventId: 'already processed' },
-      };
-    }
-  }
-
-  // Cursor boundary: paging tokens are monotonically increasing. A cursor
-  // that would move backwards is rejected to prevent replay or skip.
-  if (cursor !== null && normalized.pagingToken) {
-    const cursorNum = Number(cursor);
-    const tokenNum = Number(normalized.pagingToken);
-    if (!Number.isFinite(cursorNum) || !Number.isFinite(tokenNum)) {
-      return {
-        ok: false,
-        code: 'INVALID_CURSOR',
-        event: null,
-        details: { cursor: 'non-numeric cursor or paging token' },
-      };
-    }
-    if (tokenNum < cursorNum) {
-      return {
-        ok: false,
-        code: 'CURSOR_REGRESSION',
-        event: null,
-        details: { cursor: 'paging token precedes persisted cursor' },
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    code: null,
-    event: normalized,
-    details: null,
-  };
-}
-
 module.exports = {
   ValidationError,
   LeaseLostError,
@@ -474,10 +360,5 @@ module.exports = {
   isValidTxHash,
   deriveInvoiceId,
   normalizeEvent,
-  validateEscrowEvent,
   createKnexEscrowEventStore,
-  DEFAULT_POLL_INTERVAL_MS,
-  DEFAULT_BATCH_SIZE,
-  LEASE_KEY,
-  DEFAULT_LEASE_DURATION_MS,
 };
