@@ -15,6 +15,13 @@
  * document (`code`) and per-field (`fieldCodes`). Message wording remains free
  * to change; the codes are the contract.
  *
+ * ## Determinism guarantees
+ * The classification in {@link codeForIssue} is a pure function of the issue
+ * object: it never consults mutable module state, the clock, or the network,
+ * and it never throws. The same input always yields the same code, which is
+ * what makes failure recovery replayable and observable.
+ *
+ * @defines {string} MetricsValidationCode
  * @module constants/metricsValidationCodes
  */
 
@@ -24,6 +31,7 @@
  * These describe *why a specific field failed*, and are reported in the
  * `fieldCodes` extension of the problem document.
  *
+ * @param {string} MetricsValidationCode
  * @readonly
  * @enum {string}
  */
@@ -66,6 +74,7 @@ const METRICS_VALIDATION_ERROR_CODE = 'METRICS_VALIDATION_ERROR';
  * Fast membership set over {@link METRICS_VALIDATION_CODES} values, used to
  * validate a schema-declared `params.metricsCode` before trusting it.
  *
+ * @readonly
  * @type {Set<string>}
  */
 const KNOWN_CODES = new Set(Object.values(METRICS_VALIDATION_CODES));
@@ -128,7 +137,7 @@ function isMissingValue(issue, payload) {
  * typo degrades to the normal classification rather than reaching the wire.
  *
  * Zod reports a missing field as an `invalid_type` issue whose `received` is
- * `'undefined'`, so that case is disambiguated into `FIELD_REQUIRED` before the
+ * `'undefined', so that case is disambiguated into `FIELD_REQUIRED` before the
  * generic type branch. `too_small` / `too_big` are split by `origin` (Zod 4) or
  * `type` (Zod 3) so a 26-item array does not report the same code as a
  * 129-character string.
@@ -144,11 +153,15 @@ function codeForIssue(issue, payload) {
   }
 
   // A schema that raises a `custom` issue can name its own code via
-  // `params.metricsCode`, so hand-rolled refinements are not flattened into the
-  // generic FIELD_INVALID bucket.
-  const declared = issue.params && issue.params.metricsCode;
-  if (typeof declared === 'string' && KNOWN_CODES.has(declared)) {
-    return declared;
+  // `params.metricsCode`, so hand-rolled refinements are not flattened into
+  // the generic FIELD_INVALID bucket.
+  const declared =
+    issue.params && typeof issue.params === 'object'
+      ? issue.params.metricsCode
+      : undefined;
+  const normalised = normaliseDeclaredCode(declared);
+  if (normalised !== null) {
+    return normalised;
   }
 
   // Zod 4 renamed `type` to `origin` on size issues; support both.
@@ -193,9 +206,52 @@ function codeForIssue(issue, payload) {
   }
 }
 
+/**
+ * Classifies a whole `ZodError` into a deterministic, deduplicated list of
+ * codes.
+ *
+ * This is the recovery primitive for the caller: given a failed validation,
+ * it produces a stable set of codes that can be logged, metered, and returned
+ * to the client without exposing the original messages (which may echo
+ * untrusted input).
+ *
+ * Guarantees:
+  - Never throws, even for `null`/`undefined`/malformed input.
+  - Order is deterministic: first-seen order, duplicates removed.
+  - Always returns at least one code so callers never have to handle an
+    empty classification.
+ *
+ * @param {unknown} error - A `ZodError` or anything else.
+ * @returns {string[]} Deduplicated members of {@link METRICS_VALIDATION_CODES}.
+ */
+function codesForError(error) {
+  const issues =
+    error && typeof error === 'object' && Array.isArray(error.issues)
+      ? error.issues
+      : [];
+
+  const seen = new Set();
+  const out = [];
+  for (const issue of issues) {
+    const code = codeForIssue(issue);
+    if (!seen.has(code)) {
+      seen.add(code);
+      out.push(code);
+    }
+  }
+
+  if (out.length === 0) {
+    out.push(METRICS_VALIDATION_CODES.FIELD_INVALID);
+  }
+
+  return out;
+}
+
 module.exports = {
   METRICS_VALIDATION_CODES,
   METRICS_VALIDATION_ERROR_CODE,
   METRICS_VALIDATION_PROBLEM_TYPE,
   codeForIssue,
+  codesForError,
+  normaliseDeclaredCode,
 };

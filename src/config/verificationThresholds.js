@@ -38,6 +38,12 @@
  * environment-supplied override map. Overrides cannot be injected by untrusted
  * input — the map is parsed from the environment and stored in a {@link Map},
  * which is immune to prototype-pollution keys such as `__proto__`.
+ *
+ * Invariants preserved by this module:
+ *   I1. Every resolved ThresholdSet has finite, strictly positive fields.
+ *   I2. For every resolved ThresholdSet, manualReviewThreshold <= fraudCeiling.
+ *   I3. The memoized configuration is frozen; callers receive defensive copies.
+ *   I4. Tenant lookups never mutate the cached configuration.
  */
 
 'use strict';
@@ -150,9 +156,19 @@ function _parseTenantOverrides(raw, defaults) {
     );
   }
 
+  // Reject prototype-pollution keys explicitly before iterating. Object.keys only
+  // returns own enumerable keys, but rejecting these names keeps the invariant
+  // explicit and diagnosable rather than relying on Map semantics alone.
+  const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
   // Only the tenant's own enumerable keys are considered; using a Map for storage
   // keeps the result free of prototype-pollution surprises.
   for (const tenantId of Object.keys(parsed)) {
+    if (FORBIDDEN_KEYS.has(tenantId)) {
+      throw new VerificationConfigError(
+        `INVOICE_TENANT_THRESHOLDS contains a forbidden tenant id: "${tenantId}".`
+      );
+    }
     const override = parsed[tenantId];
     if (override === null || typeof override !== 'object' || Array.isArray(override)) {
       throw new VerificationConfigError(
@@ -178,6 +194,9 @@ function _parseTenantOverrides(raw, defaults) {
       { fraudCeiling, manualReviewThreshold },
       `tenant "${tenantId}"`
     );
+    // Freeze the stored pair so accidental mutation of the cached Map value
+    // cannot violate invariants I1/I2 for subsequent callers.
+    Object.freeze(merged);
     overrides.set(tenantId, merged);
   }
 
@@ -209,6 +228,11 @@ function _buildConfig() {
 
   const tenants = _parseTenantOverrides(process.env.INVOICE_TENANT_THRESHOLDS, defaults);
 
+  // Freeze defaults and the tenant map so the memoized configuration is
+  // immutable for the lifetime of the process (invariant I3).
+  Object.freeze(defaults);
+  Object.freeze(tenants);
+
   return { defaults, tenants };
 }
 
@@ -224,6 +248,9 @@ let _cache = null;
 function _getConfig() {
   if (!_cache) {
     _cache = _buildConfig();
+    // Freeze the top-level config object so no caller can swap out defaults or
+    // tenants after memoization (invariant I3).
+    Object.freeze(_cache);
   }
   return _cache;
 }
@@ -243,10 +270,16 @@ function _getConfig() {
 function resolveThresholds(tenantId) {
   const { defaults, tenants } = _getConfig();
 
-  if (tenantId !== undefined && tenantId !== null && tenants.has(String(tenantId))) {
-    return { ...tenants.get(String(tenantId)) };
+  if (tenantId !== undefined && tenantId !== null) {
+    const key = String(tenantId);
+    if (tenants.has(key)) {
+      // Defensive copy: callers cannot mutate the frozen cached entry, and the
+      // returned object is a fresh plain object (invariant I4).
+      return { ...tenants.get(key) };
+    }
   }
 
+  // Defensive copy of the frozen defaults (invariant I4).
   return { ...defaults };
 }
 

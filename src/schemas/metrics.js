@@ -479,3 +479,7 @@ module.exports = {
   METRICS_VALIDATION_ERROR_CODE,
   METRICS_VALIDATION_PROBLEM_TYPE,
 };
+
+// Compatibility contract: this module's exported surface is frozen.
+// Do not remove or rename exports without a tested migration path.
+Object.freeze(module.exports);
