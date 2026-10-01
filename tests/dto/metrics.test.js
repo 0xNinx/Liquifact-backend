@@ -15,6 +15,7 @@
 
 const {
   toSmeMetricsResponse,
+  toStrictSmeMetricsResponse,
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
   toPersistenceRecordParams,
@@ -82,6 +83,57 @@ describe('toSmeMetricsResponse', () => {
   it('returns zeroes for an empty object', () => {
     const result = toSmeMetricsResponse({});
     expect(result).toEqual({ open: 0, funded: 0, settled: 0, defaulted: 0 });
+  });
+});
+
+describe('toStrictSmeMetricsResponse', () => {
+  it('returns an independent DTO for complete non-negative safe integer counts', () => {
+    const raw = Object.freeze({ open: 0, funded: 1, settled: Number.MAX_SAFE_INTEGER, defaulted: 2 });
+
+    expect(toStrictSmeMetricsResponse(raw)).toEqual(raw);
+    expect(toStrictSmeMetricsResponse(raw)).not.toBe(raw);
+  });
+
+  it('uses the parser-defined last value for duplicate JSON keys deterministically', () => {
+    const raw = JSON.parse('{"open":1,"open":3,"funded":0,"settled":2,"defaulted":0}');
+    expect(toStrictSmeMetricsResponse(raw)).toEqual({ open: 3, funded: 0, settled: 2, defaulted: 0 });
+  });
+
+  it('does not accept inherited values as required count fields', () => {
+    const raw = Object.assign(Object.create({ open: 1 }), {
+      funded: 0,
+      settled: 0,
+      defaulted: 0,
+    });
+    expect(() => toStrictSmeMetricsResponse(raw)).toThrow('Invalid SME metrics data for field: open');
+  });
+
+  it.each([
+    ['missing response', undefined],
+    ['array response', []],
+    ['missing field', { open: 1, funded: 2, settled: 3 }],
+    ['negative count', { open: -1, funded: 2, settled: 3, defaulted: 4 }],
+    ['fractional count', { open: 1.5, funded: 2, settled: 3, defaulted: 4 }],
+    ['infinite count', { open: Infinity, funded: 2, settled: 3, defaulted: 4 }],
+    ['unsafe count', { open: Number.MAX_SAFE_INTEGER + 1, funded: 2, settled: 3, defaulted: 4 }],
+    ['symbol count', { open: Symbol('private'), funded: 2, settled: 3, defaulted: 4 }],
+  ])('rejects %s without including raw values in the error', (_label, raw) => {
+    expect(() => toStrictSmeMetricsResponse(raw)).toThrow(/Invalid SME metrics data/);
+    try {
+      toStrictSmeMetricsResponse(raw);
+    } catch (err) {
+      expect(err.name).toBe('MetricsDtoValidationError');
+      expect(err.code).toBe('METRICS_DTO_INVALID_DATA');
+      expect(err.message).not.toContain('private');
+    }
+  });
+
+  it('rejects a throwing getter with only the bounded field name', () => {
+    const raw = { funded: 2, settled: 3, defaulted: 4 };
+    Object.defineProperty(raw, 'open', { get() { throw new Error('secret-value'); } });
+
+    expect(() => toStrictSmeMetricsResponse(raw)).toThrow('Invalid SME metrics data for field: open');
+    expect(() => toStrictSmeMetricsResponse(raw)).not.toThrow('secret-value');
   });
 });
 
@@ -321,6 +373,27 @@ describe('toPersistenceRecordParams', () => {
     const result = toPersistenceRecordParams({ durationSeconds: 'NaN' });
     expect(result.durationSeconds).toBe(0);
   });
+
+  it('recovers deterministically from throwing getters and unsafe numeric values', () => {
+    const raw = { endpoint: 'sme_invoice_upload', cause: 'storage' };
+    Object.defineProperty(raw, 'statusCode', { get() { throw new Error('secret'); } });
+    raw.durationSeconds = Infinity;
+
+    expect(toPersistenceRecordParams(raw)).toMatchObject({
+      endpoint: 'sme_invoice_upload',
+      statusCode: 200,
+      durationSeconds: 0,
+      cause: 'storage',
+    });
+  });
+
+  it('uses safe defaults when numeric coercion throws or status is out of range', () => {
+    expect(toPersistenceRecordParams({ statusCode: Symbol('x'), durationSeconds: -1 })).toMatchObject({
+      statusCode: 200,
+      durationSeconds: 0,
+    });
+    expect(toPersistenceRecordParams({ statusCode: 600 }).statusCode).toBe(200);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -353,6 +426,15 @@ describe('isValidSmeMetricsResponse', () => {
 
   it('returns false when a field is not a number', () => {
     expect(isValidSmeMetricsResponse({ open: 'a', funded: 0, settled: 0, defaulted: 0 })).toBe(false);
+  });
+
+  it.each([
+    { open: -1, funded: 0, settled: 0, defaulted: 0 },
+    { open: 0.5, funded: 0, settled: 0, defaulted: 0 },
+    { open: Infinity, funded: 0, settled: 0, defaulted: 0 },
+    { open: Number.MAX_SAFE_INTEGER + 1, funded: 0, settled: 0, defaulted: 0 },
+  ])('rejects invalid count boundaries: %o', (value) => {
+    expect(isValidSmeMetricsResponse(value)).toBe(false);
   });
 
   it('returns true for an object with extra keys', () => {
@@ -427,6 +509,12 @@ describe('isValidPersistenceRecordParams', () => {
       durationSeconds: 0.1,
       cause: 5,
     })).toBe(false);
+  });
+
+  it('rejects non-finite or out-of-range status and duration values', () => {
+    expect(isValidPersistenceRecordParams({ endpoint: 'unknown', statusCode: 600, durationSeconds: 0, cause: 'none' })).toBe(false);
+    expect(isValidPersistenceRecordParams({ endpoint: 'unknown', statusCode: 200, durationSeconds: Infinity, cause: 'none' })).toBe(false);
+    expect(isValidPersistenceRecordParams({ endpoint: 'unknown', statusCode: 200, durationSeconds: -0.1, cause: 'none' })).toBe(false);
   });
 });
 
@@ -528,6 +616,14 @@ describe('edge cases — adversarial input', () => {
     const result = toSmeMetricsResponse(obj);
     expect(result.open).toBe(5);
     expect(result.funded).toBe(3);
+  });
+
+  it('legacy mapping preserves valid fields when coercion or property access fails', () => {
+    const raw = { funded: '3', settled: 2, defaulted: 0 };
+    Object.defineProperty(raw, 'open', { get() { throw new Error('untrusted'); } });
+
+    expect(toSmeMetricsResponse(raw)).toEqual({ open: 0, funded: 3, settled: 2, defaulted: 0 });
+    expect(toSmeMetricsResponse({ open: Symbol('x') }).open).toBe(0);
   });
 
   it('toPersistenceRecordParams truncates very long endpoint strings', () => {

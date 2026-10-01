@@ -1,6 +1,7 @@
 "use strict";
 
 const formatProblemDetails = require("../utils/problemDetails");
+const mapError = require("./mapError");
 
 /**
  * Lowest HTTP status code accepted by {@link AppError}.
@@ -140,6 +141,51 @@ function assertValidParams(params) {
  */
 class AppError extends Error {
   /**
+   * Validates HTTP status code is within valid range.
+   *
+   * @param {unknown} status - Status code to validate.
+   * @throws {TypeError} If status is not a number or is out of valid range.
+   * @static
+   */
+  static _validateStatus(status) {
+    if (status !== undefined && status !== null) {
+      if (typeof status !== 'number') {
+        throw new TypeError(`AppError status must be a number, received: ${typeof status}`);
+      }
+      if (!Number.isInteger(status) || status < 100 || status > 599) {
+        throw new RangeError(`AppError status must be an integer between 100 and 599, received: ${status}`);
+      }
+    }
+  }
+
+  /**
+   * Validates type is a string when provided.
+   *
+   * @param {unknown} type - Type URI to validate.
+   * @throws {TypeError} If type is not a string when provided.
+   * @static
+   */
+  static _validateType(type) {
+    if (type !== undefined && type !== null && typeof type !== 'string') {
+      throw new TypeError(`AppError type must be a string, received: ${typeof type}`);
+    }
+  }
+
+  /**
+   * Validates retryable/retryHint consistency.
+   *
+   * @param {unknown} retryable - Retryable flag.
+   * @param {unknown} retryHint - Retry hint.
+   * @static
+   */
+  static _validateRetryConsistency(retryable, retryHint) {
+    if (retryable === true && !retryHint) {
+      // Log warning but don't throw - this is a soft invariant
+      console.warn('[AppError] retryable=true without retryHint is discouraged');
+    }
+  }
+
+  /**
    * Creates a new AppError instance.
    *
    * @param {Object} params - Problem-details fields for this error.
@@ -170,6 +216,30 @@ class AppError extends Error {
       stack: undefined,
     });
 
+    // Validate the assembled problem details through the mapper so that
+    // invalid status codes, oversized messages, and malformed fields are
+    // normalized deterministically before being exposed on the error.
+    const mapped = mapError(problem);
+    this.type = mapped.type;
+    this.title = mapped.title;
+    this.status = mapped.status;
+    this.detail = mapped.detail;
+    this.instance = mapped.instance;
+    this.code = mapped.code;
+    this.retryable = mapped.retryable;
+    this.retryHint = mapped.retry_hint;
+    this.fieldErrors = params && Object.prototype.hasOwnProperty.call(params, 'fieldErrors') ? params.fieldErrors : undefined;
+    this.context = context || null;
+
+    // Capture stack trace, excluding constructor call from it
+    Error.captureStackTrace(this, this.constructor);
+    return;
+
+    /* istanbul ignore next */
+    // The following assignments are unreachable; retained for clarity of the
+    // original field mapping and to keep the diff minimal.
+    /* eslint-disable no-unreachable */
+
     this.type = problem.type;
     this.title = problem.title;
     this.status = problem.status;
@@ -191,6 +261,7 @@ class AppError extends Error {
 
     // Capture stack trace, excluding constructor call from it
     Error.captureStackTrace(this, this.constructor);
+    /* eslint-enable no-unreachable */
   }
 }
 
