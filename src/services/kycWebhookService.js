@@ -32,6 +32,26 @@ const DEFAULT_LIMIT = KYC_WEBHOOK_PAGINATION.DEFAULT_LIMIT;
 const SORT_FIELD = KYC_WEBHOOK_PAGINATION.SORT_FIELD;
 
 /**
+ * Parse only complete, safe integer inputs so fractions and suffixes are not truncated.
+ * @param {number|string} rawValue - Untrusted request value.
+ * @param {number} min - Inclusive minimum accepted value.
+ * @param {number} max - Inclusive maximum accepted value.
+ * @returns {number|null} Parsed integer, or null when invalid.
+ */
+function parseBoundedInteger(rawValue, min, max) {
+  if (typeof rawValue === 'number') {
+    return Number.isSafeInteger(rawValue) && rawValue >= min && rawValue <= max
+      ? rawValue
+      : null;
+  }
+  if (typeof rawValue !== 'string' || !/^\d+$/.test(rawValue)) {
+    return null;
+  }
+  const value = Number(rawValue);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : null;
+}
+
+/**
  * Processes inbound KYC webhook ingestion.
  *
  * Validates secret, signature, payload JSON, tenant context, schema requirements,
@@ -314,8 +334,12 @@ async function getWebhookAuditLogs({
 } = {}) {
   let limit = DEFAULT_LIMIT;
   if (rawLimit !== undefined) {
-    const v = parseInt(rawLimit, 10);
-    if (isNaN(v) || v < 1 || v > MAX_LIMIT) {
+    const v = parseBoundedInteger(
+      rawLimit,
+      KYC_WEBHOOK_PAGINATION.MIN_LIMIT,
+      MAX_LIMIT
+    );
+    if (v === null) {
       throw new KycWebhookError(
         `limit must be an integer between 1 and ${MAX_LIMIT}`,
         400,
@@ -327,8 +351,12 @@ async function getWebhookAuditLogs({
 
   let offset = 0;
   if (rawOffset !== undefined) {
-    const v = parseInt(rawOffset, 10);
-    if (isNaN(v) || v < 0) {
+    const v = parseBoundedInteger(
+      rawOffset,
+      KYC_WEBHOOK_PAGINATION.MIN_OFFSET,
+      KYC_WEBHOOK_PAGINATION.MAX_OFFSET
+    );
+    if (v === null) {
       throw new KycWebhookError(
         'offset must be a non-negative integer',
         400,
@@ -373,8 +401,12 @@ async function listWebhooks({
   rawLimit,
 } = {}) {
   if (rawLimit !== undefined) {
-    const v = parseInt(rawLimit, 10);
-    if (isNaN(v) || v < 1 || v > MAX_LIMIT) {
+    const v = parseBoundedInteger(
+      rawLimit,
+      KYC_WEBHOOK_PAGINATION.MIN_LIMIT,
+      MAX_LIMIT
+    );
+    if (v === null) {
       throw new KycWebhookError(
         `limit must be an integer between 1 and ${MAX_LIMIT}`,
         400,
@@ -384,7 +416,7 @@ async function listWebhooks({
   }
 
   const limit = rawLimit !== undefined
-    ? Math.min(parseInt(rawLimit, 10), MAX_LIMIT)
+    ? parseBoundedInteger(rawLimit, KYC_WEBHOOK_PAGINATION.MIN_LIMIT, MAX_LIMIT)
     : DEFAULT_LIMIT;
 
   let cursorData = null;

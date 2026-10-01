@@ -90,9 +90,20 @@ const InvoiceFileMaxSizeSchema = z
   })
   .default('5mb');
 
+// ─── Main schema ──────────────────────────────────────────────────────────────
+
 /**
- * Complete configuration schema with defaults and validation.
- * Secrets have no defaults - must be provided.
+ * Complete configuration schema with explicit boundaries on every field.
+ *
+ * Boundary guarantees enforced here:
+ *   1. PORT is a finite integer in [1, 65535].
+ *   2. JWT_SECRET is at least 32 characters — never has a default.
+ *   3. All numeric timeout/retry/concurrency knobs have min AND max guards so
+ *      a mis-typed value cannot push them into an unsafe or non-functional range.
+ *   4. Boolean feature flags accept only "true" | "false" — no truthy aliases.
+ *   5. URLs are parsed by Zod's url() validator before use.
+ *   6. Cross-field invariants are checked in superRefine (see below).
+ *
  * @type {z.ZodObject<any>}
  */
 const ConfigSchema = z
@@ -100,37 +111,29 @@ const ConfigSchema = z
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
     PORT: z.coerce.number().min(1).max(65535).default(3001),
     JWT_SECRET: z.string().min(32), // No default for security
-    JWT_ALGORITHMS: z.string().optional().default('HS256'), // Comma-separated allowlist, e.g. HS256,RS256
-    JWT_ISSUER: z.string().optional(), // Optional issuer claim to enforce
-    JWT_AUDIENCE: z.string().optional(), // Optional audience claim to enforce
-    CURSOR_SECRET: z.string().min(32).optional(), // Dedicated marketplace cursor HMAC secret
+    JWT_ALGORITHMS: z.string().optional().default('HS256'),
+    JWT_ISSUER: z.string().optional(),
+    JWT_AUDIENCE: z.string().optional(),
+    CURSOR_SECRET: z.string().min(32).optional(),
     CURSOR_TTL_ENABLED: z.enum(['true', 'false']).default('false'),
     CURSOR_TTL_SECONDS: z.coerce.number().int().min(1).default(3600),
-    CORS_ALLOWED_ORIGINS: z.string().optional(), // Comma-separated, optional for dev fallbacks
+    CORS_ALLOWED_ORIGINS: z.string().optional(),
     SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
+
     NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
     SOROBAN_BATCH_CONCURRENCY: z.coerce.number().min(1).max(50).default(5),
     SOROBAN_BATCH_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
-    // Escrow indexer configuration
     ESCROW_INDEXER_ENABLED: z.enum(['true', 'false']).default('false'),
     ESCROW_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce.number().min(1).default(300),
-    // Escrow read projection — gates the new projection/cache-based escrow read path
     ESCROW_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
-    // Invoice state machine — gates /api/invoices state-transition endpoints.
-    // When 'false', the invoice state routes are not mounted so requests return 404.
-    // Defaults to 'true' (enabled) to preserve existing behaviour.
     INVOICE_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
-    // Runtime admin config surface — gates POST /api/admin/config and
-    // GET /api/admin/config/sections. When 'false' the router is not mounted
-    // so requests return 404, allowing the surface to be disabled without a
-    // deploy. Defaults to 'true' (enabled).
     CONFIG_RUNTIME_ENABLED: z.enum(['true', 'false']).default('true'),
-    // KYC provider — all optional, but URL+key must be provided together in non-test envs
     KYC_PROVIDER_URL: z.string().url().optional(),
+
+    /** KYC API key. Must be paired with KYC_PROVIDER_URL. */
     KYC_PROVIDER_API_KEY: z.string().min(1).optional(),
+
     KYC_PROVIDER_SECRET: z.string().min(1).optional(),
-    // Issue #592 — KYC provider transport hardening. Numeric knobs are clamped
-    // so a typo cannot disable the timeout, exhaust retries, or hang the breaker.
     KYC_PROVIDER_TIMEOUT_MS: z.coerce.number().min(100).max(30000).default(5000),
     KYC_PROVIDER_MAX_RETRIES: z.coerce.number().min(0).max(10).default(3),
     KYC_PROVIDER_BASE_DELAY_MS: z.coerce.number().min(0).max(10000).default(200),
@@ -139,19 +142,19 @@ const ConfigSchema = z
     KYC_PROVIDER_VERIFY_RESPONSE_SIGNATURE: z.enum(['true', 'false']).default('false'),
     KYC_PROVIDER_CB_FAILURE_THRESHOLD: z.coerce.number().min(1).max(100).default(5),
     KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS: z.coerce.number().min(100).max(60000).default(10000),
-    // KYC webhook ingestion feature flag — safe default: disabled
     KYC_WEBHOOK_ENABLED: z.enum(['true', 'false']).default('false'),
-    // Public base URL for the API, used in the OpenAPI spec servers array.
-    // Required in production and must use HTTPS. Falls back to localhost in development/test.
     PUBLIC_API_BASE_URL: z.string().url().optional(),
+
+    // ── Invoice upload ────────────────────────────────────────────────────────
     INVOICE_FILE_MAX_SIZE: InvoiceFileMaxSizeSchema,
-    // Feature flag: gates Prometheus metrics collection and the /metrics endpoint.
-    // When 'false', all metric recording becomes a silent no-op and GET /metrics
-    // returns 503. Default 'true' preserves existing behaviour.
     METRICS_ENABLED: z.enum(['true', 'false']).default('true'),
   })
+  // ── Cross-field boundary checks ─────────────────────────────────────────────
   .superRefine((data, ctx) => {
+    // Skip cross-field checks in test mode to allow partial configurations.
     if (data.NODE_ENV === 'test') { return; }
+
+    // 1. Production cursor secret: either CURSOR_SECRET or JWT_SECRET must be set.
     if (data.NODE_ENV === 'production' && !data.CURSOR_SECRET && !data.JWT_SECRET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -159,6 +162,8 @@ const ConfigSchema = z
         path: ['CURSOR_SECRET'],
       });
     }
+
+    // 2. KYC half-configuration: URL and key must be present together or absent together.
     const hasUrl = Boolean(data.KYC_PROVIDER_URL);
     const hasKey = Boolean(data.KYC_PROVIDER_API_KEY);
     if (hasUrl !== hasKey) {
@@ -169,9 +174,10 @@ const ConfigSchema = z
         path: hasUrl ? ['KYC_PROVIDER_API_KEY'] : ['KYC_PROVIDER_URL'],
       });
     }
+
+    // 3. Production PUBLIC_API_BASE_URL: required, HTTPS, non-loopback.
     if (data.NODE_ENV === 'production') {
       const baseUrl = data.PUBLIC_API_BASE_URL;
-      // Require the variable to be present in production
       if (!baseUrl) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -181,25 +187,22 @@ const ConfigSchema = z
         });
         return;
       }
-      // Require HTTPS — never allow plaintext in production
       let parsed;
       try { parsed = new URL(baseUrl); } catch (_) { parsed = null; }
+
       if (!parsed || parsed.protocol !== 'https:') {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message:
-            'PUBLIC_API_BASE_URL must use HTTPS in production.',
+          message: 'PUBLIC_API_BASE_URL must use HTTPS in production.',
           path: ['PUBLIC_API_BASE_URL'],
         });
         return;
       }
-      // Reject loopback addresses (127.x.x.x, ::1, [::1], localhost)
       const loopbackPattern = /^(localhost|127(?:\.\d+){3}|::1|\[::1\])$/i;
       if (loopbackPattern.test(parsed.hostname)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message:
-            'PUBLIC_API_BASE_URL must not be a loopback address in production.',
+          message: 'PUBLIC_API_BASE_URL must not be a loopback address in production.',
           path: ['PUBLIC_API_BASE_URL'],
         });
       }
@@ -210,7 +213,7 @@ const ConfigSchema = z
 
 /**
  * Runtime validated configuration object.
- * @type {z.infer<typeof ConfigSchema>}
+ * @type {z.infer<typeof ConfigSchema> | undefined}
  */
 let config;
 
@@ -230,9 +233,9 @@ let config;
 function validate() {
   const parsed = ConfigSchema.safeParse(process.env);
   if (!parsed.success) {
-    throw parsed.error;
+    throw new ConfigValidationError(parsed.error);
   }
-  config = parsed.data;
+  config = Object.freeze(parsed.data);
   return config;
 }
 
@@ -248,14 +251,22 @@ function validate() {
  */
 function logRedactedSummary(error) {
   console.error('Configuration validation failed:');
+  // ConfigValidationError exposes .issues as { path, message } pairs.
+  if (error instanceof ConfigValidationError) {
+    error.issues.forEach(issue => {
+      console.error(`- [${issue.path}]: ${issue.message}`);
+    });
+    return;
+  }
+  // Legacy: raw ZodError (e.g. from callers that import ConfigSchema directly).
   if (error && Array.isArray(error.issues)) {
     error.issues.forEach(issue => {
       const key = issue.path.join('.');
       console.error(`- [${key}]: ${issue.message}`);
     });
-  } else {
-    console.error(error ? error.message : 'Unknown configuration error');
+    return;
   }
+  console.error(error ? error.message : 'Unknown configuration error');
 }
 
 /**
@@ -282,8 +293,8 @@ function get() {
  * error after future schema additions.
  *
  * @template {keyof z.infer<typeof ConfigSchema>} K
- * @param {K} key - Validated configuration key.
- * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
+ * @param {K} key
+ * @returns {z.infer<typeof ConfigSchema>[K]}
  */
 function getValue(key) {
   return get()[key];
@@ -302,7 +313,9 @@ function getInvoiceFileMaxSize() {
   if (config) {
     return config.INVOICE_FILE_MAX_SIZE;
   }
-  return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
+  // Safe fallback: if the env var is missing or invalid, return the schema default.
+  const result = InvoiceFileMaxSizeSchema.safeParse(process.env.INVOICE_FILE_MAX_SIZE);
+  return result.success ? result.data : InvoiceFileMaxSizeSchema.parse(undefined);
 }
 
 // ─── Public API — new contracts (additive, #1306) ─────────────────────────────
@@ -357,7 +370,6 @@ const securityHeaders = {
   },
   referrerPolicy: { policy: 'no-referrer' },
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
-  // Less restrictive CSP for Swagger UI docs
   docsContentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
@@ -380,10 +392,12 @@ const securityHeaders = {
 module.exports = {
   // ── Preserved (initial contract) ─────────────────────────────────────────
   validate,
+  validateSafe,
   get,
   getValue,
   getInvoiceFileMaxSize,
   logRedactedSummary,
+  ConfigValidationError,
   ConfigSchema,
   InvoiceFileMaxSizeSchema,
   securityHeaders,

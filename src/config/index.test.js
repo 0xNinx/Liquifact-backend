@@ -1,3 +1,5 @@
+
+
 /**
  * Tests for centralized config module — #1306 Preserve compatibility contracts.
  *
@@ -15,6 +17,7 @@ const mod = require('./index');
 
 const {
   validate,
+  validateSafe,
   get,
   getValue,
   getInvoiceFileMaxSize,
