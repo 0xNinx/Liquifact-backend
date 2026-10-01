@@ -6,6 +6,13 @@
  * Supports a configurable maximum number of entries with LRU eviction.
  * Metrics for hits, misses, and evictions are emitted via the metrics module.
  *
+ * Validation invariants:
+ *   - Keys must be non-empty strings of at most MAX_KEY_LENGTH characters.
+ *   - TTLs must be finite numbers in (0, MAX_TTL_MS].
+ *   - Prefixes must be non-empty strings of at most MAX_KEY_LENGTH characters.
+ *   - Invalid inputs are rejected with CacheValidationError and do not
+ *     mutate the cache or emit hit/miss/eviction metrics.
+ *
  * @class
  */
 const { footprintCacheHitsTotal, footprintCacheMissesTotal, footprintCacheEvictionsTotal } = require('../metrics');
@@ -71,6 +78,7 @@ class MemoryCacheStore {
    *
    * @param {object} [options] - Options for the cache store.
    * @param {number} [options.maxEntries] - Maximum number of entries before LRU eviction. Defaults to 5000.
+   * @throws {CacheValidationError} If maxEntries is not a non-negative finite number.
    */
   constructor(options = {}) {
     const { maxEntries = DEFAULT_MAX_ENTRIES } = options;
@@ -86,6 +94,7 @@ class MemoryCacheStore {
    *
    * @param {string} key - The cache key to look up.
    * @returns {*} The cached value, or undefined if missing/expired.
+   * @throws {CacheValidationError} If the key is invalid.
    */
   get(key) {
     const normalizedKey = normalizeKey(key);
@@ -115,6 +124,7 @@ class MemoryCacheStore {
    * @param {*} value - The value to cache.
    * @param {number} ttlMs - Time-to-live in milliseconds.
    * @returns {void}
+   * @throws {CacheValidationError} If the key or TTL is invalid.
    */
   set(key, value, ttlMs) {
     const normalizedKey = normalizeKey(key);
@@ -138,6 +148,7 @@ class MemoryCacheStore {
    *
    * @param {string} key - The cache key to remove.
    * @returns {void}
+   * @throws {CacheValidationError} If the key is invalid.
    */
   del(key) {
     const normalizedKey = normalizeKey(key);
@@ -170,6 +181,7 @@ class MemoryCacheStore {
    *
    * @param {string} prefix - The key prefix to match.
    * @returns {void}
+   * @throws {CacheValidationError} If the prefix is invalid.
    */
   delByPrefix(prefix) {
     const normalizedPrefix = normalizeKey(prefix);
@@ -237,6 +249,7 @@ let _sharedInstance = null;
 
 module.exports = {
   MemoryCacheStore,
+  CacheValidationError,
   createCacheStore,
   getSharedStore,
   resetSharedStore,

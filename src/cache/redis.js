@@ -58,6 +58,12 @@ function getRedisClient() {
 
 /**
  * Parses a raw value into a positive integer within a specified range.
+ * Boundary semantics:
+ *   - non-numeric / empty / null / undefined  -> fallback
+ *   - value below min                         -> min
+ *   - value above max                         -> max
+ *   - fractional values are truncated (parseInt)
+ *
  * @param {any} rawValue The value to parse.
  * @param {number} fallback The fallback value if parsing fails.
  * @param {number} min The minimum allowed value.
@@ -65,7 +71,10 @@ function getRedisClient() {
  * @returns {number} The parsed integer or fallback.
  */
 function parsePositiveInt(rawValue, fallback, min, max) {
-  const parsed = Number.parseInt(String(rawValue || ''), 10);
+  if (rawValue === null || rawValue === undefined || rawValue === '') {
+    return fallback;
+  }
+  const parsed = Number.parseInt(String(rawValue), 10);
   if (!Number.isFinite(parsed)) {
     return fallback;
   }
@@ -108,7 +117,7 @@ function parseRedisEscrowCacheConfig(env = process.env) {
 /**
  * Creates a Redis client based on the provided configuration.
  * @param {Object} config The configuration object.
- * @param {Function} [RedisCtor] Optional Redis constructor for testing.
+ * @param {Function} [RedisCtor] The Redis constructor for testing.
  * @returns {Object|null} The Redis client or null if not enabled.
  */
 function createRedisClient(config = parseRedisEscrowCacheConfig(), RedisCtor) {
@@ -126,11 +135,82 @@ function createRedisClient(config = parseRedisEscrowCacheConfig(), RedisCtor) {
 
 /**
  * Validates an invoice ID.
+ *
+ * Accepted input:
+ *   - non-empty string of 1..128 characters containing only [a-zA-Z0-9:_-]
+ *
+ * Rejected input:
+ *   - non-string values (null, undefined, numbers, objects, arrays)
+ *   - empty string
+ *   - strings longer than 128 characters
+ *   - strings containing whitespace, slashes, or other unsafe characters
+ *
  * @param {string} invoiceId The invoice ID to validate.
  * @returns {boolean} True if the invoice ID is valid.
  */
 function isValidInvoiceId(invoiceId) {
-  return typeof invoiceId === 'string' && /^[a-zA-Z0-9:_-]{1,128}$/.test(invoiceId);
+  return typeof invoiceId === 'string' && INVOICE_ID_PATTERN.test(invoiceId);
+}
+
+/**
+ * Validates a cache key prefix.
+ *
+ * Accepted input:
+ *   - non-empty string of 1..64 characters containing only [a-zA-Z0-9:.-]
+ *
+ * Rejected input:
+ *   - non-string values
+ *   - empty string
+ *   - stings longer than 64 characters
+ *   - strings containing whitespace or other unsafe characters
+ *
+ * @param {string} keyPrefix The key prefix to validate.
+ * @returns {boolean} True if the key prefix is valid.
+ */
+function isValidKeyPrefix(keyPrefix) {
+  return typeof keyPrefix === 'string' && KEY_PREFIX_PATTERN.test(keyPrefix);
+}
+
+/**
+ * Validates a ledger sequence number.
+ *
+ * Accepted input:
+ *   - finite non-negative integer
+ *
+ * Rejected input:
+ *   - NaN, Infinity, fractional values, negative values, non-numbers
+ *
+ * @param {number} ledger The ledger sequence to validate.
+ * @returns {boolean} True if the ledger is valid.
+ */
+function isValidLedger(ledger) {
+  return Number.isInteger(ledger) && ledger >= 0 && ledger <= MAX_CURRENT_LEGGER;
+}
+
+/**
+ * Validates a summary object for caching.
+ *
+ * Accepted input:
+ *   - non-null object that is not an array
+ *   - JSON-serializable with a payload below the maximum byte size
+ *
+ * Rejected input:
+ *   - null, undefined, arrays, primitives
+ *   - objects that cannot be serialized or exceed the size limit
+ *
+ * @param {Object} summary The summary object to validate.
+ * @returns {boolean} True if the summary is valid.
+ */
+function isValidSummary(summary) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+    return false;
+  }
+  try {
+    const serialized = JSON.stringify(summary);
+    return typeof serialized === 'string' && Buffer.byteLength(serialized, 'utf8') <= MAX_SUMMARY_PAYLOAD_BYTES;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -200,6 +280,7 @@ function parseCacheEnvelope(raw) {
 class RedisEscrowSummaryCache {
   /**
    * Initializes the RedisEscrowSummaryCache.
+   *
    * @param {Object} root0 Configuration object.
    * @param {Object} root0.client The Redis client.
    * @param {number} [root0.ttlSeconds] Time-to-live in seconds.
@@ -217,10 +298,25 @@ class RedisEscrowSummaryCache {
     circuitBreaker,
   }) {
     this.client = client;
-    this.ttlSeconds = ttlSeconds;
-    this.ledgerGapThreshold = ledgerGapThreshold;
-    this.keyPrefix = keyPrefix;
-    this.timeoutMs = timeoutMs;
+    this.ttlSeconds = parsePositiveInt(
+      ttlSeconds,
+      DEFAULT_TTL_SECONDS,
+      MIN_TTL_SECONDS,
+      MAX_TTL_SECONDS
+    );
+    this.ledgerGapThreshold = parsePositiveInt(
+      ledgerGapThreshold,
+      DEFAULT_LEDGER_GAP_THRESHOLD,
+      1,
+      MAX_LEDGER_GAP_THRESHOLD
+    );
+    this.keyPrefix = isValidKeyPrefix(keyPrefix) ? keyPrefix : 'escrow:summary';
+    this.timeoutMs = parsePositiveInt(
+      timeoutMs,
+      DEFAULT_TIMEOUT_MS,
+      MIN_TIMEOUT_MS,
+      MAX_TIMEOUT_MS
+    );
 
     /** @type {CircuitBreaker} Shared breaker — falls back to null so callers never see throws. */
     this.circuitBreaker = circuitBreaker || new CircuitBreaker({
@@ -256,7 +352,10 @@ class RedisEscrowSummaryCache {
    * @returns {Promise<Object>} The cache result including hit status and value.
    */
   async getSummary(invoiceId, currentLedger) {
-    if (!this.client || !isValidInvoiceId(invoiceId)) {
+    if (!this.client) {
+      return { hit: false, reason: 'unavailable' };
+    }
+    if (!isValidInvoiceId(invoiceId)) {
       return { hit: false, reason: 'invalid_input' };
     }
 
@@ -312,7 +411,13 @@ class RedisEscrowSummaryCache {
    * @returns {Promise<boolean>} True if the summary was successfully cached.
    */
   async setSummary(invoiceId, summary, currentLedger) {
-    if (!this.client || !isValidInvoiceId(invoiceId)) {
+    if (!this.client) {
+      return false;
+    }
+    if (!isValidInvoiceId(invoiceId)) {
+      return false;
+    }
+    if (!isValidSummary(summary)) {
       return false;
     }
     if (!isCacheableSummary(summary)) {
@@ -320,18 +425,19 @@ class RedisEscrowSummaryCache {
     }
 
     const key = this.key(invoiceId);
-    const payload = JSON.stringify({
+    const entry = {
       summary,
-      cachedLedger: Number.isFinite(currentLedger) ? currentLedger : null,
-      cachedAt: new Date().toISOString(),
-    });
+      cachedLedger: isValidLedger(currentLedger) ? currentLedger : null,
+    };
 
     try {
       const result = await this.circuitBreaker.execute(() =>
-        withTimeout(this.client.set(key, payload, 'EX', this.ttlSeconds), this.timeoutMs)
+        withTimeout(
+          this.client.set(key, JSON.stringify(entry), 'EX', this.ttlSeconds),
+          this.timeoutMs
+        )
       );
-      // Circuit breaker fallback returns null on trip.
-      return result !== null;
+      return result === 'OK';
     } catch {
       // Redis error, timeout, or circuit breaker exception — fail open.
       redisCacheFailOpenTotal.inc();
@@ -340,20 +446,27 @@ class RedisEscrowSummaryCache {
   }
 
   /**
-   * Deletes an invoice summary after a successful escrow write.
-   * Failures are non-fatal because callers can still invalidate their local cache.
+   * Deletes an escrow summary from the cache.
+   * Wraps the Redis DEL in a bounded timeout and circuit breaker.
+   * On any failure, fails open by returning false. Never throws.
    * @param {string} invoiceId The invoice ID.
    * @returns {Promise<boolean}> Whether Redis accepted the deletion.
    */
   async deleteSummary(invoiceId) {
-    if (!this.client || !isValidInvoiceId(invoiceId)) {
+    if (!this.client) {
       return false;
     }
+    if (!isValidInvoiceId(invoiceId)) {
+      return false;
+    }
+
+    const key = this.key(invoiceId);
+
     try {
       const result = await this.circuitBreaker.execute(() =>
-        withTimeout(this.client.del(this.key(invoiceId)), this.timeoutMs)
+        withTimeout(this.client.del(key), this.timeoutMs)
       );
-      return result !== null;
+      return result === 1 || result === 0;
     } catch {
       redisCacheFailOpenTotal.inc();
       return false;

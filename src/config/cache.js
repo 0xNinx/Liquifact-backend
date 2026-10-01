@@ -40,8 +40,53 @@ function parsePositiveInteger(raw, defaultValue, maxValue) {
 }
 
 /**
+ * Maximum acceptable cache TTL in seconds. Larger values are clamped to
+ * prevent accidental configuration from effectively disabling cache expiry.
+ */
+const MAX_CACHE_TTL_SECONDS = 86400; // 24 hours
+
+/**
+ * Maximum acceptable cache entry count. Larger values are clamped to bound
+ * memory usage and avoid unbounded growth from misconfiguration.
+ */
+const MAX_CACHE_ENTRIES = 100000;
+
+/**
+ * Parses a positive integer environment value with default and clamping.
+ *
+ * Behavior:
+ * - missing / empty / whitespace -> default
+ * - non-numeric / NaN / non-integer -> default
+ * - zero / negative / Infinity -> default
+ * - valid positive integer -> clamped to [min, max]
+ *
+ * @param {unknown} raw - Raw environment value.
+ * @param {number} defaultValue - Value used when input is invalid or missing.
+ * @param {number} maxValue - Upper bound applied to valid inputs.
+ * @returns {number} Validated integer.
+ */
+function parsePositiveInteger(raw, defaultValue, maxValue) {
+  if (raw === undefined || raw === null) {
+    return defaultValue;
+  }
+  if (typeof raw === 'string' && raw.trim() === '') {
+    return defaultValue;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    return defaultValue;
+  }
+  return Math.min(parsed, maxValue);
+}
+
+/**
  * Parses cache configuration from environment variables.
  * Falls back to defaults when values are missing or invalid.
+ *
+ * Invariants:
+ * - Returned TTLs are positive integer milliseconds within [1000, MAX_CACHE_TTL_SECONDS*1000].
+ * - Returned max entries are positive integers within [1, MAX_CACHE_ENTRIES].
+ * - Invalid input never produces NaN or negative values.
  *
  * @param {NodeJS.ProcessEnv} env - Environment variables to read from.
  * @returns {{ escrowTtl: number, escrowMaxEntries: number, invoiceStateTtl: number, invoiceStateMaxEntries: number }} Cache configuration.
