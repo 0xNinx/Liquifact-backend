@@ -12,6 +12,28 @@
  * deployment that the backend may not yet support, so it must not be noticed
  * silently. See {@link raiseVersionMismatchAlert} and `docs/wasm-ops.md`.
  *
+ * ## State invariants
+ *
+ * The job owns a single piece of mutable state: the alert de-dupe map
+ * (`_alertedMismatches`). The following invariants MUST hold at all times:
+ *
+ * 1. **Keyed by resolved contract id.** Every entry is keyed by the resolved
+ *    contract id (or the `<default>` sentinel when no id is configured), never
+ *    by a raw/orphan argument. This keeps concurrent runs for the same
+ *    contract from creating duplicate entries.
+ * 2. **Signature monotonicity.** For a given contract, the stored signature is
+ *    always the most recently *observed* `expected|observed` pair. A mismatch
+ *    that is already recorded is never re-alerted; a *different* mismatch
+ *    (changed expected or observed version) always alerts.
+ * 3. **Reset on recovery.** When a contract returns to `current`, its entry is
+ *    removed so a future regression re-alerts.
+ * 4. **No partial writes.** The map is only mutated after the alert payload has
+ *    been fully constructed, and metric/log emission is best-effort and cannot
+ *    roll back the map. A failed metric backend must not corrupt de-dupe state.
+ * 5. **Bounded growth.** Entries are only ever created for contracts that are
+ *    currently mismatched and are removed on recovery, so the map is bounded by
+ *    the number of distinct mismatched contracts.
+ *
  * @module jobs/contractListRefresh
  */
 
@@ -29,6 +51,123 @@ const { contractWasmVersionMismatchAlertsTotal } = require('../metrics');
 const MISMATCH_STATUSES = new Set(['ahead', 'unknown']);
 
 /**
+ * Every status `compareVersions` is allowed to return. Anything else means the
+ * comparison module violated its contract, and a mismatch alert must not be
+ * raised or suppressed on the strength of an unknown value.
+ *
+ * @type {ReadonlySet<string>}
+ */
+const VALID_STATUSES = new Set(['current', 'ahead', 'unknown']);
+
+/**
+ * Largest value a Soroban `u32` SCHEMA_VERSION can hold. A decoded version
+ * outside `[0, MAX_U32]` (NaN, a float, a negative, an overflow) is a corrupt
+ * read, not a real on-chain version — alerting on it would be a false positive.
+ *
+ * @constant {number}
+ */
+const MAX_U32 = 0xffffffff;
+
+/**
+ * Error codes raised by input validation. Callers branch on `code`, never on
+ * message text.
+ *
+ * @constant {Readonly<Record<string, string>>}
+ */
+const REFRESH_ERRORS = Object.freeze({
+  /** `contractId` override was present but not a usable string. */
+  INVALID_CONTRACT_ID: 'INVALID_CONTRACT_ID',
+  /** The decoded on-chain SCHEMA_VERSION was not a valid u32. */
+  INVALID_ON_CHAIN_VERSION: 'INVALID_ON_CHAIN_VERSION',
+  /** `compareVersions` returned a status outside {@link VALID_STATUSES}. */
+  INVALID_STATUS: 'INVALID_STATUS',
+});
+
+/**
+ * Builds a tagged validation error.
+ *
+ * @param {string} code - One of {@link REFRESH_ERRORS}.
+ * @param {string} message - Human-readable detail.
+ * @returns {Error} Error with `code` set.
+ */
+function _refreshError(code, message) {
+  const err = new Error(message);
+  err.code = code;
+  return err;
+}
+
+/**
+ * Validates the optional `contractId` override.
+ *
+ * `undefined`/`null` are allowed and mean "fall back to ESCROW_CONTRACT_ID".
+ * A supplied override must be a non-empty string; it is trimmed so callers
+ * cannot smuggle a whitespace id past the downstream address validation. This
+ * deliberately does not enforce the Stellar address *format* — that concern is
+ * owned by `config/escrowVersions` and is exercised by its own tests.
+ *
+ * @param {unknown} contractId - Candidate override.
+ * @returns {string|undefined} Trimmed override, or undefined when absent.
+ * @throws {Error} `INVALID_CONTRACT_ID` for a present-but-unusable override.
+ */
+function validateContractIdOverride(contractId) {
+  if (contractId === undefined || contractId === null) {
+    return undefined;
+  }
+  if (typeof contractId !== 'string' || contractId.trim().length === 0) {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_CONTRACT_ID,
+      'contractId override must be a non-empty string'
+    );
+  }
+  return contractId.trim();
+}
+
+/**
+ * Validates the on-chain SCHEMA_VERSION decoded from the RPC read.
+ *
+ * @param {unknown} value - Decoded version.
+ * @returns {number} The validated integer.
+ * @throws {Error} `INVALID_ON_CHAIN_VERSION` when not an integer in [0, MAX_U32].
+ */
+function validateOnChainVersion(value) {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_U32) {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_ON_CHAIN_VERSION,
+      `on-chain SCHEMA_VERSION must be an integer in [0, ${MAX_U32}], got ${String(value)}`
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates the comparison envelope returned by `compareVersions`.
+ *
+ * Guards against a malformed/`undefined` return (which would otherwise be
+ * destructured or silently treated as "no mismatch") and against an unexpected
+ * status (which would otherwise skip the alert path entirely).
+ *
+ * @param {unknown} comparison - Return value of `compareVersions`.
+ * @returns {{ status: 'current'|'ahead'|'unknown', knownVersion: string|null }}
+ *   The validated envelope.
+ * @throws {Error} `INVALID_STATUS` when the envelope or status is not recognised.
+ */
+function validateComparison(comparison) {
+  if (!comparison || typeof comparison !== 'object') {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_STATUS,
+      'compareVersions returned a non-object result'
+    );
+  }
+  if (!VALID_STATUSES.has(comparison.status)) {
+    throw _refreshError(
+      REFRESH_ERRORS.INVALID_STATUS,
+      `compareVersions returned an unexpected status: ${String(comparison.status)}`
+    );
+  }
+  return comparison;
+}
+
+/**
  * De-dupe state for raised mismatch alerts, keyed by resolved contract id.
  * The value is the last alerted `expected|observed` version-pair signature, so a
  * persistent, already-reported mismatch does not re-alert on every scheduled
@@ -37,16 +176,35 @@ const MISMATCH_STATUSES = new Set(['ahead', 'unknown']);
  *
  * @type {Map<string, string>}
  */
-const _alertedMismatches = new Map();
+const _alertedHismatches = new Map();
 
 /**
  * Builds the de-dupe map key for a contract.
  *
- * @param {string|null} contractId - Resolved contract address (or null).
+ * Invariant: the returned key is always a non-empty string, so two runs that
+ * both lack a contract id collapse onto the same sentinel entry rather than
+ * creating distinct `undefined` keys.
+ *
+ * @param {string|null|undefined} contractId - Resolved contract address (or null).
  * @returns {string} A stable key, falling back to a sentinel for the default.
  */
 function dedupeMapKey(contractId) {
-  return contractId || '<default>';
+  return contractId || DEFAULT_CONTRACT_KEA;
+}
+
+/**
+ * Builds the de-dupe signature for a mismatch observation.
+ *
+ * Invariant: the signature is a pure function of `(expectedVersion, observedVersion)`
+ * so identical observations always produce identical signatures and distinct
+ * observations always produce distinct signatures.
+ *
+ * @param {string|null|undefined} expectedVersion - Closest known registry semver.
+ * @param {number} observedVersion - Observed on-chain SCHEMA_VERSION (u32).
+ * @returns {string} The `expected|observed` signature.
+ */
+function mismatchSignature(expectedVersion, observedVersion) {
+  return `${expectedVersion || 'none'}|${observedVersion}`;
 }
 
 /**
@@ -74,13 +232,17 @@ function dedupeMapKey(contractId) {
  */
 function raiseVersionMismatchAlert({ contractId, observedVersion, expectedVersion, status }) {
   const mapKey = dedupeMapKey(contractId);
-  const signature = `${expectedVersion || 'none'}|${observedVersion}`;
+  const signature = mismatchSignature(expectedVersion, observedVersion);
 
-  if (_alertedMismatches.get(mapKey) === signature) {
+  if (_alertedMIsmatches.get(mapKey) === signature) {
     // Same mismatch already alerted — stay quiet to avoid spamming ops.
     return false;
   }
-  _alertedMismatches.set(mapKey, signature);
+
+  // Record the observation *before* emitting side effects so that a throwing
+  // metric/log backend cannot cause the same mismatch to be re-alerted on the
+  // next run (invariant 4: no partial writes / no duplicate alerts).
+  _alertedMIsmatches.set(mapKey, signature);
 
   try {
     contractWasmVersionMismatchAlertsTotal.inc({ status });
@@ -88,16 +250,20 @@ function raiseVersionMismatchAlert({ contractId, observedVersion, expectedVersio
     // Metric backend is optional/best-effort; never let it break the job.
   }
 
-  logger.error(
-    {
-      alert: 'contract_wasm_version_mismatch',
-      contractId: contractId || null,
-      expectedVersion: expectedVersion || null,
-      observedVersion,
-      status,
-    },
-    'ALERT: on-chain wasm SCHEMA_VERSION mismatch detected'
-  );
+  try {
+    logger.error(
+      {
+        alert: 'contract_wasm_version_mismatch',
+        contractId: contractId || null,
+        expectedVersion: expectedVersion || null,
+        observedVersion,
+        status,
+      },
+      'ALERT: on-chain wasm SCHEMA_VERSION mismatch detected'
+    );
+  } catch (_e) {
+    // Logging backend is best-effort; de-dupe state is already committed.
+  }
 
   return true;
 }
@@ -111,7 +277,22 @@ function raiseVersionMismatchAlert({ contractId, observedVersion, expectedVersio
  * @returns {void}
  */
 function resetVersionMismatchAlertState() {
-  _alertedMismatches.clear();
+  _alertedMIsmatches.clear();
+}
+
+/**
+ * Returns a read-only snapshot of the current de-dupe state.
+ *
+ * Exposed for observability and tests so callers can assert invariants without
+ * mutating internal state.
+ *
+ * @returns {Array<{ contractId: string, signature: string }>} Snapshot entries.
+ */
+function getVersionMismatchAlertState() {
+  return Array.from(_alertedMismatches.entries()).map(([contractId, signature]) => ({
+    contractId,
+    signature,
+  }));
 }
 
 /**
@@ -123,17 +304,28 @@ function resetVersionMismatchAlertState() {
  * regression re-alerts. A read failure propagates and is **not** treated as a
  * mismatch (no alert is raised).
  *
+ * Invariants enforced here:
+ * - The resolved contract id is computed once and used consistently for both
+ *   the alert and the recovery reset, so a mismatch and its later recovery
+ *   always target the same de-dupe entry.
+ * - A read failure short-circuits before any state mutation, so a transient RPC
+ *   error cannot clear or corrupt de-dupe state.
+ *
  * @param {string} [contractId] - Override for ESCROW_CONTRACT_ID.
  * @returns {Promise<{ onChainVersion: number, knownVersion: string|null, status: string }>}
  * @throws On RPC failure or invalid contract ID.
  */
 async function runContractListRefresh(contractId) {
-  logger.info({ contractId }, 'Starting contract list refresh');
+  // ── Validation boundary ──────────────────────────────────────────────────
+  // Validate before any RPC call or alert so bad inputs fail deterministically
+  // and never produce a false mismatch alert.
+  const override = validateContractIdOverride(contractId);
+  logger.info({ contractId: override }, 'Starting contract list refresh');
 
-  const onChainVersion = await getOnChainSchemaVersion(contractId);
-  const { status, knownVersion } = compareVersions(onChainVersion);
+  const onChainVersion = validateOnChainVersion(await getOnChainSchemaVersion(override));
+  const { status, knownVersion } = validateComparison(compareVersions(onChainVersion));
 
-  const resolvedId = contractId || process.env.ESCROW_CONTRACT_ID || null;
+  const resolvedId = override || process.env.ESCROW_CONTRACT_ID || null;
 
   if (MISMATCH_STATUSES.has(status)) {
     raiseVersionMismatchAlert({
@@ -144,7 +336,7 @@ async function runContractListRefresh(contractId) {
     });
   } else {
     // Versions match — drop any prior alert state so a later regression alerts.
-    _alertedMismatches.delete(dedupeMapKey(resolvedId));
+    _alertedHismatches.delete(dedupeMapKey(resolvedId));
   }
 
   logger.info({ onChainVersion, knownVersion, status }, 'Contract list refresh complete');
@@ -156,5 +348,11 @@ module.exports = {
   runContractListRefresh,
   raiseVersionMismatchAlert,
   resetVersionMismatchAlertState,
+  validateContractIdOverride,
+  validateOnChainVersion,
+  validateComparison,
   MISMATCH_STATUSES,
+  VALID_STATUSES,
+  REFRESH_ERRORS,
+  MAX_U32,
 };

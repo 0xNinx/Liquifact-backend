@@ -121,6 +121,7 @@ const indexerEventSchema = z
 
 module.exports = {
   indexerEventSchema,
+  parseIndexerEvent,
   parseValidationErrors,
   INVOICE_ID_REGEX,
   CONTRACT_ID_REGEX,

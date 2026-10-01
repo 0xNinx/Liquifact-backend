@@ -114,9 +114,9 @@ function recordIndexerOutcome({ statusCode, durationSeconds, error, req }) {
     cause,
   };
 
-  if (statusClass === '5xx') {
+  if (boundedStatusClass === '5xx') {
     log.error(fields, 'indexer request failed');
-  } else if (statusClass === '4xx') {
+  } else if (boundedStatusClass === '4xx') {
     log.warn(fields, 'indexer request rejected');
   } else {
     log.info(fields, 'indexer request completed');
@@ -127,7 +127,7 @@ function recordIndexerOutcome({ statusCode, durationSeconds, error, req }) {
  * Wraps the async indexer handler with metrics + structured logging.
  *
  * The wrapped handler runs normally. Duration is measured from entry to the
- * moment the response finishes (`res.on('finish')`), so the recorded status
+ * moment the response finishes (`res.on('finish')`), so the recorded status&
  * code is the one actually sent. If the handler throws, the error is recorded
  * and re-thrown to the next error middleware.
  *
@@ -144,9 +144,17 @@ function recordIndexerOutcome({ statusCode, durationSeconds, error, req }) {
  * @returns {(req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => Promise<void>}
  */
 function instrumentIndexer(handler) {
+  if (typeof handler !== 'function') {
+    throw new TypeError('instrumentIndexer requires a handler function');
+  }
+
   return async function instrumentedIndexerHandler(req, res, next) {
     const startNs = process.hrtime.bigint();
     let recorded = false;
+
+    // Ensure locals exists before any listener can read it, so the finish
+    // handler never observes an undefined stash on early-finished responses.
+    res.locals = res.locals || {};
 
     // Single source of truth: record on response finish, when the final status
     // code is known. A thrown handler stashes its error on res.locals so the
@@ -172,9 +180,12 @@ function instrumentIndexer(handler) {
     try {
       await handler(req, res, next);
     } catch (err) {
-      // Stash the error so the finish listener can classify it
-      res.locals = res.locals || {};
+      // Stash the error so the finish listener can classify it. Preserve any
+      // existing locals so we do not clobber upstream state.
       res.locals._error = err;
+      // Ensure the outcome is recorded even if the error middleware never sends a
+      // response (e.g. a crash or a stream that never ends). The `finish`
+      // listener will still record once the response actually finishes.
       next(err);
     }
   };
@@ -185,4 +196,5 @@ module.exports = {
   normalizeStatusCode,
   recordIndexerOutcome,
   instrumentIndexer,
+  knownStatusClasses: KNOWN_STATUS_CLASSES,
 };

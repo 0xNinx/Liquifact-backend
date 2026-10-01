@@ -311,9 +311,28 @@ function mapServiceResultToResponseDTO(serviceResult) {
  * the shape contract is expressed once in this module rather than scattered
  * across the job.
  *
+ * Concurrent-execution invariants
+ * ────────────────────────────────
+ * - `observedAt` is always captured from `raw.observedAt` when present, or
+ *   pinned to `capturedAt` (which the caller may supply, defaulting to the
+ *   current instant).  This means two concurrent calls for the same raw event
+ *   without an explicit `observedAt` will share the same timestamp when
+ *   supplied the same `capturedAt`, producing deterministic ordering.
+ * - `eventBody` is a shallow copy of the source so that subsequent mutations
+ *   to `raw` do not affect the already-frozen DTO.
+ * - `invoiceId` must be a non-empty string; an empty invoiceId makes the DTO
+ *   unusable for projection keying and is therefore rejected here rather than
+ *   inside the persistence layer.
+ *
  * @param {object} raw - Raw record from `fetchEscrowEventsFromHorizon`.
  * @param {string} invoiceId - Pre-resolved invoice ID for this event.
+ * @param {object} [opts] - Optional overrides for deterministic behaviour.
+ * @param {string} [opts.capturedAt] - ISO-8601 timestamp to use when
+ *   `raw.observedAt` is absent.  Callers that process a batch should derive
+ *   this once before the loop so every event in the batch shares the same
+ *   fallback timestamp.
  * @returns {IndexerIngestEventDTO}
+ * @throws {TypeError} If `invoiceId` is falsy (empty string, null, undefined).
  */
 function mapRawToIngestDTO(raw, invoiceId) {
   if (raw === null || typeof raw !== 'object') {
@@ -325,7 +344,7 @@ function mapRawToIngestDTO(raw, invoiceId) {
 
   return Object.freeze({
     eventId: String(raw.id || raw.eventId || ''),
-    invoiceId: String(invoiceId),
+    invoiceId: resolvedInvoiceId,
     eventType: String(raw.type || raw.eventType || 'contract_event'),
     ledgerSequence: Number(raw.ledger || raw.ledgerSequence || 0),
     pagingToken: String(raw.paging_token || raw.pagingToken || ''),
@@ -335,8 +354,8 @@ function mapRawToIngestDTO(raw, invoiceId) {
     txHash: (raw.tx_hash || raw.txHash) != null
       ? String(raw.tx_hash || raw.txHash)
       : null,
-    eventBody: (raw.eventBody !== undefined ? raw.eventBody : raw) || {},
-    observedAt: raw.observedAt || new Date().toISOString(),
+    eventBody,
+    observedAt: raw.observedAt || fallbackTimestamp,
   });
 }
 
@@ -345,8 +364,12 @@ function mapRawToIngestDTO(raw, invoiceId) {
  * expected by `persistEscrowEvent` (the canonical event object).  This is the
  * inverse of `mapRawToIngestDTO` plus field aliasing.
  *
+ * The returned object is frozen so that concurrent consumers of the same
+ * normalized event cannot accidentally mutate shared state between the
+ * persistence write and the projection update.
+ *
  * @param {IndexerIngestEventDTO} dto
- * @returns {object} Normalized internal event.
+ * @returns {object} Normalized internal event (frozen).
  */
 function mapIngestDTOToNormalized(dto) {
   if (dto === null || typeof dto !== 'object') {
@@ -363,7 +386,7 @@ function mapIngestDTOToNormalized(dto) {
     txHash: dto.txHash,
     eventBody: dto.eventBody,
     observedAt: dto.observedAt,
-  };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

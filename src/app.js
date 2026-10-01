@@ -73,6 +73,7 @@ const {
 } = require('./utils/routeMountRegistry');
 const { createCompressionMiddleware } = require('./middleware/compression');
 const { configErrorHandler } = require('./middleware/configErrorHandler');
+const { KYC_WEBHOOK_VALIDATION } = require('./constants/kycWebhooks');
 
 /**
  * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
@@ -144,7 +145,6 @@ function handleInternalError(err, req, res, _next) {
  * @returns {import('express').Express} Configured Express application.
  */
 function createApp() {
-  resetFeatureRouterMounts();
   const app = express();
 
   // ── 1. CORS ──────────────────────────────────────────────────────────────
@@ -153,7 +153,10 @@ function createApp() {
 
   // ── 1.a. KYC webhook raw body parser ──────────────────────────────────────
   // Incoming provider webhooks must be verified against the raw JSON body.
-  app.use('/api/kyc/webhook', express.raw({ type: 'application/json', limit: '100kb' }));
+  app.use('/api/kyc/webhook', express.raw({
+    type: 'application/json',
+    limit: KYC_WEBHOOK_VALIDATION.MAX_PAYLOAD_BYTES,
+  }));
 
   // ── 2 & 3. Body-size guardrails ──────────────────────────────────────────
   app.use(...jsonBodyLimit());
@@ -401,7 +404,7 @@ function createApp() {
   mountFeatureRouter(app, '/v1', v1Routes);
   mountFeatureRouter(app, '/api', apiKeysRoutes);
 
-  assertNoDuplicateRouterMounts();
+  assertNoDuplicateRouterMounts(app);
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
   // Rate limiter mounted BEFORE metricsAuth so unauthenticated attempts
