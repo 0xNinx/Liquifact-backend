@@ -4,8 +4,7 @@
  * @file src/db/knex.js
  * @description Knex connection factory with lifecycle state invariants.
  *
- * Connection selection rules
- * --------------------------
+ * ## Connection selection rules
  * - NODE_ENV=test       → always uses the `test` config block (in-memory SQLite).
  *                         Never falls back to development or production config.
  * - NODE_ENV=production → uses the `production` config block. Throws if the
@@ -51,8 +50,7 @@
  * `jest.mock('../../src/db/knex')` is called, so this file is never executed
  * during unit tests that use the manual mock.
  *
- * Config selection logic
- * ----------------------
+ * ## Config selection logic
  * The config-selection logic lives in `src/db/resolveConfig.js` so it can be
  * unit-tested independently without loading knex or pino.
  *
@@ -274,31 +272,9 @@ function applyProductionTls(env, config) {
 // Pool error handler attachment
 // ---------------------------------------------------------------------------
 
-/**
- * Attach pool-level error and connection-acquisition logging to a Knex
- * instance. Errors are caught here so unhandled promise rejections do not
- * propagate out of the pool layer.
- *
- * @param {import('knex').Knex} instance - The initialised Knex instance.
- * @returns {void}
- */
-function attachPoolErrorHandlers(instance) {
-  // `instance.client.pool` is exposed by tarn (the pool library knex uses).
-  const pool = instance.client && instance.client.pool;
-  if (!pool) { return; }
-
-  pool.on('createFail', (eventId, err) => {
-    logger.error({ err, eventId }, '[db] Pool: failed to create connection');
-  });
-
-  pool.on('acquireFail', (eventId, err) => {
-    logger.error({ err, eventId }, '[db] Pool: failed to acquire connection');
-  });
-
-  pool.on('destroyFail', (eventId, err) => {
-    logger.warn({ err, eventId }, '[db] Pool: failed to destroy connection');
-  });
-}
+// ---------------------------------------------------------------------------
+// Pool defaults
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Lifecycle proxy
@@ -432,7 +408,15 @@ const mergedConfig = {
  *
  * Subsequent `require` calls return the cached export (Node module cache).
  *
- * @type {import('knex').Knex}
+ * Extended with two additional properties:
+ * - `destroyOnce()` — idempotent, concurrent-safe pool teardown.
+ * - `getHealthInfo()` — structured DB liveness snapshot for /readyz.
+ *
+ * All other Knex methods (`db('table')`, `db.raw`, `db.transaction`, etc.) are
+ * available as usual.  The extensions are non-enumerable to avoid surprising
+ * callers that spread the export.
+ *
+ * @type {import('knex').Knex & { destroyOnce: () => Promise<void>, getHealthInfo: () => Promise<object> }}
  */
 const _rawDb = knex(mergedConfig);
 
