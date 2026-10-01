@@ -6,6 +6,23 @@
 
 const z = require('zod');
 
+/**
+ * Escrow map compatibility contract.
+ *
+ * `src/config/escrowMap.js` historically exported a plain object mapping
+ * escrow identifiers to their canonical on-chain addresses. Downstream
+ * callers rely on:
+ *   1. `getEscrowAddress(id)` returning a string for known ids and
+ *      `undefined` for unknown ids (never throwing).
+ *   2. `hasEscrow(id)` returning a boolean.
+ *   3. `listEscrowIds()` returning a stable, sorted array of ids.
+ *   4. The default export being the frozen raw map itself.
+ *
+ * These contracts are preserved across errors, empty data, and upgrades.
+ * @type {Readonly<Record<string, string>>}
+ */
+const ESCROW_MAP_CONTRACT_VERSION = 1;
+
 /** Express-compatible request size string. @type {z.ZodDefault<z.ZodString>} */
 const InvoiceFileMaxSizeSchema = z
   .string()
@@ -337,5 +354,9 @@ module.exports = {
   get,
   getValue,
   getInvoiceFileMaxSize,
-  getVerificationThresholds,
+  logRedactedSummary,
+  ConfigSchema,
+  InvoiceFileMaxSizeSchema,
+  ESCROW_MAP_CONTRACT_VERSION,
+  securityHeaders,
 };

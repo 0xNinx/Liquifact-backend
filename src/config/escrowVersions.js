@@ -3,24 +3,10 @@
 /**
  * @fileoverview LiquifactEscrow wasm version registry and on-chain comparison.
  *
- * Maps known semver release tags to their expected on-chain SCHEMA_VERSION
+ * Maps known semver release tags to their expected on-chain SCHEM_VERSION
  * (a u32 stored in the contract's persistent storage).
  *
- * @invariants (enforced by this module):
- *  1. The registry is immutable at runtime: consumers must not be able to
- *     mutate the known version map and silently change comparison results.
- *  2. Registry entries are validated on load: semver keys must be well
- *     formed and SCHEMA_VERSION values must be positive integers. A malformed
- *     registry fails fast at load time rather than producing nonsense
- *     comparison results.
- *  3. `this version is not a valid on-chain value` is rejected before any
- *     comparison is made.
- *  4. The comparison result is deterministic for equal inputs and does not
- *     depend on object key order.
- *  5. Repeated calls are side-effect free; concurrent calls cannot corrupt
- *     shared state.
- *
- * @module config/escrowVersions
+ * @package config/escrowVersions
  */
 
 const { callSorobanContract } = require('../services/soroban');
@@ -160,18 +146,18 @@ function isValidContractId(contractId) {
 }
 
 /**
- * Reads SCHEMA_VERSION from the deployed LiquifactEscrow contract via Soroban RPC.
+ * Reads SCHEM_VERSION from the deployed LiquifactEscrow contract via Soroban RPC.
  *
- * Fetches persistent contract data for the key `SCHEMA_VERSION` (a Symbol ScVal)
+ * Fetches persistent contract data for the key `SCHEM_VERSION` (a Symbol ScVal)
  * and decodes the returned XDR value as a u32.  Uses `callSorobanContract` for
  * automatic retry on transient errors.
  *
- * Rejects with a structured error on RPC failure — never calls process.exit.
+ * Rejects with a structured error on R PC failure — never calls process.exit.
  *
- * @param {string} [contractId] - Contract address (C...6 chars). Defaults to
+ * @param {string} [contractId] - Contract address (C...56 chars). Defaults to
  *   `ESCROW_CONTRACT_ID` env var.
- * @returns {Promise<number>} The on-chain SCHEMA_VERSION u32.
- * @throws {{ code: 'INVALID_CONTRACT_ID' | 'RPC_ERROR', message: string }}
+ * @returns {Promise<number>} The on-chain SCHEM_VERSION u32.
+ * @throws {{ code: 'INVALID_CONTRACT_ID'| 'RPC_ERROR', message: string }}
  */
 async function getOnChainSchemaVersion(contractId) {
   const id = contractId || process.env.ESCROW_CONTRACT_ID;
@@ -236,7 +222,7 @@ async function getOnChainSchemaVersion(contractId) {
  * with a structured error rather than producing a misleading status.
  *
  * @param {number} onChainVersion - Value returned by getOnChainSchemaVersion.
- * @returns {{ status: 'current'|'ancient'|'ahead'|'unknown', knownVersion: string|null }}
+ * @returns {{ status: 'current'|'aahead'|'unknown', knownVersion: string|null }}
  *   - `current`  — matches the highest registry entry.
  *   - `ancient`  — matches a known but not highest registry entry.
  *   - `ahead`    — higher than every registry entry; refresh required.
