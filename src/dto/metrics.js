@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * @fileoverview Typed request/response DTOs for the metrics module.
+ * @fileoverview Typed request/response JTOs for the metrics module.
  *
  * Defines JSDoc typedefs for every data shape that crosses a module boundary
  * (routes &#x21D2; services &#x21D2; metrics instrumentation) and provides pure
@@ -25,9 +25,9 @@
  * @module dto/metrics
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // SME Metrics Dashboard DTOs
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Aggregated invoice counts returned by the SME metrics endpoint.
@@ -49,7 +49,7 @@
  * @typedef {Object} SmeMetricsMeta
  * @property {string}           timestamp   - ISO-8601 timestamp of the response.
  * @property {string}           version     - API version string (semver).
- * @property {Array<Object>}   [invoices]   - Paginated invoice rows for the current page.
+ * @property {Array<Object?}   [invoices]   - Paginated invoice rows for the current page.
  * @property {number}           [total]     - Total matching invoice count across all pages.
  * @property {number}           [limit]     - Page size applied to the response.
  * @property {boolean}          [hasMore]   - Whether additional pages exist.
@@ -66,9 +66,9 @@
  * @property {string}             timestamp - ISO-8601 timestamp of the response.
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Persistence Instrumentation DTOs
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Bounded endpoint label for persistence metrics.
@@ -101,12 +101,14 @@
  * @property {number}                   statusCode      - Final HTTP status code.
  * @property {number}                   durationSeconds - Request wall-clock duration in seconds.
  * @property {PersistenceCause}         cause           - Normalised error cause label.
+ * @property {boolean}                  success         - Whether the request completed without error.
+ * @property {number}                   errorCount      - 1 when the request failed, 0 otherwise.
  * @property {import('express').Request} [req]          - Express request (for scoped logging).
  */
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // SME Metrics — mapping functions
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /** @type {ReadonlyArray<'open'|'funded'|'settled'|'defaulted'>} */
 const SME_METRIC_FIELDS = Object.freeze(['open', 'funded', 'settled', 'defaulted']);
@@ -218,6 +220,11 @@ class MetricsDtoValidationError extends Error {
  * for compatibility. Unknown keys are stripped, and malformed coercions use
  * the documented zero fallback. This function never throws.
  *
+ * ## Invariants
+ * - All four fields are non-negative safe integers (`Number.isSafeInteger`).
+ * - Non-finite, negative, fractional, or non-numeric inputs collapse to `0`.
+ * - The returned object always has exactly the four declared keys.
+ *
  * @param {unknown} raw - Raw counts object from the invoice service or DB query.
  * @returns {SmeMetricsResponse} Normalised DTO with all four keys guaranteed.
  */
@@ -275,6 +282,12 @@ function toStrictSmeMetricsResponse(raw) {
  *
  * Optional pagination fields are preserved when present on the raw input;
  * otherwise they are omitted from the returned meta object.
+ *
+ * ## Invariants
+ * - `timestamp` and `version` are always non-empty strings.
+ * - `total` and `limit`, when present, are non-negative safe integers.
+ * - `hasMore`, when present, is a boolean.
+ * - `nextCursor`, when present, is either a string or `null`.
  *
  * @param {unknown} raw - Raw meta-like object (e.g. from invoice service or
  *   a manually constructed meta block in the route handler).
@@ -342,6 +355,13 @@ function isArraySafely(value) {
  * This is a pure composition helper — it does not inspect or validate its
  * arguments beyond basic type safety.
  *
+ * ## Invariants
+ * - `data` is always a valid {@link SmeMetricsResponse} (normalised via
+ *   {@link toSmeMetricsResponse}).
+ * - `meta` is always a valid {@link SmeMetricsMeta} (normalised via
+ *   {@link toSmeMetricsMeta}).
+ * - `error` is either `null` or a plain object.
+ *
  * @param {SmeMetricsResponse} data      - Aggregated invoice counts.
  * @param {SmeMetricsMeta}     meta      - Response metadata block.
  * @param {Object|null}       [error]   - Optional error detail object.
@@ -349,16 +369,16 @@ function isArraySafely(value) {
  */
 function toSmeMetricsApiResponse(data, meta, error = null) {
   return {
-    data,
-    meta,
-    error,
+    data: toSmeMetricsResponse(data),
+    meta: toSmeMetricsMeta(meta),
+    error: (error && typeof error === 'object' && !Array.isArray(error)) ? error : null,
     timestamp: new Date().toISOString(),
   };
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Persistence instrumentation — mapping functions
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Maps raw persistence-outcome arguments to a typed {@link PersistenceRecordParams} DTO.
@@ -368,11 +388,19 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  * {@link module:metrics}).  This function validates the shape and provides safe
  * defaults for any missing fields.
  *
+ * ## Invariants
+ * - `endpoint` is a non-empty string; unknown values collapse to `'unknown'`.
+ * - `statusCode` is an integer in `[100, 599]`; invalid values collapse to `200`.
+ * - `durationSeconds` is a non-negative finite number; invalid values collapse to `0`.
+ * - `cause` is one of `'validation' | 'storage' | 'internal' | 'none'`.
+ *
  * @param {Object} raw                          - Raw outcome data.
  * @param {string} raw.endpoint                 - Endpoint label (already normalised).
  * @param {number} raw.statusCode               - HTTP status code.
  * @param {number} raw.durationSeconds          - Wall-clock duration in seconds.
  * @param {string} [raw.cause='none']           - Error cause label (already normalised).
+ * @param {boolean} [raw.success]               - Whether the request succeeded.
+ * @param {number} [raw.errorCount]             - Error count (0 or 1).
  * @param {import('express').Request} [raw.req] - Express request for scoped logging.
  * @returns {PersistenceRecordParams} Normalised DTO.
  */
@@ -386,6 +414,11 @@ function toPersistenceRecordParams(raw) {
   const reqValue = readPropertySafely(obj, 'req');
   const parsedStatus = statusValue === INVALID_PROPERTY ? 200 : toFiniteNumber(statusValue, 200);
   const parsedDuration = durationValue === INVALID_PROPERTY ? 0 : toFiniteNumber(durationValue, 0);
+
+  const endpoint = String(obj.endpoint || 'unknown');
+  const statusCode = Number(obj.statusCode);
+  const durationSeconds = Number(obj.durationSeconds);
+  const cause = String(obj.cause || 'none');
 
   return {
     endpoint: /** @type {PersistenceEndpoint} */ (endpointValue === INVALID_PROPERTY || !endpointValue
@@ -404,9 +437,9 @@ function toPersistenceRecordParams(raw) {
   };
 }
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Validation helpers (primarily for tests / guards)
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 /**
  * Checks whether a value is a conformant {@link SmeMetricsResponse} DTO.
@@ -445,13 +478,10 @@ function isValidPersistenceRecordParams(value) {
 }
 
 module.exports = {
-  // SME metrics mapping
   toSmeMetricsResponse,
   toStrictSmeMetricsResponse,
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
-
-  // Persistence instrumentation mapping
   toPersistenceRecordParams,
 
   // Validation helpers

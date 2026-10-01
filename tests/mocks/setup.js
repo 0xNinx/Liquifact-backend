@@ -10,6 +10,13 @@ jest.mock('../../src/metrics', () => {
     footprintCacheMissesTotal: makeCounter(),
     footprintCacheEvictionsTotal: makeCounter(),
 
+    // CORS origin-cache metrics — required by src/config/corsCache.js which
+    // is loaded transitively whenever src/config/cors.js is imported.
+    corsCacheHitsTotal: makeCounter(),
+    corsCacheMissesTotal: makeCounter(),
+    corsCacheEvictionsTotal: makeCounter(),
+    corsCacheInvalidationsTotal: makeCounter(),
+
     // KYC webhook metrics — needed so route handlers can call
     // normalizeKycWebhookStatusClass / normalizeKycWebhookCause
     // in their res.on('finish') callbacks without crashing.
@@ -213,6 +220,52 @@ jest.mock('../../src/db/knex', () => {
   m.fn = { now: jest.fn(() => new Date().toISOString()) };
   m.migrate = { latest: jest.fn().mockResolvedValue([0, []]) };
   m.destroy = jest.fn().mockResolvedValue(undefined);
+
+  // -------------------------------------------------------------------------
+  // Idempotent teardown helpers — mirrors the real src/db/knex.js API added
+  // in issue #1330. destroyOnce() coalesces concurrent destroy calls onto a
+  // single Promise so tests can assert teardown happens exactly once.
+  // -------------------------------------------------------------------------
+  let _destroyOnceCalled = 0;
+  let _destroyOncePromise = null;
+
+  m.destroyOnce = jest.fn(() => {
+    if (_destroyOncePromise !== null) { return _destroyOncePromise; }
+    _destroyOnceCalled += 1;
+    _destroyOncePromise = m.destroy();
+    return _destroyOncePromise;
+  });
+
+  // Health-check snapshot — returns healthy by default.
+  m.getHealthInfo = jest.fn(async () => ({
+    status: 'healthy',
+    latencyMs: 1,
+    lastHealthyAt: new Date().toISOString(),
+    error: null,
+  }));
+
+  // Test-only helpers for introspection and state reset.
+  m._getDestroyCallCount = () => _destroyOnceCalled;
+  m._isDestroyed = () => _destroyOnceCalled > 0;
+  m._setHealthResponse = (response) => {
+    const defaults = { status: 'healthy', latencyMs: 1, lastHealthyAt: new Date().toISOString(), error: null };
+    m.getHealthInfo.mockImplementationOnce(async () => ({ ...defaults, ...response }));
+  };
+  m._reset = () => {
+    _destroyOnceCalled = 0;
+    _destroyOncePromise = null;
+    m.destroy.mockReset();
+    m.destroy.mockResolvedValue(undefined);
+    m.destroyOnce.mockReset();
+    m.destroyOnce.mockImplementation(() => {
+      if (_destroyOncePromise !== null) { return _destroyOncePromise; }
+      _destroyOnceCalled += 1;
+      _destroyOncePromise = m.destroy();
+      return _destroyOncePromise;
+    });
+    m.getHealthInfo.mockReset();
+    m.getHealthInfo.mockResolvedValue({ status: 'healthy', latencyMs: 1, lastHealthyAt: new Date().toISOString(), error: null });
+  };
   m.then = jest.fn((onFulfilled) => {
     if (m._resolveValue) {
       const rv = m._resolveValue;
