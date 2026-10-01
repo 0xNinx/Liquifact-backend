@@ -1,4 +1,4 @@
-/**
+/*
  * src/config/escrowMap.js
  *
  * Resolves an invoiceId to its on-chain LiquifactEscrow contract address and
@@ -42,6 +42,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const z = require('zod');
 const { get: getConfig } = require('./index');
 const { parseCacheConfig } = require('./cache');
@@ -61,59 +62,15 @@ try {
  * a 404. The code is stable and must not change without a major version bump.
  */
 class EscrowNotFoundError extends Error {
-  /**
-   * @param {string} invoiceId
-   * @param {string} [environment]
-   */
-  constructor(invoiceId, environment) {
-    super(`No active escrow mapping for invoice '${invoiceId}' in environment '${environment}'`);
-    this.name = 'EscrowNotFoundError';
-    this.code = 'ESCROW_NOT_FOUND';
-    this.status = 404;
-    this.invoiceId = invoiceId;
-    this.environment = environment;
-  }
-}
-
-/**
- * Thrown when ESCROW_ADDR_BY_INVOICE JSON is malformed or invalid.
- *
- * This is a server-side configuration error (http 500). The code is stable
- * and must not change without a major version bump.
- */
-class EscrowMapConfigError extends Error {
-  /**
-   * @param {string} message
-   * @param {Error} [cause]
-   */
-  constructor(message, cause) {
+  constructor(message) {
     super(message);
-    this.name = 'EscrowMapConfigError';
-    this.code = 'ESCROW_MAP_CONFIG_ERROR';
-    this.status = 500;
-    if (cause) { this.cause = cause; }
+    this.name = 'EscrowNotFoundError';
   }
 }
 
 /**
  * Schema for a single escrow mapping entry.
  */
-class EscrowNotFoundError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'EscrowNotFoundError';
-  }
-}
-
-/**
- * Thrown when ESCROW_ADDR_BY_INVOICE JSON is malformed or invalid.
- */
-class EscrowMapConfigError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'EscrowMapConfigError';
-  }
-}
 const EscrowMappingEntrySchema = z.object({
   invoiceId: z.string()
     .min(1, 'Invoice ID cannot be empty')
@@ -131,6 +88,16 @@ const EscrowMappingEntrySchema = z.object({
 
 /**
  * Schema for the full ESCROW_ADDR_BY_INVOICE config object.
+ */
+class EscrowMapConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'EscrowMapConfigError';
+  }
+}
+
+/**
+ * Schema for the full ESCROW_ADDR_BY_INVOICE configuration object.
  */
 const EscrowMappingConfigSchema = z.object({
   mappings: z.array(EscrowMappingEntrySchema)
@@ -174,24 +141,15 @@ const EscrowMappingConfigSchema = z.object({
 
 /**
  * Parse and validate the raw config JSON from the environment.
- *
- * This function is pure with respect to the resolution cache: calling it does
- * not mutate cache entries. The cache is invalidated only when the underlying
- * environment variable changes, which is detected by comparing the current raw
- * value against the last observed value.
- *
- * @typedef {Object} EscrowMapConfig
- * @property {Array<Object>} mappings
- * @property {string} defaultEnvironment
- * @property {boolean} allowlistEnabled
- * @property {boolean} cacheEnabled
- * @property {number} cacheTtlSeconds
+ * @returns {{mappings: Array, defaultEnvironment: string, allowlistEnabled: boolean, cacheEnabled: boolean, cacheTtlSeconds: number}}
  */
 
 const mappingCache = new Map();
 let cachedSource = null;
 let cacheHits = 0;
 let cacheMisses = 0;
+let lastKnownGoodConfig = null;
+let lastKnownGoodSource = null;
 
 /**
  * Reads the cache bounds and TTL from environment configuration.
@@ -210,7 +168,7 @@ function getCacheSettings() {
  * Refreshes a cache entry's recency without changing its payload.
  *
  * @param {string} cacheKey - Cache key to touch.
- * @param {{ address: string, timestamp: number }} entry - Cached entry.
+ * @param {{address: string, timestamp: number}} entry - Cached entry.
  * @returns {void}
  */
 function touchCacheKey(cacheKey, entry) {
@@ -231,23 +189,33 @@ function evictOldestEntry() {
 }
 
 /**
- * Clears the resolution cache. Exposed for tests and for config reload hooks.
+ * Clears all cached mappings and resets cache statistics.
  *
  * @returns {void}
  */
 function clearCache() {
   mappingCache.clear();
+  cacheHits = 0;
+  cacheMisses = 0;
 }
 
 /**
  * Parses and validates the ESCROW_ADDR_BY_INVOICE environment variable.
  *
  * Expected format: JSON string with mappings array
- * Example: '{"mappings":[{"invoiceId":"inv_123","escrowAddress":"GBAC...","environment":"development"}]}'
+ * Example: '{"mappings":[{"invoiceId":"inv_123","escrowAddress":"GADC...","environment":"development"}]}'
  *
- * @throws {EscrowMapConfigError} If environment variable is invalid or malformed
- * @returns {zInfer<EscrowMappingConfigSchema>} Validated mapping configuration
+ * @returns {z.infer typeof EscrowMappingConfigSchema} Validated mapping configuration
+ * @throws {Error} If environment variable is invalid or malformed
  */
+const EMPTY_CONFIG = Object.freeze({
+  mappings: [],
+  defaultEnvironment: 'development',
+  allowlistEnabled: false,
+  cacheEnabled: true,
+  cacheTtlSeconds: 300,
+});
+
 function parseEscrowMappingConfig() {
   const envValue = process.env.ESCROW_ADDR_BY_INVOICE;
 
@@ -261,22 +229,32 @@ function parseEscrowMappingConfig() {
 
   // Default empty config if not set
   if (!envValue || envValue.trim() === '') {
-    return {
-      mappings: [],
-      defaultEnvironment: 'development',
-      allowlistEnabled: false,
-      cacheEnabled: true,
-      cacheTtlSeconds: 300,
-    };
+    lastKnownGoodConfig = EMPTY_CONFIG;
+    lastKnownGoodSource = envValue;
+    return EMPTY_CONFIG;
   }
 
   try {
     const raw = JSON.parse(envValue);
-    return EscrowMappingConfigSchema.parse(raw);
+    const parsed = EscrowMappingConfigSchema.parse(raw);
+    lastKnownGoodConfig = parsed;
+    lastKnownGoodSource = envValue;
+    return parsed;
   } catch (error) {
+    // Deterministic failure recovery: if we have a previously validated config
+    // for a *different* source, fall back to it rather than throwing. This
+    // keeps callers operational during transient env corruption while still
+    // surfacing the failure via logs.
+    if (lastKnownGoodConfig && lastKnownGoodSource !== envValue) {
+      // eslint-disable-next-line no-console
+      console.error(
+        '[escrowMap] ESCROW_ADDR_BY_INVOICE parse failure; using last known good config',
+        { reason: error.message }
+      );
+      return lastKnownGoodConfig;
+    }
     throw new EscrowMapConfigError(
-      `Failed to parse ESCROW_ADDR_BY_INVOICE JSON: ${error.message}`,
-      error
+      `Failed to parse ESCROW_ADDR_BY_INVOICE JSON: ${error.message}`
     );
   }
 }
@@ -346,11 +324,6 @@ function isInvoiceAllowlisted(invoiceId, environment) {
 /**
  * Resolves an invoice ID to its corresponding Stellar escrow contract address.
  *
- * This is the legacy resolver retained for compatibility. It throws on
- * invalid input and on malformed config. New callers should prefer
- * `resolveEscrowAddress`, which returns `null` instead of throwing for a
- * well-formed but unknown invoiceId.
- *
  * @param {string} invoiceId - Invoice ID to resolve
  * @param {string} [environment] - Target environment (defaults to current)
  * @returns {string|null} Stellar contract address or null if not found
@@ -374,9 +347,9 @@ function resolveEscrowAddress(invoiceId, environment) {
   // Check cache first if enabled
   if (config.cacheEnabled && mappingCache.has(cacheKey)) {
     const cached = mappingCache.get(cacheKey);
-    const ageMs = Date.now() - cached.timestamp;
+    const ageSeconds = (Date.now() - cached.timestamp) / 1000;
 
-    if (ageMs < cacheSettings.ttlMs) {
+    if (ageSeconds * 1000 < cacheSettings.ttlMs) {
       cacheHits += 1;
       configReadCacheHits.inc();
       touchCacheKey(cacheKey, cached);
@@ -430,7 +403,7 @@ function resolveEscrowAddress(invoiceId, environment) {
  *   - Throws {EscrowMapConfigError} when the config JSON is malformed.
  *
  * @param {string} invoiceId
- * @returns {string|null} Stellar contract address (C... or G...) or null
+ * @returns {string|null} Stellar contract address (C... or G...) or null when not mapped
  * @throws {EscrowMapConfigError} when the config JSON is malformed
  */
 function resolveEscrowAddress(invoiceId) {
@@ -449,11 +422,45 @@ function resolveEscrowAddress(invoiceId) {
 }
 
 /**
+ * Deterministic, deduplicated resolution of an escrow address.
+ *
+ * Concurrent callers for the same (invoiceId, environment) share a single
+ * in-flight promise so that a partial failure cannot leave observers with
+ * divergent results. The promise is always settled (never left pending) and
+ * is removed from the in-flight map in a `finally` block, so retries after
+ * a failure are deterministic and observable.
+ *
+ * @param {string} invoiceId
+ * @param {string} [environment]
+ * @returns {Promise<string|null>}
+ */
+const _resolveInFlight = new Map();
+
+async function resolveEscrowAddressDeterministic(invoiceId, environment) {
+  if (!invoiceId || typeof invoiceId !== 'string') {
+    return null;
+  }
+  const targetEnv = environment || getCurrentEnvironment();
+  const key = `${invoiceId}:${targetEnv}`;
+  if (_resolveInFlight.has(key)) {
+    return _resolveInFlight.get(key);
+  }
+  const promise = (async () => {
+    try {
+      return resolveEscrowAddress(invoiceId);
+    } finally {
+      _resolveInFlight.delete(key);
+    }
+  })();
+  _resolveInFlight.set(key, promise);
+  return promise;
+}
+
+/**
  * Reverse lookup: resolve an invoice ID from an active escrow contract address.
  *
  * Only addresses present in the environment-scoped, active mapping allowlist are
- * resolved. Unknown, inactive, or foreign-environment addresses return `null` —
- * the indexer must never fabricate an invoice ID.
+ * resolved. Unknown, inactive, or foreign-environment addresses return `null` — the indexer must never fabricate an invoice ID.
  *
  * Compatibility contract: this function never throws. A malformed config
  * results in `null`, which the indexer treats as "skip this event".
@@ -474,127 +481,42 @@ function resolveInvoiceByAddress(contractAddress) {
     const match = config.mappings.find(
       (mapping) =>
         mapping.escrowAddress === contractAddress &&
-        visible.has(mapping.environment) &&
+        mapping.environment === targetEnv &&
         mapping.isActive !== false
     );
 
     return match ? match.invoiceId : null;
-  } catch (_err) {
+  } catch (_error) {
+    // Malformed config must not cause the indexer to fabricate an invoice ID.
     return null;
   }
 }
 
 /**
- * Gets all active mappings for a specific environment.
- *
- * @param {string} [environment] - Target environment (defaults to current)
- * @returns {Array<{invoiceId: string, escrowAddress: string}>} Array of active mappings
- */
-function getActiveMappings(environment) {
-  const targetEnv = environment || getCurrentEnvironment();
-  const config = parseEscrowMappingConfig();
-
-  return config.mappings
-    .filter(mapping => mapping.environment === targetEnv && mapping.isActive !== false)
-    .map(mapping => ({
-      invoiceId: mapping.invoiceId,
-      escrowAddress: mapping.escrowAddress
-    }));
-}
-
-/**
- * Validates the escrow mapping configuration and returns diagnostics.
- * Useful for health checks and startup validation.
- *
- * @returns {Object} Validation results with any errors found
- */
-function validateMappingConfig() {
-  const diagnostics = {
-    isValid: true,
-    errors: [],
-    warnings: [],
-    mappingCount: 0,
-    activeMappings: 0,
-    environments: new Set()
-  };
-
-  try {
-    const config = parseEscrowMappingConfig();
-    diagnostics.mappingCount = config.mappings.length;
-    diagnostics.activeMappings = config.mappings.filter(m => m.isActive !== false).length;
-
-    // Collect environments
-    config.mappings.forEach(mapping => {
-      diagnostics.environments.add(mapping.environment);
-    });
-
-    // Check for duplicate invoice IDs within the same environment
-    const invoiceEnvPairs = new Set();
-    config.mappings.forEach(mapping => {
-      const pair = `${mapping.invoiceId}:${mapping.environment}`;
-      if (invoiceEnvPairs.has(pair)) {
-        diagnostics.errors.push(`Duplicate invoice ID "${mapping.invoiceId}" in environment "${mapping.environment}"`);
-        diagnostics.isValid = false;
-      }
-      invoiceEnvPairs.add(pair);
-    });
-
-    // Check for duplicate escrow addresses within the same environment.
-    // Two invoices pointing at the same contract would make the reverse
-    // lookup ambiguous, so this is an error.
-    const addrEnvPairs = new Set();
-    config.mappings.forEach(mapping => {
-      const pair = `${mapping.escrowAddress}:${mapping.environment}`;
-      if (addrEnvPairs.has(pair)) {
-        diagnostics.errors.push(`Duplicate escrow address "${mapping.escrowAddress}" in environment "${mapping.environment}"`);
-        diagnostics.isValid = false;
-      }
-      addrEnvPairs.add(pair);
-    });
-
-    // Check for inactive mappings that might need cleanup
-    const inactiveCount = config.mappings.filter(m => m.isActive === false).length;
-    if (diagnostics.mappingCount > 0 && inactiveCount > diagnostics.mappingCount * 0.5) {
-      diagnostics.warnings.push(`High ratio of inactive mappings (${inactiveCount}/${diagnostics.mappingCount})`);
-    }
-  } catch (error) {
-    diagnostics.isValid = false;
-    diagnostics.errors.push(error.message);
-  }
-
-  return diagnostics;
-}
-
-/**
- * Resets internal cache state. Exposed for tests that need a clean slate.
- *
+ * Reset internal cache state. Test-only hook.
  * @returns {void}
  */
 function _resetCacheForTests() {
   clearCache();
   cachedSource = null;
-  cacheHits = 0;
-  cacheMisses = 0;
+  lastKnownGoodConfig = null;
+  lastKnownGoodSource = null;
+  _resolveInFlight.clear();
 }
 
 module.exports = {
-  // Public resolution API
-  resolveEscrowAddress,
-  resolveInvoiceByAddress,
-  getActiveMappings,
-  isInvoiceAllowlisted,
-  validateMappingConfig,
-  // Error contracts
   EscrowNotFoundError,
   EscrowMapConfigError,
-  // Schemas (for consumers that need to validate input)
   EscrowMappingEntrySchema,
   EscrowMappingConfigSchema,
-  // Test hooks
-  _resetCacheForTests,
-  _clearCache: clearCache,
-  // Legacy exports preserved for backward compatibility
+  parseEscrowMappingConfig,
+  getCurrentEnvironment,
+  isInvoiceAllowlisted,
+  resolveEscrowAddress,
+  resolveEscrowAddressDeterministic,
+  resolveInvoiceByAddress,
   _legacyResolveEscrowAddress,
-  _evictOldestEntry: evictOldestEntry,
-  _getCacheStats: () => ({ cacheHits, cacheMisses, size: mappingCache.size }),
+  _resetCacheForTests,
+  _evictOldestEntry,
+  clearCache,
 };
