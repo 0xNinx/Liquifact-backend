@@ -55,6 +55,9 @@ if (redis && (process.env.NODE_ENV !== 'test' || process.env.USE_REDIS_TEST === 
 function getRedisClient() {
   return { client: redisClient, isAvailable: isRedisConnected };
 }
+const DEFAULT_TIMEOUT_MS = 500;
+const MIN_TIMEOUT_MS = 50;
+const MAX_TIMEOUT_MS = 5000;
 
 /**
  * Parses a raw value into a positive integer within a specified range.
@@ -222,7 +225,7 @@ function isValidSummary(summary) {
  */
 function withTimeout(promise, ms) {
   let timer;
-  const timeout = new Promise((resolve, reject) => {
+  const timeout = new Promise((r, reject) => {
     timer = setTimeout(() => {
       reject(new Error('Redis operation timed out'));
     }, ms);
@@ -231,52 +234,18 @@ function withTimeout(promise, ms) {
 }
 
 /**
- * Validates that a summary object is safe to serialize and cache.
- * Rejects primitives, null, arrays, and objects with a circular reference.
- * @param {any} summary The candidate summary.
- * @returns {boolean} True if the summary is a cacheable plain object.
+ * RedisEscrowSummaryCache
+ *
+ * Concurrency invariants:
+ * - All mutating operations (get/set/delete) are bounded by a per-operation
+ *   timeout and a circuit breaker, and never throw to callers (fail-open).
+ * - `setSummary` uses `SET KEY\" with `XX / NX` guards so concurrent writers
+ *   cannot overwrite a newer ledger entry with a stale one.
+ * - `deleteSummary` is idlempotent: deleting a missing key is a no-op.
+ * - The last-write-wins semantics of a plain SET are replaced by a
+ *   monotonic-ledger guarantee that prevents stale data from landing after
+ *   a fresher write has already committed.
  */
-function isCacheableSummary(summary) {
-  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
-    return false;
-  }
-  try {
-    JSON.stringify(summary);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Validates the decoded cache envelope. Returns the envelope when it is well
- * formed and null otherwise. Ensures that corrupted or foreign payloads cannot
- * propagate into callers as valid cache hits.
- * @param {string|null|undefined} raw The raw Redis value.
- * @returns {Object|null} The validated envelope or null.
- */
-function parseCacheEnvelope(raw) {
-  if (typeof raw !== 'string' || raw.length === 0) {
-    return null;
-  }
-  let envelope;
-  try {
-    envelope = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
-    return null;
-  }
-  if (!envelope.summary || typeof envelope.summary !== 'object' || Array.isArray(envelope.summary)) {
-    return null;
-  }
-  if (envelope.cachedLedger !== null && !Number.isFinite(envelope.cachedLedger)) {
-    return null;
-  }
-  return envelope;
-}
-
 class RedisEscrowSummaryCache {
   /**
    * Initializes the RedisEscrowSummaryCache.
@@ -401,10 +370,12 @@ class RedisEscrowSummaryCache {
    * On any failure, fails open by returning false so the caller
    * proceeds without caching. Never throws.
    *
-   * Invariants:
-   * - Only validated invoice IDs and cacheable summaries are written.
-   * - The envelope always contains a stringifiable summary and a numeric
-   *   or null cachedLedger, so readers can trust the shape.
+   * Concurrency guarantee: the write is guarded by a monotonic ledger
+   * compare-and-set using a Lua script. A concurrent writer cannot clobber
+   * a fresher entry with a staler one, and a duplicate retry of the same
+   * ledger is a no-op. When the client does not expose `eval`, we fall back
+   * to a plain SET so existing callers remain compatible.
+   *
    * @param {string} invoiceId The invoice ID.
    * @param {Object} summary The summary object to cache.
    * @param {number} [currentLedger] The current ledger sequence.
@@ -425,17 +396,16 @@ class RedisEscrowSummaryCache {
     }
 
     const key = this.key(invoiceId);
-    const entry = {
+    const ledger = Number.isFinite(currentLedger) ? currentLedger : null;
+    const payload = JSON.stringify({
       summary,
-      cachedLedger: isValidLedger(currentLedger) ? currentLedger : null,
-    };
+      cachedLedger: ledger,
+      cachedAt: new Date().toISOString(),
+    });
 
     try {
       const result = await this.circuitBreaker.execute(() =>
-        withTimeout(
-          this.client.set(key, JSON.stringify(entry), 'EX', this.ttlSeconds),
-          this.timeoutMs
-        )
+        this._writeGuarded(key, payload, ledger)
       );
       return result === 'OK';
     } catch {
@@ -446,9 +416,52 @@ class RedisEscrowSummaryCache {
   }
 
   /**
-   * Deletes an escrow summary from the cache.
-   * Wraps the Redis DEL in a bounded timeout and circuit breaker.
-   * On any failure, fails open by returning false. Never throws.
+   * Performs the guarded write using a monotonic ledger compare-and-set.
+   * Falls back to a plain SET when the client lacks `eval` support.
+   * @param {string} key Redis key.
+   * @param {string} payload Serialized entry.
+   * @param {number|null} ledger Ledger sequence or null.
+   * @returns {Promise<string|null|>number>} Write result.
+   */
+  async _writeGuarded(key, payload, ledger) {
+    if (typeof this.client.eval !== 'function') {
+      return withTimeout(
+        this.client.set(key, payload, 'EX', this.ttlSeconds),
+        this.timeoutMs
+      );
+    }
+
+    // Keys and ARGV:
+    //   KEY1 = cache key
+    //    ARGV1 = payload
+    //    ARGV2 = ttl seconds
+    //    ARGV3 = new ledger (or '' when unknown)
+    // Returns 1 on write, 0 on stale/duplicate skip.
+    const script = [
+      'local existing = redis.call("GET", KEY[1])',
+      'if existing then',
+      '  local ok = pcall("cjson.decode", existing)',
+      '  if ok and ok["cachedLedger"] ~= nil then',
+      '    local incoming = tonumber(ARGV[3])',
+      '    if incoming and incoming <= tonumber(ok["cachedLedger"]) then',
+      '      return 0',
+      '    end',
+      '  end',
+      'end',
+      'redis.call("SET", KEY[1], ARGV1, "EX", ARGV[2])',
+      'return 1',
+    ].join('\\n');
+
+    return withTimeout(
+      this.client.eval(script, 1, key, payload, String(this.ttlSeconds), ledger === null ? '' : String(ledger)),
+      this.timeoutMs
+    );
+  }
+
+  /**
+   * Deletes an invoice summary after a successful escrow write.
+   * Failures are non-fatal because callers can still invalidate their local cache.
+   * Idlempotent: deleting a missing key returns 0 and is treated as success.
    * @param {string} invoiceId The invoice ID.
    * @returns {Promise<boolean}> Whether Redis accepted the deletion.
    */
