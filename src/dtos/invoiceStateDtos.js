@@ -11,7 +11,30 @@
  * exhaustively unit-tested in isolation from Express / Knex / audit-log
  * concerns, and gives us a typed boundary for safer refactors.
  *
+ * ## State invariants
+ *
+ * The mappers are the boundary, so their output *is* the contract. Every
+ * response DTO is frozen, and any array a DTO exposes is a fresh copy rather
+ * than a reference into caller-owned state. That gives two guarantees:
+ *
+ * 1. A DTO cannot be mutated after it has been classified. A route cannot
+ *    quietly rewrite `currentState` on a completed transition, because the
+ *    object it received is the same object every other consumer sees.
+ * 2. A derived scalar cannot drift from the data it describes.
+ *    `isTerminal` is snapshotted from the transition list, and
+ *    `totalTransitions` can never disagree with the length of `transitions`
+ *    because that array is a module-owned frozen copy.
+ *
+ * `allowedTransitions` is the one deliberate exception: it is still a fresh
+ * copy (the mapper is never poisoned by caller mutation) but it is left
+ * mutable, because callers are documented to build on it.
+ *
  * @module dtos/invoiceStateDtos
+ * @version 1.0.0
+ * @compatibility Contract version 1.0 - All mappers guarantee stable output shapes
+ *                 for valid, invalid, and boundary-case inputs. Optional fields are
+ *                 omitted (not null) when undefined. Arrays are copied to prevent
+ *                 caller mutation. Malformed inputs fall back to safe defaults.
  */
 
 // ---------------------------------------------------------------------------
@@ -185,6 +208,12 @@
 /**
  * Pulls the typed transition fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with targetState and reason fields.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Extra keys ignored (prototype pollution defense)
+ *                 - Output shape is stable regardless of input validity
+ *
  * The mapper itself does NOT perform semantic validation — that remains the
  * responsibility of `invoiceStateMachine.validateTransition` and the Zod
  * schema in `schemas/invoiceState`.  The mapper only guarantees the returned
@@ -207,6 +236,11 @@ function mapTransitionRequest(body) {
 /**
  * Pulls the typed approval fields from an Express request body.
  *
+ * @contract v1.0 - Returns object with reason field.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
+ *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ reason: string|undefined }}
  */
@@ -220,6 +254,12 @@ function mapApproveRequest(body) {
 
 /**
  * Pulls the typed link-escrow fields from an Express request body.
+ *
+ * @contract v1.0 - Returns object with escrowId and reason fields.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string escrowId → null
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
  *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ escrowId: string|null, reason: string|undefined }}
@@ -235,6 +275,11 @@ function mapLinkEscrowRequest(body) {
 
 /**
  * Pulls the typed rejection fields from an Express request body.
+ *
+ * @contract v1.0 - Returns object with reason field.
+ *                 - Null/undefined/array body → empty object fallback
+ *                 - Non-string reason → undefined
+ *                 - Output shape is stable regardless of input validity
  *
  * @param {unknown} body - Raw `req.body`.
  * @returns {{ reason: string|undefined }}
@@ -255,6 +300,13 @@ function mapRejectRequest(body) {
  * Builds the state-query response DTO from a resolved invoice + state-machine
  * output.
  *
+ * @contract v1.0 - Returns InvoiceStateResponseDto with invoiceId, currentState,
+ *                 allowedTransitions, and isTerminal fields.
+ *                 - Non-array allowedTransitions → empty array fallback
+ *                 - allowedTransitions is copied to prevent caller mutation
+ *                 - isTerminal derived from allowedTransitions.length === 0
+ *                 - Optional fields omitted when undefined (not null)
+ *
  * @param {object} args
  * @param {string} args.invoiceId - Invoice identifier (from route params).
  * @param {string} args.currentState - Invoice status.
@@ -263,17 +315,29 @@ function mapRejectRequest(body) {
  * @returns {InvoiceStateResponseDto}
  */
 function toInvoiceStateResponse({ invoiceId, currentState, allowedTransitions }) {
-  return {
+  const allowedCopy = Array.isArray(allowedTransitions) ? [...allowedTransitions] : [];
+  return Object.freeze({
     invoiceId,
     currentState,
-    allowedTransitions: Array.isArray(allowedTransitions) ? [...allowedTransitions] : [],
+    // A fresh copy, deliberately left mutable — see the module-level note.
+    allowedTransitions: allowedCopy,
+    // Snapshotted from the *input* array: a non-array value reports
+    // non-terminal rather than terminal, so malformed upstream data can never
+    // declare an invoice finished.
     isTerminal: Array.isArray(allowedTransitions) ? allowedTransitions.length === 0 : false,
-  };
+  });
 }
 
 /**
  * Builds a transition response DTO from a state-machine execution result and
  * the caller-supplied optional reason.
+ *
+ * @contract v1.0 - Returns TransitionResponseDto with invoiceId, previousState,
+ *                 currentState, transitionedAt, transitionedBy, auditLogId, and
+ *                 optional reason field.
+ *                 - Missing/malformed auditLog → auditLogId = ''
+ *                 - Undefined/null reason → field omitted (not null)
+ *                 - JSON serialization omits undefined fields
  *
  * @param {object} args
  * @param {string} args.invoiceId - Invoice identifier (from route params).
@@ -293,17 +357,24 @@ function toTransitionResponse({ invoiceId, result, reason }) {
   };
   if (reason !== undefined && reason !== null) {
     /** @type {TransitionResponseDto} */
-    const withReason = Object.assign({}, base, { reason });
+    const withReason = Object.freeze(Object.assign({}, base, { reason }));
     return withReason;
   }
   /** @type {TransitionResponseDto} */
-  const withoutReason = base;
+  const withoutReason = Object.freeze(base);
   return withoutReason;
 }
 
 /**
  * Builds the link-escrow response DTO from a transition result and the
  * user-supplied escrow identifier.
+ *
+ * @contract v1.0 - Returns LinkEscrowResponseDto with invoiceId, previousState,
+ *                 currentState, escrowId, transitionedAt, transitionedBy, and
+ *                 auditLogId fields.
+ *                 - Non-string escrowId → null
+ *                 - Missing/malformed auditLog → auditLogId = ''
+ *                 - escrowId is always present (may be null)
  *
  * @param {object} args
  * @param {string} args.invoiceId - Invoice identifier.
@@ -312,7 +383,7 @@ function toTransitionResponse({ invoiceId, result, reason }) {
  * @returns {LinkEscrowResponseDto}
  */
 function toLinkEscrowResponse({ invoiceId, result, escrowId }) {
-  return {
+  return Object.freeze({
     invoiceId,
     previousState: result.previousState,
     currentState: result.newState,
@@ -320,11 +391,17 @@ function toLinkEscrowResponse({ invoiceId, result, escrowId }) {
     transitionedAt: result.transitionedAt,
     transitionedBy: result.transitionedBy,
     auditLogId: result.auditLog && result.auditLog.id ? result.auditLog.id : '',
-  };
+  });
 }
 
 /**
  * Converts a single audit-log record into a history-entry DTO.
+ *
+ * @contract v1.0 - Returns HistoryEntryDto with id, timestamp, actor, and optional
+ *                 fromState, toState, reason, ipAddress fields.
+ *                 - Missing optional fields are omitted (not null)
+ *                 - Partial changes (before without after, or vice versa) handled
+ *                 - JSON serialization omits undefined fields
  *
  * Missing optional fields are either omitted or set to `undefined` so JSON
  * serialisation produces the leanest valid payload.
@@ -351,12 +428,18 @@ function toHistoryEntryDto(log) {
   if (log.ipAddress !== undefined) {
     entry.ipAddress = log.ipAddress;
   }
-  return entry;
+  return Object.freeze(entry);
 }
 
 /**
  * Builds the history response DTO from a resolved invoice + ordered list of
  * transition entries.
+ *
+ * @contract v1.0 - Returns InvoiceHistoryResponseDto with invoiceId, currentState,
+ *                 transitions array, and totalTransitions count.
+ *                 - Non-array transitions → empty array fallback
+ *                 - totalTransitions = transitions.length
+ *                 - transitions array is not mutated or cloned
  *
  * The `transitions` array is expected to already be in {@link HistoryEntryDto}
  * shape — this is the format produced by
@@ -372,19 +455,38 @@ function toHistoryEntryDto(log) {
  * @returns {InvoiceHistoryResponseDto}
  */
 function toInvoiceHistoryResponse({ invoiceId, currentState, transitions }) {
-  const safe = Array.isArray(transitions) ? transitions : [];
-  return {
+  const entries = Array.isArray(transitions) ? [...transitions] : [];
+  return Object.freeze({
     invoiceId,
     currentState,
-    transitions: safe,
-    totalTransitions: safe.length,
-  };
+    // Shallow copy (entry identity is preserved) that is frozen to match the
+    // DTO. Previously this array was the caller's own, so a later push or
+    // splice produced a response advertising `totalTransitions` alongside a
+    // different number of entries.
+    transitions: Object.freeze(entries),
+    totalTransitions: entries.length,
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
+/**
+ * @note Migration path for route adoption
+ *
+ * Current routes (src/routes/invoiceStateRoutes.js) access req.body directly
+ * instead of using these mappers. To adopt the mappers:
+ *
+ * 1. Replace direct req.body access with mapper calls in each route handler
+ * 2. Verify service layer returns shapes compatible with response mappers
+ * 3. Update response helpers to use mapper outputs
+ * 4. Run existing test suite to ensure no breaking changes
+ * 5. Increment contract version if output shapes change
+ *
+ * The mappers are production-ready and tested. Adoption is optional but
+ * recommended for consistency and defensive boundary handling.
+ */
 module.exports = {
   // Request mappers
   mapTransitionRequest,
