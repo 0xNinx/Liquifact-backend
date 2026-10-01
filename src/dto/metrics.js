@@ -110,11 +110,115 @@
 // SME Metrics — mapping functions
 // ----------------------------------------------------------------------------
 
+/** @type {ReadonlyArray<'open'|'funded'|'settled'|'defaulted'>} */
+const SME_METRIC_FIELDS = Object.freeze(['open', 'funded', 'settled', 'defaulted']);
+const INVALID_PROPERTY = Symbol('invalid-property');
+
+/**
+ * Safely identifies object inputs without allowing revoked proxies to escape.
+ *
+ * @param {unknown} value - Value to inspect.
+ * @returns {boolean} Whether value is a non-array object.
+ */
+function isObjectRecord(value) {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  try {
+    return !Array.isArray(value);
+  } catch (_err) {
+    return false;
+  }
+}
+
+/**
+ * Reads a property without allowing a hostile getter/proxy trap to abort DTO
+ * normalization. INVALID_PROPERTY is distinct from a missing or undefined
+ * property so callers can apply the documented fallback deterministically.
+ *
+ * @param {*} obj - Source object.
+ * @param {string} key - Property to read.
+ * @returns {*} The property value, or INVALID_PROPERTY if access failed.
+ */
+function readPropertySafely(obj, key) {
+  try {
+    return obj[key];
+  } catch (_err) {
+    return INVALID_PROPERTY;
+  }
+}
+
+/**
+ * Checks own-property presence without allowing proxy traps to escape.
+ *
+ * @param {*} obj - Source object.
+ * @param {string} key - Property to inspect.
+ * @returns {boolean} Whether the object owns the property.
+ */
+function hasOwnPropertySafely(obj, key) {
+  try {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+  } catch (_err) {
+    return false;
+  }
+}
+
+/**
+ * Converts a value to a finite number, returning fallback if conversion fails.
+ *
+ * @param {*} value - Value to convert.
+ * @param {number} fallback - Value used when conversion is unsafe.
+ * @returns {number} Finite numeric result or fallback.
+ */
+function toFiniteNumber(value, fallback) {
+  try {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  } catch (_err) {
+    return fallback;
+  }
+}
+
+/**
+ * Safely converts a value to a string, preserving the specified fallback on
+ * coercion errors (for example, an object with a throwing toString method).
+ *
+ * @param {*} value - Value to convert.
+ * @param {string} fallback - Fallback string.
+ * @returns {string} Converted value or fallback.
+ */
+function toStringSafely(value, fallback) {
+  try {
+    return String(value);
+  } catch (_err) {
+    return fallback;
+  }
+}
+
+/**
+ * Error for malformed internal metrics data. The message contains only a
+ * bounded field name; raw metric values are deliberately never retained.
+ */
+class MetricsDtoValidationError extends Error {
+  /**
+  * Creates a sanitized validation error for malformed metrics output.
+  *
+   * @param {string} field - A known metric field, or 'response'.
+   */
+  constructor(field) {
+    super(`Invalid SME metrics data for field: ${field}`);
+    this.name = 'MetricsDtoValidationError';
+    this.code = 'METRICS_DTO_INVALID_DATA';
+    this.field = field;
+  }
+}
+
 /**
  * Maps a raw invoice-counts object to a typed {@link SmeMetricsResponse} DTO.
  *
- * Every field is coerced to a safe integer.  Unknown keys on the raw object
- * are silently stripped.  This function never throws.
+ * Every field is coerced to a finite number; fractional values are preserved
+ * for compatibility. Unknown keys are stripped, and malformed coercions use
+ * the documented zero fallback. This function never throws.
  *
  * ## Invariants
  * - All four fields are non-negative safe integers (`Number.isSafeInteger`).
@@ -125,41 +229,52 @@
  * @returns {SmeMetricsResponse} Normalised DTO with all four keys guaranteed.
  */
 function toSmeMetricsResponse(raw) {
-  const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
-  const toCount = (value) => {
-    const n = Number(value);
-    return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+  /** @type {*} */
+  const obj = isObjectRecord(raw) ? raw : {};
+  /**
+   * Reads and safely normalizes one known count field.
+   *
+   * @param {'open'|'funded'|'settled'|'defaulted'} field - Count field name.
+   * @returns {number} Finite normalized value or zero.
+   */
+  const readCount = (field) => {
+    const value = readPropertySafely(obj, field);
+    return value === INVALID_PROPERTY ? 0 : toFiniteNumber(value, 0) || 0;
   };
   return {
-    open: toCount(obj.open),
-    funded: toCount(obj.funded),
-    settled: toCount(obj.settled),
-    defaulted: toCount(obj.defaulted),
-  };
-  return {
-    open: toCount(obj.open),
-    funded: toCount(obj.funded),
-    settled: toCount(obj.settled),
-    defaulted: toCount(obj.defaulted),
+    open: readCount('open'),
+    funded: readCount('funded'),
+    settled: readCount('settled'),
+    defaulted: readCount('defaulted'),
   };
 }
 
 /**
- * Coerces an arbitrary value to a non-negative safe integer.
+ * Strictly maps counts supplied by the invoice service for an API response.
+ * Unlike the legacy normalizer above, this path rejects missing, unsafe, or
+ * invalid fields instead of turning upstream data failures into zero counts.
+ * This keeps the existing permissive public mapper compatible while ensuring
+ * the live endpoint never reports a plausible but silently incomplete result.
  *
- * Returns `0` for `NaN`, `Infinity`, `-Infinity`, negatives, non-numbers,
- * and values outside the safe-integer range.  Fractional values are floored.
- *
- * @param {unknown} value - Value to coerce.
- * @returns {number} A non-negative safe integer.
+ * @param {unknown} raw - Raw count response from the invoice service.
+ * @returns {SmeMetricsResponse} Validated counts.
+ * @throws {MetricsDtoValidationError} When the source shape/counts are invalid.
  */
-function toNonNegativeInt(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) {
-    return 0;
+function toStrictSmeMetricsResponse(raw) {
+  if (!isObjectRecord(raw)) {
+    throw new MetricsDtoValidationError('response');
   }
-  const floored = Math.floor(n);
-  return Number.isSafeInteger(floored) ? floored : 0;
+
+  /** @type {SmeMetricsResponse} */
+  const result = { open: 0, funded: 0, settled: 0, defaulted: 0 };
+  for (const field of SME_METRIC_FIELDS) {
+    const value = readPropertySafely(raw, field);
+    if (!hasOwnPropertySafely(raw, field) || value === INVALID_PROPERTY || !Number.isSafeInteger(value) || value < 0) {
+      throw new MetricsDtoValidationError(field);
+    }
+    result[field] = value;
+  }
+  return result;
 }
 
 /**
@@ -179,44 +294,59 @@ function toNonNegativeInt(value) {
  * @returns {SmeMetricsMeta} Normalised meta DTO.
  */
 function toSmeMetricsMeta(raw) {
-  const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  /** @type {*} */
+  const obj = isObjectRecord(raw) ? raw : {};
+  const timestamp = readPropertySafely(obj, 'timestamp');
+  const version = readPropertySafely(obj, 'version');
 
   // Mandatory fields with defaults.
-  // Invariant: timestamp and version are always present and non-empty strings
-  // so downstream consumers can rely on them without null checks.
+  /** @type {SmeMetricsMeta} */
   const meta = {
-    timestamp: (typeof obj.timestamp === 'string' && obj.timestamp.length > 0)
-      ? obj.timestamp
-      : new Date().toISOString(),
-    version: (typeof obj.version === 'string' && obj.version.length > 0)
-      ? obj.version
-      : '0.1.0',
+    timestamp: typeof timestamp === 'string' ? timestamp : new Date().toISOString(),
+    version: typeof version === 'string' ? version : '0.1.0',
   };
 
   // Optional pagination fields — only include when the source had them.
-  if (Array.isArray(obj.invoices)) {
-    meta.invoices = obj.invoices;
+  const invoices = readPropertySafely(obj, 'invoices');
+  if (invoices !== INVALID_PROPERTY && isArraySafely(invoices)) {
+    meta.invoices = invoices;
   }
-  if (typeof obj.total === 'number' && Number.isFinite(obj.total) && obj.total >= 0) {
-    const total = Math.floor(obj.total);
-    if (Number.isSafeInteger(total)) {
-      meta.total = total;
-    }
+  const total = readPropertySafely(obj, 'total');
+  if (typeof total === 'number' && Number.isFinite(total)) {
+    meta.total = Math.max(0, Math.floor(total));
   }
-  if (typeof obj.limit === 'number' && Number.isFinite(obj.limit) && obj.limit > 0) {
-    meta.limit = obj.limit;
+  const limit = readPropertySafely(obj, 'limit');
+  if (typeof limit === 'number' && Number.isFinite(limit)) {
+    meta.limit = limit;
   }
-  if (typeof obj.hasMore === 'boolean') {
-    meta.hasMore = obj.hasMore;
+  const hasMore = readPropertySafely(obj, 'hasMore');
+  if (typeof hasMore === 'boolean') {
+    meta.hasMore = hasMore;
   }
   // Explicitly handle nextCursor — null is a valid terminal value.
-  if (Object.prototype.hasOwnProperty.call(obj, 'nextCursor')) {
-    meta.nextCursor = (typeof obj.nextCursor === 'string' || obj.nextCursor === null)
-      ? obj.nextCursor
-      : null;
+  const hasNextCursor = hasOwnPropertySafely(obj, 'nextCursor');
+  if (hasNextCursor) {
+    const nextCursor = readPropertySafely(obj, 'nextCursor');
+    if (nextCursor !== INVALID_PROPERTY) {
+      meta.nextCursor = nextCursor === undefined ? null : nextCursor;
+    }
   }
 
   return /** @type {SmeMetricsMeta} */ (meta);
+}
+
+/**
+ * Safely checks whether a value is an array, including revoked proxies.
+ *
+ * @param {*} value - Value to inspect.
+ * @returns {boolean} Whether value is an array.
+ */
+function isArraySafely(value) {
+  try {
+    return Array.isArray(value);
+  } catch (_err) {
+    return false;
+  }
 }
 
 /**
@@ -275,7 +405,15 @@ function toSmeMetricsApiResponse(data, meta, error = null) {
  * @returns {PersistenceRecordParams} Normalised DTO.
  */
 function toPersistenceRecordParams(raw) {
-  const obj = (raw && typeof raw === 'object' && !Array.isArray(raw)) ? raw : {};
+  /** @type {*} */
+  const obj = isObjectRecord(raw) ? raw : {};
+  const endpointValue = readPropertySafely(obj, 'endpoint');
+  const statusValue = readPropertySafely(obj, 'statusCode');
+  const durationValue = readPropertySafely(obj, 'durationSeconds');
+  const causeValue = readPropertySafely(obj, 'cause');
+  const reqValue = readPropertySafely(obj, 'req');
+  const parsedStatus = statusValue === INVALID_PROPERTY ? 200 : toFiniteNumber(statusValue, 200);
+  const parsedDuration = durationValue === INVALID_PROPERTY ? 0 : toFiniteNumber(durationValue, 0);
 
   const endpoint = String(obj.endpoint || 'unknown');
   const statusCode = Number(obj.statusCode);
@@ -283,13 +421,19 @@ function toPersistenceRecordParams(raw) {
   const cause = String(obj.cause || 'none');
 
   return {
-    endpoint: endpoint.length > 0 ? endpoint : 'unknown',
-    statusCode: Number.isFinite(statusCode) && statusCode > 0 ? statusCode : 200,
-    durationSeconds: Number.isFinite(durationSeconds) && durationSeconds >= 0
-      ? durationSeconds
+    endpoint: /** @type {PersistenceEndpoint} */ (endpointValue === INVALID_PROPERTY || !endpointValue
+      ? 'unknown'
+      : toStringSafely(endpointValue, 'unknown')),
+    statusCode: Number.isInteger(parsedStatus) && parsedStatus >= 100 && parsedStatus <= 599
+      ? parsedStatus
+      : 200,
+    durationSeconds: Number.isFinite(parsedDuration) && parsedDuration >= 0
+      ? parsedDuration
       : 0,
-    cause: /** @type {PersistenceCause} */ (cause.length > 0 ? cause : 'none'),
-    req: obj.req || undefined,
+    cause: /** @type {PersistenceCause} */ (
+      causeValue === INVALID_PROPERTY || !causeValue ? 'none' : toStringSafely(causeValue, 'none')
+    ),
+    req: reqValue === INVALID_PROPERTY ? undefined : (reqValue || undefined),
   };
 }
 
@@ -304,15 +448,13 @@ function toPersistenceRecordParams(raw) {
  * @returns {boolean} `true` when the value has the expected shape.
  */
 function isValidSmeMetricsResponse(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+  if (!isObjectRecord(value)) {
     return false;
   }
-  return (
-    Number.isInteger(value.open) && value.open >= 0 &&
-    Number.isInteger(value.funded) && value.funded >= 0 &&
-    Number.isInteger(value.settled) && value.settled >= 0 &&
-    Number.isInteger(value.defaulted) && value.defaulted >= 0
-  );
+  return SME_METRIC_FIELDS.every((field) => {
+    const count = readPropertySafely(value, field);
+    return hasOwnPropertySafely(value, field) && count !== INVALID_PROPERTY && Number.isSafeInteger(count) && count >= 0;
+  });
 }
 
 /**
@@ -321,25 +463,29 @@ function isValidSmeMetricsResponse(value) {
  * @param {unknown} value - Value to inspect.
  * @returns {boolean} `true` when the value has the expected shape.
  */
-function isSmeMetricsResponse(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+function isValidPersistenceRecordParams(value) {
+  if (!isObjectRecord(value)) {
     return false;
   }
-  return (
-    typeof value.endpoint === 'string' && value.endpoint.length > 0 &&
-    typeof value.statusCode === 'number' && Number.isFinite(value.statusCode) &&
-    value.statusCode > 0 &&
-    typeof value.durationSeconds === 'number' &&
-    Number.isFinite(value.durationSeconds) && value.durationSeconds >= 0 &&
-    typeof value.cause === 'string' && value.cause.length > 0
-  );
+  const endpoint = readPropertySafely(value, 'endpoint');
+  const statusCode = readPropertySafely(value, 'statusCode');
+  const durationSeconds = readPropertySafely(value, 'durationSeconds');
+  const cause = readPropertySafely(value, 'cause');
+  return endpoint !== INVALID_PROPERTY && typeof endpoint === 'string' &&
+    statusCode !== INVALID_PROPERTY && Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599 &&
+    durationSeconds !== INVALID_PROPERTY && Number.isFinite(durationSeconds) && durationSeconds >= 0 &&
+    cause !== INVALID_PROPERTY && typeof cause === 'string';
 }
 
 module.exports = {
   toSmeMetricsResponse,
+  toStrictSmeMetricsResponse,
   toSmeMetricsMeta,
   toSmeMetricsApiResponse,
   toPersistenceRecordParams,
-  toNonNegativeInt,
-  isSmeMetricsResponse,
+
+  // Validation helpers
+  isValidSmeMetricsResponse,
+  isValidPersistenceRecordParams,
+  MetricsDtoValidationError,
 };
