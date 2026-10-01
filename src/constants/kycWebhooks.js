@@ -46,6 +46,34 @@ const KYC_STATUSES = Object.freeze({
   UNKNOWN: 'unknown',
 });
 
+const SME_ID_MIN_LENGTH = 1;
+const SME_ID_MAX_LENGTH = 128;
+const STATUS_MIN_LENGTH = 1;
+const STATUS_MAX_LENGTH = 50;
+const IDEMPOTENCY_KEY_MIN_LENGTH = 8;
+const IDEMPOTENCY_KEY_MAX_LENGTH = 128;
+const SME_ID_PATTERN = `^[a-zA-Z0-9_-]{${SME_ID_MIN_LENGTH},${SME_ID_MAX_LENGTH}}$`;
+const IDEMPOTENCY_KEY_PATTERN = `^[A-Za-z0-9._:-]{${IDEMPOTENCY_KEY_MIN_LENGTH},${IDEMPOTENCY_KEY_MAX_LENGTH}}$`;
+
+/** Input limits shared by KYC webhook parsers and request handlers. */
+const KYC_WEBHOOK_VALIDATION = Object.freeze({
+  SME_ID_MIN_LENGTH,
+  SME_ID_MAX_LENGTH,
+  SME_ID_PATTERN,
+  STATUS_MIN_LENGTH,
+  STATUS_MAX_LENGTH,
+  RECORD_ID_MAX_LENGTH: 255,
+  IDEMPOTENCY_KEY_MIN_LENGTH,
+  IDEMPOTENCY_KEY_MAX_LENGTH,
+  IDEMPOTENCY_KEY_PATTERN,
+  ALLOWED_EVENTS: Object.freeze([
+    ...Object.values(KYC_WEBHOOK_EVENTS),
+    'kyc_status_updated',
+    'kyc.status_changed',
+  ]),
+  MAX_PAYLOAD_BYTES: 100 * 1024,
+});
+
 /** Structured Error Codes used in RFC 7807 problem json / error responses. */
 const KYC_WEBHOOK_ERROR_CODES = Object.freeze({
   MISSING_SECRET: 'missing_secret',
@@ -89,7 +117,7 @@ const KYC_WEBHOOK_MESSAGES = Object.freeze({
   INVALID_SIGNATURE_LOG: 'Invalid KYC webhook signature',
   FAIL_CLOSED_LOG: 'KYC webhook received status outside PROVIDER_STATUS_MAP; rejecting (fail-closed)',
   IDEMPOTENCY_KEY_REQUIRED: 'Idempotency-Key header is required for this endpoint.',
-  IDEMPOTENCY_KEY_INVALID: 'Idempotency-Key must be 8–128 URL-safe characters (A-Za-z0-9._:-).',
+  IDEMPOTENCY_KEY_INVALID: `Idempotency-Key must be ${IDEMPOTENCY_KEY_MIN_LENGTH}–${IDEMPOTENCY_KEY_MAX_LENGTH} URL-safe characters (A-Za-z0-9._:-).`,
   IDEMPOTENCY_KEY_REUSED: 'Idempotency-Key reused with a different request body. Use a unique key for each distinct payload.',
   IDEMPOTENCY_SERVER_ERROR: 'Internal server error processing idempotency key.',
 });
@@ -107,8 +135,11 @@ const KYC_WEBHOOK_DB = Object.freeze({
 
 /** Pagination defaults and boundaries for KYC webhooks listing. */
 const KYC_WEBHOOK_PAGINATION = Object.freeze({
+  MIN_LIMIT: 1,
   MAX_LIMIT: 100,
   DEFAULT_LIMIT: 20,
+  MIN_OFFSET: 0,
+  MAX_OFFSET: Number.MAX_SAFE_INTEGER,
   SORT_FIELD: 'updated_at',
   DEFAULT_ORDER: 'desc',
 });
@@ -132,6 +163,7 @@ const constants = Object.freeze({
   KYC_WEBHOOK_ROUTES,
   KYC_WEBHOOK_EVENTS,
   KYC_STATUSES,
+  KYC_WEBHOOK_VALIDATION,
   KYC_WEBHOOK_ERROR_CODES,
   KYC_WEBHOOK_MESSAGES,
   KYC_WEBHOOK_DB,
