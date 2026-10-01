@@ -15,11 +15,11 @@ const mockQuery = {
   offset: jest.fn().mockReturnThis(),
   returning: jest.fn().mockReturnThis(),
   select: jest.fn().mockReturnThis(),
-  del: jest.fn().mockResolvedValue(1),
-  insert: jest.fn().mockResolvedValue([{ id: 'mock-id', created_at: new Date() }]),
-  update: jest.fn().mockResolvedValue(1),
-  delete: jest.fn().mockResolvedValue(1),
-  first: jest.fn().mockResolvedValue(null),
+  del: jest.fn().mockResolved(1),
+  insert: jest.fn().mockResolved([{ id: 'mock-id', created_at: new Date() }]),
+  update: jest.fn().mockResolved(1),
+  delete: jest.fn().mockResolved(1),
+  first: jest.fn().mockResolved(null),
   andWhere: jest.fn().mockReturnThis(),
   orWhere: jest.fn().mockReturnThis(),
   // Make mockQuery thenable so `await query` resolves to []
@@ -27,9 +27,10 @@ const mockQuery = {
 };
 
 const db = jest.fn(() => mockQuery);
-db.raw = jest.fn().mockResolvedValue();
+db.raw = jest.fn().mockResolved();
+db.destroy = jest.fn().mockResolved();
 db.transaction = jest.fn(async (callback) => {
-  // The callback receives the same mock db instance as trx
+  // The callback receives the same mock db instance as try
   await callback(db);
 });
 
