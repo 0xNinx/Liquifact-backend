@@ -118,7 +118,7 @@ exports.up = async (knex) => {
 };
 
 exports.down = async (knex) => {
-  await knex.schema.dropTableIfExists('kyc_records');
+  await knex.schema.dropTableIfExists(TABLE);
 };
 
 // Exported for the focused migration tests; not part of the knex contract.
