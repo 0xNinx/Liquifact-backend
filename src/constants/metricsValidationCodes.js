@@ -91,34 +91,42 @@ const METRICS_VALIDATION_PROBLEM_TYPE =
   'https://liquifact.io/problems/validation-error';
 
 /**
- * Maximum length of a schema-declared code we will echo back. Bounds the
- * size of attacker-controlled input that can reach the wire format.
+ * Resolves the value at `path` inside `payload`, or `undefined` when any
+ * segment along the way is absent or not traversable.
  *
- * @type {number}
+ * @param {unknown} payload - Original, unparsed request payload.
+ * @param {Array<string|number|symbol>} path - Zod issue path.
+ * @returns {unknown} The value at `path`, or `undefined`.
  */
-const MAX_CODE_LENGTH = 64;
+function valueAtPath(payload, path) {
+  let current = payload;
+  for (const segment of path) {
+    if (current === null || typeof current !== 'object') {
+      return undefined;
+    }
+    current = current[segment];
+  }
+  return current;
+}
 
 /**
- * Normalises a schema-declared code into a known {@link METRICS_VALIDATION_CODES}
- * member, or `null` when it cannot be trusted.
+ * Decides whether an `invalid_type` issue means the value was absent.
  *
- * The check is deliberately exact-match and case-sensitive: a typo or a code
- * from a future version of this module degrades to the normal classification
- * rather than reaching the wire. This is the security boundary that stops
- * untrusted schema authors from injecting arbitrary codes into client
- * decision logic.
+ * Signals, in priority order: Zod 3's `received`, an explicit `input` key,
+ * then the original payload (real Zod 4 issues carry neither of the first two).
  *
- * @param {unknown} declared - Value of `issue.params.metricsCode`.
- * @returns {string|null} A canonical code, or `null`.
+ * @param {object} issue - The `invalid_type` Zod issue.
+ * @param {unknown} payload - Original payload, if the caller supplied it.
+ * @returns {boolean} True when the field was absent or `undefined`.
  */
-function normaliseDeclaredCode(declared) {
-  if (typeof declared !== 'string') {
-    return null;
+function isMissingValue(issue, payload) {
+  if (issue.received !== undefined) {
+    return issue.received === 'undefined';
   }
-  if (declared.length === 0 || declared.length > MAX_CODE_LENGTH) {
-    return null;
+  if ('input' in issue) {
+    return issue.input === undefined;
   }
-  return KNOWN_CODES.has(declared) ? declared : null;
+  return valueAtPath(payload, Array.isArray(issue.path) ? issue.path : []) === undefined;
 }
 
 /**
@@ -134,15 +142,12 @@ function normaliseDeclaredCode(declared) {
  * `type` (Zod 3) so a 26-item array does not report the same code as a
  * 129-character string.
  *
- * The function is totally defensive: malformed issues (`null`, non-objects,
- * unknown codes) all degrade to `FIELD_INVALID` and never throw. That guarantee
- * is what allows the caller to classify a failure without a try/catch and
- * without losing the original error.
- *
- * @param {unknown} issue - A single issue from a `ZodError`.
+ * @param {object} issue - A single issue from a `ZodError`.
+ * @param {unknown} [payload] - Original unparsed payload; needed on Zod 4 to tell
+ *   a missing field from a wrong-type one, since its issues omit the input.
  * @returns {string} A member of {@link METRICS_VALIDATION_CODES}.
  */
-function codeForIssue(issue) {
+function codeForIssue(issue, payload) {
   if (!issue || typeof issue !== 'object') {
     return METRICS_VALIDATION_CODES.FIELD_INVALID;
   }
@@ -164,7 +169,7 @@ function codeForIssue(issue) {
 
   switch (issue.code) {
     case 'invalid_type':
-      return issue.received === 'undefined' || issue.input === undefined
+      return isMissingValue(issue, payload)
         ? METRICS_VALIDATION_CODES.FIELD_REQUIRED
         : METRICS_VALIDATION_CODES.FIELD_TYPE_INVALID;
 
