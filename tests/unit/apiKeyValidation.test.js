@@ -39,6 +39,8 @@ const {
   MAX_CLIENT_ID_LENGTH: CONFIG_MAX_CLIENT_LENGTH,
   MAX_SCOPES_COUNT: CONFIG_MAX_SCOPES_COUNT,
   KNOWN_ENTRY_FIELDS,
+  buildKeyRegistry,
+  loadApiKeyRegistry,
 } = require('../../src/config/apiKeys');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -194,14 +196,14 @@ describe('apiKeyCreateSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  it(`accepts scopes at exactly ${MAX_SCOPES_COUNT} entries (boundary)`, () => {
-    const exactScopes = Array(MAX_SCOPES_COUNT).fill('invoices:read');
-    const result = apiKeyCreateSchema.safeParse(validPayload({ scopes: exactScopes }));
-    expect(result.success).toBe(true);
-  });
 
   it('rejects an unknown scope', () => {
     const result = apiKeyCreateSchema.safeParse(validPayload({ scopes: ['invoices:read', 'unknown:scope'] }));
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects duplicate scopes', () => {
+    const result = apiKeyCreateSchema.safeParse(validPayload({ scopes: ['invoices:read', 'invoices:read'] }));
     expect(result.success).toBe(false);
   });
 
@@ -463,14 +465,13 @@ describe('config/apiKeys — enhanced validateEntry', () => {
     ).toThrow(/must not exceed/);
   });
 
-  it('accepts scopes at exactly max count boundary', () => {
-    const exactScopes = Array(CONFIG_MAX_SCOPES_COUNT).fill('invoices:read');
+  it('rejects duplicate scopes', () => {
     expect(() =>
       validateEntry(
-        { key: 'lf_validkey001', clientId: 'svc', scopes: exactScopes },
+        { key: 'lf_validkey001', clientId: 'svc', scopes: ['invoices:read', 'invoices:read'] },
         0
       )
-    ).not.toThrow();
+    ).toThrow(/duplicate scope/);
   });
 });
 
@@ -522,6 +523,32 @@ describe('config/apiKeys — parseApiKeys with enhanced validation', () => {
     const longKey = 'lf_' + 'a'.repeat(CONFIG_MAX_KEY_LENGTH);
     const raw = JSON.stringify({ key: longKey, clientId: 'svc', scopes: ['invoices:read'] });
     expect(() => parseApiKeys(raw)).toThrow(/must not exceed/);
+  });
+});
+
+describe('config/apiKeys — buildKeyRegistry & loadApiKeyRegistry', () => {
+  it('builds a registry map for valid entries', () => {
+    const entries = [
+      { key: 'lf_validkey001', clientId: 'svc1', scopes: ['invoices:read'], revoked: false },
+      { key: 'lf_validkey002', clientId: 'svc2', scopes: ['admin'], revoked: false },
+    ];
+    const registry = buildKeyRegistry(entries);
+    expect(registry.size).toBe(2);
+    expect(registry.get('lf_validkey001').clientId).toBe('svc1');
+    expect(registry.get('lf_validkey002').clientId).toBe('svc2');
+  });
+
+  it('rejects duplicate keys across different clients', () => {
+    const entries = [
+      { key: 'lf_validkey001', clientId: 'svc1', scopes: ['invoices:read'] },
+      { key: 'lf_validkey001', clientId: 'svc2', scopes: ['admin'] },
+    ];
+    expect(() => buildKeyRegistry(entries)).toThrow(/duplicate key detected/);
+  });
+
+  it('loads empty registry when API_KEYS is absent', () => {
+    const registry = loadApiKeyRegistry({});
+    expect(registry.size).toBe(0);
   });
 });
 
@@ -596,6 +623,8 @@ describe('schema exports', () => {
     expect(config.rejectUnknownFields).toBeInstanceOf(Function);
     expect(config.validateEntry).toBeInstanceOf(Function);
     expect(config.parseApiKeys).toBeInstanceOf(Function);
+    expect(config.buildKeyRegistry).toBeInstanceOf(Function);
+    expect(config.loadApiKeyRegistry).toBeInstanceOf(Function);
   });
 });
 

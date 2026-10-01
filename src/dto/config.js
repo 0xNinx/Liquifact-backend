@@ -36,6 +36,18 @@
  * Callers that need strict boot-time fail-fast behaviour use `requireConfigDto()`
  * which throws a `ConfigError` if the result is not `ok`.
  *
+ * Invariants enforced here:
+ *   - All inputs are validated defensively; no input can produce a thrown
+ *     exception — malformed inputs produce safe zero-value defaults instead
+ *     of propagating bad data downstream.
+ *   - Output objects are shallow-frozen so callers cannot silently mutate the
+ *     DTO after it leaves this layer, preventing cross-request state bleed
+ *     in concurrent execution.
+ *   - `config` payloads are always shallow-copied (never aliased) so the
+ *     original request body cannot be mutated via the DTO reference.
+ *   - String fields are type-checked and default to `''` rather than
+ *     `undefined`, keeping downstream consumers free from null-checks.
+ *
  * @module dto/config
  */
 

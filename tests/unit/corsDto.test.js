@@ -87,6 +87,26 @@ describe('CORS DTO layer', () => {
       });
     });
 
+    it('does not inherit process maxAge when a custom env omits it', () => {
+      process.env.CORS_MAX_AGE = '7200';
+
+      jest.isolateModules(() => {
+        const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
+        const dto = corsConfigDtoFromEnv({ NODE_ENV: 'production' });
+
+        expect(dto.maxAge).toBe(600);
+      });
+    });
+
+    it('applies the maxAge boundary to custom environments', () => {
+      jest.isolateModules(() => {
+        const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
+
+        expect(corsConfigDtoFromEnv({ CORS_MAX_AGE: '86400' }).maxAge).toBe(86400);
+        expect(corsConfigDtoFromEnv({ CORS_MAX_AGE: '86401' }).maxAge).toBe(600);
+      });
+    });
+
     it('returns a defensive copy of allowedOrigins', () => {
       jest.isolateModules(() => {
         const { corsConfigDtoFromEnv } = require('../../src/dtos/cors');
@@ -371,6 +391,40 @@ describe('CORS DTO layer', () => {
   // ─── Integration: DTO-built options behave like real cors middleware ───────
 
   describe('DTO → cors middleware integration', () => {
+    it('keeps concurrent and repeated requests on the creation-time policy snapshot', async () => {
+      const { corsConfigDtoToOptions } = require('../../src/dtos/cors');
+      const allowedOrigins = ['https://app.example.com'];
+      const corsOpts = corsConfigDtoToOptions({
+        allowedOrigins,
+        maxAge: 600,
+        optionsSuccessStatus: 204,
+        isDevelopmentFallback: false,
+      });
+      allowedOrigins.push('https://evil.com');
+
+      const app = express();
+      app.use(cors(corsOpts));
+      app.use((err, req, res, next) => {
+        if (err && err.isCorsOriginRejected) {
+          return res.status(403).json({ error: err.message });
+        }
+        next(err);
+      });
+      app.get('/test', (req, res) => res.json({ ok: true }));
+
+      const responses = await Promise.all([
+        request(app).get('/test').set('Origin', 'https://app.example.com'),
+        request(app).get('/test').set('Origin', 'https://evil.com'),
+        request(app).get('/test').set('Origin', 'https://evil.com'),
+        request(app).get('/test'),
+      ]);
+
+      expect(responses.map((response) => response.status)).toEqual([200, 403, 403, 200]);
+      expect(responses[0].headers['access-control-allow-origin']).toBe('https://app.example.com');
+      expect(responses[1].headers['access-control-allow-origin']).toBeUndefined();
+      expect(responses[2].headers['access-control-allow-origin']).toBeUndefined();
+    });
+
     it('allows an origin when using DTO-built options with the cors package', async () => {
       const { corsConfigDtoToOptions } = require('../../src/dtos/cors');
       const dto = {
