@@ -25,11 +25,50 @@ const {
 const logger = require('../logger');
 
 /**
- * Status classes that the instrumentation understands. Anything else is
- * normalized to 'unknown' by {@link normalizeIndexerStatusClass}.
- * @type {Set<string>}
+ * Maximum acceptable duration (seconds) recorded into the histogram.
+ *
+ * A wrapped handler that hangs or a clock that jumps backwards can yield a
+ * non-finite or absurdly large duration. Prometheus histograms are sensitive
+ * to NaN / Infinity observations (they corrupt quantile aggregation), so we
+ * clamp to a bounded range and never observe a non-finite value.
+ *
+ * @type {number}
  */
-const KNOWN_STATUS_CLASSES = new Set(['2xx', '30x', '4xx', '5xx']);
+const MAX_DURATION_SECONDS = 1000;
+
+/**
+ * Normalizes a raw duration into a finite, non-negative, bounded seconds
+ * value suitable for a histogram observation.
+ *
+ * @param {number} durationSeconds - Raw duration in seconds.
+ * @returns {number} Bounded duration in seconds.
+ */
+function normalizeDuration(durationSeconds) {
+  const numeric = Number(durationSeconds);
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return 0;
+  }
+  return Math.min(numeric, MAX_DURATION_SECONDS);
+}
+
+/**
+ * Validates a raw HTTP status code into a bounded integer in [100, 599].
+ *
+ * Express may leave `res.statusCode` at its default (200) or a handler may
+ * set an out-of-range value. Prometheus label values must be bounded, so we
+ * reject anything outside the valid HTTP range and fall back to 500, which
+ * classifies as '5xx' and surfaces the anomaly rather than hiding it.
+ *
+ * @param {unknown} statusCode - Raw status code.
+ * @returns {number} A valid HTTP status code.
+ */
+function normalizeStatusCode(statusCode) {
+  const numeric = Number(statusCode);
+  if (!Number.isInteger(numeric) || numeric < 100 || numeric > 599) {
+    return 500;
+  }
+  return numeric;
+}
 
 /**
  * Records metrics and a structured log for one completed indexer request.
@@ -38,9 +77,10 @@ const KNOWN_STATUS_CLASSES = new Set(['2xx', '30x', '4xx', '5xx']);
  * isolation against each status class without driving a full HTTP request.
  *
  * Invariants:
- *   - Always records exactly one duration observation and one request count.
- *   - Error counter is incremented at most once, and only for a bounded cause.
- *   - Never logs raw error messages or other PII.
+ *   - Exactly one duration observation and one request count increment.
+ *   - The error counter is incremented at most once, and only for a bounded
+ *     cause other than 'none'.
+ *   - No PII is logged: only bounded labels and a numeric duration.
  *
  * @param {object} params
  * @param {number} params.statusCode - Final HTTP status code.
@@ -50,19 +90,12 @@ const KNOWN_STATUS_CLASSES = new Set(['2xx', '30x', '4xx', '5xx']);
  * @returns {void}
  */
 function recordIndexerOutcome({ statusCode, durationSeconds, error, req }) {
-  // Normalize inputs so a malformed status or duration cannot create an
-  // unbounded label or a NaN observation.
-  const safeStatusCode = Number.isInteger(statusCode) ? statusCode : 0;
+  const safeStatusCode = normalizeStatusCode(statusCode);
   const statusClass = normalizeIndexerStatusClass(safeStatusCode);
-  const boundedStatusClass = KNOWN_STATUS_CLASSES.has(statusClass)
-    ? statusClass
-    : 'unknown';
-  const safeDuration = Number.isFinite(durationSeconds) && durationSeconds >= 0
-    ? durationSeconds
-    : 0;
+  const boundedDuration = normalizeDuration(durationSeconds);
 
-  indexerRequestDurationSeconds.labels(boundedStatusClass).observe(safeDuration);
-  indexerRequestsTotal.labels(boundedStatusClass).inc();
+  indexerRequestDurationSeconds.labels(statusClass).observe(boundedDuration);
+  indexerRequestsTotal.labels(statusClass).inc();
 
   const cause = normalizeIndexerCause(error, safeStatusCode);
   if (cause !== 'none') {
@@ -75,9 +108,9 @@ function recordIndexerOutcome({ statusCode, durationSeconds, error, req }) {
     ? logger.createRequestLogger(req)
     : logger;
   const fields = {
-    statusClass: boundedStatusClass,
+    statusClass,
     statusCode: safeStatusCode,
-    durationSeconds: Number(safeDuration.toFixed(6)),
+    durationSeconds: Number(boundedDuration.toFixed(6)),
     cause,
   };
 
@@ -98,13 +131,14 @@ function recordIndexerOutcome({ statusCode, durationSeconds, error, req }) {
  * code is the one actually sent. If the handler throws, the error is recorded
  * and re-thrown to the next error middleware.
  *
- * Compatibility contracts (preserved):
- *   - Returns a function with the same (req, res, next) async signature.
- *   - Resolves to the handler's resolved value (typically undefined).
- *   - Rejects with the handler's error after forwarding it to `next`.
- *   - Records exactly once per request, even if `finish` fires multiple times
- *     or the response is already finished before the listener is attached.
- *   - Never mutates the request or response beyond the private `_error` stash.
+ * Invariants:
+ *   - Exactly one outcome is recorded per request, even if `finish` and
+ *     `close` both fire or the handler throws after the response finished.
+ *   - The outcome is recorded on `finish` when the response was sent, and on
+ *     `close` when the connection died before a response could be sent, so a
+ *     client disconnect never silently drops the metric.
+ *   - A thrown error is stashed on `ress.locals` for classification and is
+ *     always forwarded to `next`.
  *
  * @param {(req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => Promise<void>} handler
  * @returns {(req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) => Promise<void>}
@@ -125,7 +159,7 @@ function instrumentIndexer(handler) {
     // Single source of truth: record on response finish, when the final status
     // code is known. A thrown handler stashes its error on res.locals so the
     // finish listener can classify the cause consistently with that status.
-    const onFinish = () => {
+    const finalize = () => {
       if (recorded) { return; }
       recorded = true;
       const durationSeconds = Number(process.hrtime.bigint() - startNs) / 1e9;
@@ -137,14 +171,11 @@ function instrumentIndexer(handler) {
       });
     };
 
-    res.on('finish', onFinish);
-
-    // If the response was already finished before the listener was attached
-    // (e.g. a cache or upstream short-circuit), the `finish` event will not
-    // fire again. Record immediately so the outcome is not silently lost.
-    if (res.finished) {
-      onFinish();
-    }
+    res.on('finish', finalize);
+    // A client disconnect can fire `close` without ever firing `finish`.
+    // Record on close too, guarded by the same flag, so the outcome is never
+    // double-counted and never lost.
+    res.on('close', finalize);
 
     try {
       await handler(req, res, next);
@@ -161,6 +192,8 @@ function instrumentIndexer(handler) {
 }
 
 module.exports = {
+  normalizeDuration,
+  normalizeStatusCode,
   recordIndexerOutcome,
   instrumentIndexer,
   knownStatusClasses: KNOWN_STATUS_CLASSES,

@@ -354,36 +354,117 @@ function createKnexEscrowEventStore(knex) {
 }
 
 /**
- * Processes a single escrow event idempotently within a transaction.
+ * Defines the validation boundaries for an escrow indexer event.
  *
- * The event is normalized and validated, deduplicated by event ID, and the
- * projection is updated only when the event is newer than the current
- * projection state. Duplicates and out-of-order events are skipped without
- * mutating state.
+ * This is the single source of truth for what constitutes a valid, invalid,
+ * duplicate, or boundary-case input to the indexer. It combines the
+ * structural schema validation with the domain-specific checks (Stellar
+ * contract ID, transaction hash, cursor monotonicity) that the schema alone
+ * cannot express.
  *
- * @param {object} store - Escrow event store.
- * @param {object} rawEvent - Raw event payload.
- * @returns {Promise<{status: string, eventId?: string}>} Result of processing.
+ * The returned object is deterministic for a given input and is safe to
+ * log -- it never echoes sensitive raw payload bytes, only field names and
+ * machine-readable codes.
+ *
+ * @param {unknown} rawEvent - Raw event payload.
+ * @param {object} [options]
+ * @param {string|null} [options.cursor] - Last persisted cursor (paging token).
+ * @param {Set<string>|Array<string>} [options.seenEventIds] - Already-processed event IDs.
+ * @returns {object} Validation result with `ok`, `code`, `event`, and `details`.
  */
-async function processEvent(store, rawEvent) {
-  const event = normalizeEvent(rawEvent);
+function validateEscrowEvent(rawEvent, options = {}) {
+  const { cursor = null, seenEventIds = null } = options;
 
-  const existing = await store.findProjection(event.invoiceId);
-  if (existing) {
-    const existingLedger = Number(existing.latest_ledger_sequence);
-    const incomingLedger = Number(event.ledgerSequence);
-    if (incomingLedger < existingLedger) {
-      return { status: 'skipped', eventId: event.eventId };
+  // Boundary: null, undefined, and non-object payloads are rejected before
+  // any field access so the error is deterministic and does not leak internals.
+  if (!rawEvent || typeof rawEvent !== 'object' || Array.isArray(rawEvent)) {
+    return {
+      ok: false,
+      code: 'INVALID_PAYLOAD',
+      event: null,
+      details: null,
+    };
+  }
+
+  let normalized;
+  try {
+    normalized = normalizeEvent(rawEvent);
+  } catch (err) {
+    if (err instanceof ValidationError) {
+      return {
+        ok: false,
+        code: err.code,
+        event: null,
+        details: err.details,
+      };
     }
-    if (incomingLedger === existingLedger && event.eventId === existing.latest_event_id) {
-      return { status: 'skipped', eventId: event.eventId };
+    throw err;
+  }
+
+  // Domain boundary: contract ID must be a valid Stellar contract address.
+  if (normalized.contractId !== null && !isValidStellarContractId(normalized.contractId)) {
+    return {
+      ok: false,
+      code: 'INVALID_CONTRACT_ID',
+      event: null,
+      details: { contractId: 'must be a valid Stellar contract ID' },
+    };
+  }
+
+  // Domain boundary: transaction hash must be 64 hex characters.
+  if (normalized.txHash !== null && !isValidTxHash(normalized.txHash)) {
+    return {
+      ok: false,
+      code: 'INVALID_TX_HASH',
+      event: null,
+      details: { txHash: 'must be 64 hexadecimal characters' },
+    };
+  }
+
+  // Duplicate boundary: event IDs are idempotent. A duplicate is not an
+  // error -- it is skipped with a stable code so the caller can advance
+  // the cursor without reinserting data.
+  if (seenEventIds) {
+    const seen = seenEventIds instanceof Set ? seenEventIds : new Set(seenEventIds);
+    if (seen.has(normalized.eventId)) {
+      return {
+        ok: false,
+        code: 'DUPLICATE_EVENT',
+        event: normalized,
+        details: { eventId: 'already processed' },
+      };
     }
   }
 
-  await store.upsertEvent(db, event);
-  await store.upsertProjection(db, event);
+  // Cursor boundary: paging tokens are monotonically increasing. A cursor
+  // that would move backwards is rejected to prevent replay or skip.
+  if (cursor !== null && normalized.pagingToken) {
+    const cursorNum = Number(cursor);
+    const tokenNum = Number(normalized.pagingToken);
+    if (!Number.isFinite(cursorNum) || !Number.isFinite(tokenNum)) {
+      return {
+        ok: false,
+        code: 'INVALID_CURSOR',
+        event: null,
+        details: { cursor: 'non-numeric cursor or paging token' },
+      };
+    }
+    if (tokenNum < cursorNum) {
+      return {
+        ok: false,
+        code: 'CURSOR_REGRESSION',
+        event: null,
+        details: { cursor: 'paging token precedes persisted cursor' },
+      };
+    }
+  }
 
-  return { status: 'processed', eventId: event.eventId };
+  return {
+    ok: true,
+    code: null,
+    event: normalized,
+    details: null,
+  };
 }
 
 module.exports = {
@@ -393,6 +474,10 @@ module.exports = {
   isValidTxHash,
   deriveInvoiceId,
   normalizeEvent,
+  validateEscrowEvent,
   createKnexEscrowEventStore,
-  processEvent,
+  DEFAULT_POLL_INTERVAL_MS,
+  DEFAULT_BATCH_SIZE,
+  LEASE_KEY,
+  DEFAULT_LEASE_DURATION_MS,
 };

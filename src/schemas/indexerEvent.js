@@ -8,86 +8,107 @@ const {
   TX_HASH_REGEX,
 } = require('./validationHelper');
 
-// NOTE: `parseValidationErrors` is re-exported below for backward compatibility.
-// It is imported here so the re-export stays in sync with the helper module.
+/**
+ * Maximum length of a paging token. Horizon paging tokens are opaque but
+ * bounded; a cap keeps a malicious/buggy producer from bloating the event
+ * table with unbounded strings.
+ * @type {number}
+ */
+const MAX_PAGING_TOKEN_LENGTH = 2048;
 
 /**
- * Compatibility contract for indexer events.
- *
- * This schema is the public boundary between the indexer jobs and the
- * persistence layer. The following invariants are part of the contract:
- *
- *  1. Valid events are normalized deterministically: string fields are
- *     trimmed, optional nullable fields remain `null` when explicitly set,
- *     and missing optional fields are omitted from the output.
- *  2. Unknown keys are rejected (`.strict()`) so downstream consumers
- *     can rely on the exact shape of the object.
- *  3. Errors are reported through the shared `parseValidationErrors` helper
- *     so callers get a stable, machine-readable error shape.
- *  4. The exported regex constants are re-exported unchanged for backward
- *     compatibility with existing callers.
+ * Maximum length of an event ID--long enough for a Horizon token or a
+ * composite key, but bounded to keep the event table deterministic.
+ * @type {number}
  */
-
-const contractIdSchema = z.string({
-  invalid_type_error: 'contractId must be a string',
-}).regex(CONTRACT_ID_REGEX, {
-  message: 'contractId must be a valid Stellar contract address (C... 56 chars)',
-});
+const MAX_EVENT_ID_LENGTH = 256;
 
 /**
- * Normalizes an optional nullable string field.
- *
- * Behavior:
- *  - `undefined` -> field is omitted (not present in output)
- *  - `null`      -> field is preserved as `null`
- *  - `string`    -> field is trimmed and validated
- *
- * This keeps the compatibility contract explicit and deterministic for
- * consumers that distinguish between "absent" and "explicitly null".
+ * Maximum length of an event type label.
+ * @type {number}
  */
-function optionalNullableString(schema) {
-  return z.union([z.undefined(), z.null(), schema]).optional();
-}
+const MAX_EVENT_TYPE_LENGTH = 128;
 
+/**
+ * Maximum length of an invoice ID.
+ * @type {number}
+ */
+const MAX_INVOICE_ID_LENGTH = 128;
+
+/**
+ * Maximum acceptable ledger sequence. Stellar's ledger sequence is a
+ * uninterpreted 32-bit counter in practice, but we bound to MaxSafeInteger
+ * so the value is always representable in JS and in a Postgres bigint.
+ * @type {number}
+ */
+const MAX_LEGDER_SEQUENCE = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Minimum acceptable ledger sequence. Stellar ledgers are 1-based.
+ * @type {number}
+ */
+const MIN_LEDGER_SEQUENCE = 1;
+
+/**
+ * Stellar contract address schema (C... 56 chars, StrKey encoded).
+ * @type {z.ZodString}
+ */
+const contractIdSchema = z
+  .string({ invalid_type_error: 'contractId must be a string' })
+  .regex(CONTRACT_ID_REGEX, {
+    message: 'contractId must be a valid Stellar contract address (C... 56 chars)',
+  });
+
+/**
+ * Canonical schema for a single escrow indexer event. Strict mode rejects
+ * unknown fields so a misspelled or unexpected property cannot silently
+ * bypass validation.
+ * @type {z.ZodObject}
+ */
 const indexerEventSchema = z
   .object({
     eventId: z
       .string({ invalid_type_error: 'eventId must be a string' })
       .min(1, { message: 'eventId is required' })
-      .max(256, { message: 'eventId must not exceed 256 characters' })
+      .max(MAX_EVENT_ID_LENGTH, { message: `eventId must not exceed ${MAX_EVENT_ID_LENGTH} characters` })
       .transform((v) => v.trim()),
 
     invoiceId: z
       .string({ invalid_type_error: 'invoiceId must be a string' })
       .regex(INVOICE_ID_REGEX, {
-        message: 'invoiceId must be 1-128 alphanumeric/underscore/hyphen characters',
+        message: `invoiceId must be 1-${MAX_INVOICE_ID_LENGTH} alphanumeric/underscore/hyphen characters`,
       })
       .transform((v) => v.trim()),
 
     eventType: z
       .string({ invalid_type_error: 'eventType must be a string' })
       .min(1, { message: 'eventType is required' })
-      .max(128, { message: 'eventType must not exceed 128 characters' })
+      .max(MAX_EVENT_TYPE_LENGTH, { message: `eventType must not exceed ${MAX_EVENT_TYPE_LENGTH} characters` })
       .transform((v) => v.trim()),
 
     ledgerSequence: z
       .number({ invalid_type_error: 'ledgerSequence must be a number' })
       .int({ message: 'ledgerSequence must be an integer' })
-      .positive({ message: 'ledgerSequence must be a positive integer' })
-      .max(Number.MAX_SAFE_INTEGER, { message: 'ledgerSequence is out of range' }),
+      .min(1, { message: 'ledgerSequence must be a positive integer' })
+      .max(MAX_LEDGER_SEQUENCE, { message: 'ledgerSequence is out of range' }),
 
     pagingToken: z
       .string({ invalid_type_error: 'pagingToken must be a string' })
-      .max(2048, { message: 'pagingToken must not exceed 2048 characters' })
+      .max(MAX_PAGING_TOKEN_LENGTH, { message: `pagingToken must not exceed ${MAX_PAGING_TOKEN_LENGTH} characters` })
       .default(''),
 
-    contractId: optionalNullableString(contractIdSchema),
+    contractId: z
+      .union([contractIdSchema, z.null()])
+      .optional(),
 
-    txHash: optionalNullableString(
-      z.string().regex(TX_HASH_REGEX, {
-        message: 'txHash must be a 64-character hexadecimal string',
-      }),
-    ),
+    txHash: z
+      .union([
+        z.string().regex(TX_HASH_REGEX, {
+          message: 'txHash must be a 64-character hexadecimal string',
+        }),
+        z.null(),
+      ])
+      .optional(),
 
     eventBody: z.unknown().optional(),
 
@@ -98,22 +119,6 @@ const indexerEventSchema = z
   })
   .strict();
 
-/**
- * Parse an indexer event and return a normalized result or throw a
- * validation error with the shared error shape.
- *
- * This is the canonical entry point for callers that want deterministic
- * error handling. It is intentionally wrapped so the compatibility
- * contract is explicit and testable.
- */
-function parseIndexerEvent(input) {
-  const result = indexerEventSchema.safeParse(input);
-  if (!result.success) {
-    throw parseValidationErrors(result.error);
-  }
-  return result.data;
-}
-
 module.exports = {
   indexerEventSchema,
   parseIndexerEvent,
@@ -121,4 +126,10 @@ module.exports = {
   INVOICE_ID_REGEX,
   CONTRACT_ID_REGEX,
   TX_HASH_REGEX,
+  MAX_PAGING_TOKEN_LENGTH,
+  MAX_EVENT_ID_LENGTH,
+  MAX_EVENT_TYPE_LENGTH,
+  MAX_INVOICE_ID_LENGTH,
+  MAX_LEDGER_SEQUENCE,
+  MIN_LEDGER_SEQUENCE,
 };
