@@ -153,8 +153,11 @@ const KYC_WEBHOOK_DB = Object.freeze({
 
 /** Pagination defaults and boundaries for KYC webhooks listing. */
 const KYC_WEBHOOK_PAGINATION = Object.freeze({
+  MIN_LIMIT: 1,
   MAX_LIMIT: 100,
   DEFAULT_LIMIT: 20,
+  MIN_OFFSET: 0,
+  MAX_OFFSET: Number.MAX_SAFE_INTEGER,
   SORT_FIELD: 'updated_at',
   DEFAULT_ORDER: 'desc',
 });
@@ -239,6 +242,7 @@ const constants = deepFreeze({
   KYC_WEBHOOK_DB,
   KYC_WEBHOOK_PAGINATION,
   KYC_WEBHOOK_METRICS,
+  KYC_WEBHOOK_RETRY,
 });
 
 module.exports = Object.freeze({
