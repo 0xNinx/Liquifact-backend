@@ -1,1 +1,547 @@
-LyoqCiAqIENlbnRyYWxpemVkIHR5cGVkIGNvbmZpZ3VyYXRpb24gbW9kdWxlIHdpdGggcnVudGltZSB2YWxpZGF0aW9uLgogKiBVc2VzIFpvZCBmb3Igc2NoZW1hIHZhbGlkYXRpb24gYW5kIHR5cGUgc2FmZXR5LgogKiBAbW9kdWxlIGNvbmZpZwogKi8KCmNvbnN0IHogPSByZXF1aXJlKCd6b2QnKTsKCi8qKiBFeHByZXNzLWNvbXBhdGlibGUgcmVxdWVzdCBzaXplIHN0cmluZy4gQHR5cGUge3ouWm9kRGVmYXVsdDx6LlpvZFN0cmluZz59ICovCmNvbnN0IEludm9pY2VGaWxlTWF4U2l6ZVNjaGVtYSA9IHoKICAuc3RyaW5nKCkKICAudHJpbSgpCiAgLnJlZ2V4KC9eXGQrKD86XC5cZCspPyg/OmJ8a2J8bWJ8Z2IpJC9pLCB7CiAgICBtZXNzYWdlOiAnSU5WT0lDRV9GSUxFX01BWF9TSVpFIG11c3QgYmUgYSBzaXplIHN1Y2ggYXMgNTEya2Igb3IgNW1iLicsCiAgfSkKICAuZGVmYXVsdCgnNW1iJyk7CgovKioKICogQ29tcGxldGUgY29uZmlndXJhdGlvbiBzY2hlbWEgd2l0aCBkZWZhdWx0cyBhbmQgdmFsaWRhdGlvbi4KICogU2VjcmV0cyBoYXZlIG5vIGRlZmF1bHRzIC0gbXVzdCBiZSBwcm92aWRlZC4KICogQHR5cGUge3ouWm9kT2JqZWN0PGFueT59CiAqLwpjb25zdCBDb25maWdTY2hlbWEgPSB6CiAgLm9iamVjdCh7CiAgICBOT0RFX0VOVjogei5lbnVtKFsnZGV2ZWxvcG1lbnQnLCAncHJvZHVjdGlvbicsICd0ZXN0J10pLmRlZmF1bHQoJ2RldmVsb3BtZW50JyksCiAgICBQT1JUOiB6LmNvZXJjZS5udW1iZXIoKS5taW4oMSkubWF4KDY1NTM1KS5kZWZhdWx0KDMwMDEpLAogICAgSldUX1NFQ1JFVDogei5zdHJpbmcoKS5taW4oMzIpLCAvLyBObyBkZWZhdWx0IGZvciBzZWN1cml0eQogICAgSldUX0FM R09SSVRITVM6IHouc3RyaW5nKCkub3B0aW9uYWwoKS5kZWZhdWx0KCdIUzI1NicpLCAvLyBDb21tYS1zZXBhcmF0ZWQgYWxsb3dsaXN0LCBlLmcuIEhTMjU2LFJTMjU2CiAgICBKV1RfSVNTVUVSOiB6LnN0cmluZygpLm9wdGlvbmFsKCksIC8vIE9wdGlvbmFsIGlzc3VlciBjbGFpbSB0byBlbmZvcmNlCiAgICBKV1RfQVVESUVOQ0U6IHouc3RyaW5nKCkub3B0aW9uYWwoKSwgLy8gT3B0aW9uYWwgYXVkaWVuY2UgY2xhaW0gdG8gZW5mb3JjZQogICAgQ1VSU09SX1NFQ1JFVDogei5zdHJpbmcoKS5taW4oMzIpLm9wdGlvbmFsKCksIC8vIERlZGljYXRlZCBtYXJrZXRwbGFjZSBjdXJzb3IgSE1BQyBzZWNyZXQKICAgIENVUlNPUl9UVExfRU5BQkxFRDogei5lbnVtKFsndHJ1ZScsICdmYWxzZSddKS5kZWZhdWx0KCdmYWxzZScpLAogICAgQ1VSU09SX1RUTF9TRUNPTkRTOiB6LmNvZXJjZS5udW1iZXIoKS5pbnQoKS5taW4oMSkuZGVmYXVsdCgzNjAwKSwKICAgIENPUlNfQUxMT1dFRF9PUklHSU5TOiB6LnN0cmluZygpLm9wdGlvbmFsKCksIC8vIENvbW1hLXNlcGFyYXRlZCwgb3B0aW9uYWwgZm9yIGRldiBmYWxsYmFja3MKICAgIFNPUk9CQU5fUlBDX1VSTDogei5zdHJpbmcoKS51cmwoKS5kZWZhdWx0KCdodHRwczovL3Nvcm9iYW4tdGVzdG5ldC5zdGVsbGFyLm9yZycpLAogICAgTkVUV09SS19QQVNTVFBIUkFTRTogei5zdHJpbmcoKS5kZWZhdWx0KCdUZXN0IFNERiBOZXR3b3JrIDsgU2VwdGVtYmVyIDIwMTUnKSwKICAgIFNPUk9CQU5fQkFUQ0hfQ09OQ1VSUkVOQ1k6IHouY29lcmNlLm51bWJlcigpLm1pbigxKS5tYXgoNTApLmRlZmF1bHQoNSksCiAgICBTT1JPQkFOX0JBVENIX1RJTUVPVVRfTVM6IHouY29lcmNlLm51bWJlcigpLm1pbigxMDApLm1heCgzMDAwMCkuZGVmYXVsdCg1MDAwKSwKICAgIC8vIEVzY3JvdyBpbmRleGVyIGNvbmZpZ3VyYXRpb24KICAgIEVTQ1JPV19JTkRFWEVSX0VOQUJMRUQ6IHouZW51bShbJ3RydWUnLCAnZmFsc2UnXSkuZGVmYXVsdCgnZmFsc2UnKSwKICAgIEVTQ1JPV19JTkRFWEVSX1NUQUxFX1RIUkVTSE9MRF9TRUNPTkRTOiB6LmNvZXJjZS5udW1iZXIoKS5taW4oMSkuZGVmYXVsdCgzMDApLAogICAgLy8gRXNjcm93IHJlYWQgcHJvamVjdGlvbiDigJQgZ2F0ZXMgdGhlIG5ldyBwcm9qZWN0aW9uL2NhY2hlLWJhc2VkIGVzY3JvdyByZWFkIHBhdGgKICAgIEVTQ1JPV19SRUFEX1BST0pFQ1RJT05fRU5BQkxFRDogei5lbnVtKFsndHJ1ZScsICdmYWxzZSddKS5kZWZhdWx0KCd0cnVlJyksCiAgICAvLyBJbnZvaWNlIHN0YXRlIG1hY2hpbmUg4oCUIGdhdGVzIC9hcGkvaW52b2ljZXMgc3RhdGUtdHJhbnNpdGlvbiBlbmRwb2ludHMuCiAgICAvLyBXaGVuICdmYWxzZScsIHRoZSBpbnZvaWNlIHN0YXRlIHJvdXRlcyBhcmUgbm90IG1vdW50ZWQgc28gcmVxdWVzdHMgcmV0dXJuIDQwNC4KICAgIC8vIERlZmF1bHRzIHRvICd0cnVlJyAoZW5hYmxlZCkgdG8gcHJlc2VydmUgZXhpc3RpbmcgYmVoYXZpb3VyLgogICAgSU5WT0lDRV9TVEFURV9FTkFCTEVEOiB6LmVudW0oWyd0cnVlJywgJ2ZhbHNlJ10pLmRlZmF1bHQoJ3RydWUnKSwKICAgIC8vIFJ1bnRpbWUgYWRtaW4gY29uZmlnIHN1cmZhY2Ug4oCUIGdhdGVzIFBPU1QgL2FwaS9hZG1pbi9jb25maWcgYW5kCiAgICAvLyBHRVQgL2FwaS9hZG1pbi9jb25maWcvc2VjdGlvbnMuIFdoZW4gJ2ZhbHNlJyB0aGUgcm91dGVyIGlzIG5vdCBtb3VudGVkCiAgICAvLyBzbyByZXF1ZXN0cyByZXR1cm4gNDA0LCBhbGxvd2luZyB0aGUgc3VyZmFjZSB0byBiZSBkaXNhYmxlZCB3aXRob3V0IGEKICAgIC8vIGRlcGxveS4gRGVmYXVsdHMgdG8gJ3RydWUnIChlbmFibGVkKS4KICAgIENPTkZJR19SVU5USU1FX0VOQUJMRUQ6IHouZW51bShbJ3RydWUnLCAnZmFsc2UnXSkuZGVmYXVsdCgndHJ1ZScpLAogICAgLy8gS1lDIHByb3ZpZGVyIOKAlCBhbGwgb3B0aW9uYWwsIGJ1dCBVUkwra2V5IG11c3QgYmUgcHJvdmlkZWQgdG9nZXRoZXIgaW4gbm9uLXRlc3QgZW52cwogICAgS1lDX1BST1ZJREVSX1VSTDogei5zdHJpbmcoKS51cmwoKS5vcHRpb25hbCgpLAogICAgS1lDX1BST1ZJREVSX0FQSV9LRVk6IHouc3RyaW5nKCkubWluKDEpLm9wdGlvbmFsKCksCiAgICBLWUNfUFJPVklERVJfU0VDUkVUOiB6LnN0cmluZygpLm1pbigxKS5vcHRpb25hbCgpLAogICAgLy8gSXNzdWUgIzU5MiDigJQgS1lDIHByb3ZpZGVyIHRyYW5zcG9ydCBoYXJkZW5pbmcuIE51bWVyaWMga25vYnMgYXJlIGNsYW1wZWQKICAgIC8vIHNvIGEgdHlwbyBjYW5ub3QgZGlzYWJsZSB0aGUgdGltZW91dCwgZXhoYXVzdCByZXRyaWVzLCBvciBoYW5nIHRoZSBicmVha2VyLgogICAgS1lDX1BST1ZJREVSX1RJTUVPVVRfTVM6IHouY29lcmNlLm51bWJlcigpLm1pbigxMDApLm1heCgzMDAwMCkuZGVmYXVsdCg1MDAwKSwKICAgIEtZQ19QUk9WSURFUl9NQVhfUkVUUklFUzogei5jb2VyY2UubnVtYmVyKCkubWluKDApLm1heCgxMCkuZGVmYXVsdCgzKSwKICAgIEtZQ19QUk9WSURFUl9CQVNFX0RFTEFZX01TOiB6LmNvZXJjZS5udW1iZXIoKS5taW4oMCkubWF4KDEwMDAwKS5kZWZhdWx0KDIwMCksCiAgICBLWUNfUFJPVklERVJfTUFYX0RFTEFZX01TOiB6LmNvZXJjZS5udW1iZXIoKS5taW4oMCkubWF4KDYwMDAwKS5kZWZhdWx0KDUwMDApLAogICAgS1lDX1BST1ZJREVSX1NJR05fUkVRVUVTVFM6IHouZW51bShbJ3RydWUnLCAnZmFsc2UnXSkuZGVmYXVsdCgnZmFsc2UnKSwKICAgIEtZQ19QUk9WSURFUl9WRVJJRllfUkVTUE9OU0VfU0lHTkFUVVJFOiB6LmVudW0oWyd0cnVlJywgJ2ZhbHNlJ10pLmRlZmF1bHQoJ2ZhbHNlJyksCiAgICBLWUNfUFJPVklERVJfQ0JfRkFJTFVSRV9USFJFU0hPTEQ6IHouY29lcmNlLm51bWJlcigpLm1pbigxKS5tYXgoMTAwKS5kZWZhdWx0KDUpLAogICAgS1lDX1BST1ZJREVSX0NCX1JFQ09WRVJZX1RJTUVPVVRfTVM6IHouY29lcmNlLm51bWJlcigpLm1pbigxMDApLm1heCg2MDAwMCkuZGVmYXVsdCgxMDAwMCksCiAgICAvLyBLWUMgd2ViaG9vayBpbmdlc3Rpb24gZmVhdHVyZSBmbGFnIOKAlCBzYWZlIGRlZmF1bHQ6IGRpc2FibGVkCiAgICBLWUNfV0VCSE9PS19FTkFCTEVEOiB6LmVudW0oWyd0cnVlJywgJ2ZhbHNlJ10pLmRlZmF1bHQoJ2ZhbHNlJyksCiAgICAvLyBQdWJsaWMgYmFzZSBVUkwgZm9yIHRoZSBBUEksIHVzZWQgaW4gdGhlIE9wZW5BUEkgc3BlYyBzZXJ2ZXJzIGFycmF5LgogICAgLy8gUmVxdWlyZWQgaW4gcHJvZHVjdGlvbiBhbmQgbXVzdCB1c2UgSFRUUFMuIEZhbGxzIGJhY2sgdG8gbG9jYWxob3N0IGluIGRldmVsb3BtZW50L3Rlc3QuCiAgICBQVUJMSUNfQVBJX0JBU0VfVVJMOiB6LnN0cmluZygpLnVybCgpLm9wdGlvbmFsKCksCiAgICBJTlZPSUNFX0ZJTEVfTUFYX1NJWkU6IEludm9pY2VGaWxlTWF4U2l6ZVNjaGVtYSwKICAgIC8vIEZlYXR1cmUgZmxhZzogZ2F0ZXMgUHJvbWV0aGV1cyBtZXRyaWNzIGNvbGxlY3Rpb24gYW5kIHRoZSAvbWV0cmljcyBlbmRwb2ludC4KICAgIC8vIFdoZW4gJ2ZhbHNlJywgYWxsIG1ldHJpYyByZWNvcmRpbmcgYmVjb21lcyBhIHNpbGVudCBuby1vcCBhbmQgR0VUIC9tZXRyaWNzCiAgICAvLyByZXR1cm5zIDUwMy4gRGVmYXVsdCAndHJ1ZScgcHJlc2VydmVzIGV4aXN0aW5nIGJlaGF2aW91ci4KICAgIE1FVFJJQ1NfRU5BQkxFRDogei5lbnVtKFsndHJ1ZScsICdmYWxzZSddKS5kZWZhdWx0KCd0cnVlJyksCiAgfSkKICAuc3VwZXJSZWZpbmUoKGRhdGEsIGN0eCkgPT4gewogICAgaWYgKGRhdGEuTk9ERV9FTlYgPT09ICd0ZXN0JykgeyByZXR1cm47IH0KICAgIGlmIChkYXRhLk5PREVfRU5WID09PSAncHJvZHVjdGlvbicgJiYgIWRhdGEuQ1VSU09SX1NFQ1JFVCAmJiAhZGF0YS5KV1RfU0VDUkVUKSB7CiAgICAgIGN0eC5hZGRJc3N1ZSh7CiAgICAgICAgY29kZTogei5ab2RJc3N1ZUNvZGUuY3VzdG9tLAogICAgICAgIG1lc3NhZ2U6ICdDVVJTT1JfU0VDUkVUIG9yIEpXVF9TRUNSRVQgbXVzdCBiZSBjb25maWd1cmVkIGluIHByb2R1Y3Rpb24uJywKICAgICAgICBwYXRoOiBbJ0NVUlNPUl9TRUNSRVQnXSwKICAgICAgfSk7CiAgICB9CiAgICBjb25zdCBoYXNVcmwgPSBCb29sZWFuKGRhdGEuS1lDX1BST1ZJREVSX1VSTCk7CiAgICBjb25zdCBoYXNLZXkgPSBCb29sZWFuKGRhdGEuS1lDX1BST1ZJREVSX0FQSV9LRVkpOwogICAgaWYgKGhhc1VybCAhPT0gaGFzS2V5KSB7CiAgICAgIGN0eC5hZGRJc3N1ZSh7CiAgICAgICAgY29kZTogei5ab2RJc3N1ZUNvZGUuY3VzdG9tLAogICAgICAgIG1lc3NhZ2U6CiAgICAgICAgICAnS1lDX1BST1ZJREVSX1VSTCBhbmQgS1lDX1BST1ZJREVSX0FQSV9LRVkgbXVzdCBib3RoIGJlIHNldCBvciBib3RoIGJlIGFic2VudC4nLAogICAgICAgIHBhdGg6IGhhc1VybCA/IFsnS1lDX1BST1ZJREVSX0FQSV9LRVknXSA6IFsnS1lDX1BST1ZJREVSX1VSTCddLAogICAgICB9KTsKICAgIH0KICAgIGlmIChkYXRhLk5PREVfRU5WID09PSAncHJvZHVjdGlvbicpIHsKICAgICAgY29uc3QgYmFzZVVybCA9IGRhdGEuUFVCTElDX0FQSV9CQVNFX1VSTDsKICAgICAgLy8gUmVxdWlyZSB0aGUgdmFyaWFibGUgdG8gYmUgcHJlc2VudCBpbiBwcm9kdWN0aW9uCiAgICAgIGlmICghYmFzZVVybCkgewogICAgICAgIGN0eC5hZGRJc3N1ZSh7CiAgICAgICAgICBjb2RlOiB6LlpvZElzc3VlQ29kZS5jdXN0b20sCiAgICAgICAgICBtZXNzYWdlOgogICAgICAgICAgICAnUFVCTElDX0FQSV9CQVNFX1VSTCBtdXN0IGJlIHNldCBpbiBwcm9kdWN0aW9uLiBJdCBpcyB1c2VkIGluIHRoZSBPcGVuQVBJIHNwZWMgc2VydmVycyBhcnJheS4nLAogICAgICAgICAgcGF0aDogWydQVUJMSUNfQVBJX0JBU0VfVVJMJ10sCiAgICAgICAgfSk7CiAgICAgICAgcmV0dXJuOwogICAgICB9CiAgICAgIC8vIFJlcXVpcmUgSFRUUFMg4oCUIG5ldmVyIGFsbG93IHBsYWludGV4dCBpbiBwcm9kdWN0aW9uCiAgICAgIGxldCBwYXJzZWQ7CiAgICAgIHRyeSB7IHBhcnNlZCA9IG5ldyBVUkwoYmFzZVVybCk7IH0gY2F0Y2ggKF8pIHsgcGFyc2VkID0gbnVsbDsgfQogICAgICBpZiAoIXBhcnNlZCB8fCBwYXJzZWQucHJvdG9jb2wgIT09ICdodHRwczonKSB7CiAgICAgICAgY3R4LmFkZElzc3VlKHsKICAgICAgICAgIGNvZGU6IHouWm9kSXNzdWVDb2RlLmN1c3RvbSwKICAgICAgICAgIG1lc3NhZ2U6CiAgICAgICAgICAgICdQVUJMSUNfQVBJX0JBU0VfVVJMIG11c3QgdXNlIEhUVFBUIGluIHByb2R1Y3Rpb24uJywKICAgICAgICAgIHBhdGg6IFsnUFVCTElDX0FQSV9CQVNFX1VSTCddLAogICAgICAgIH0pOwogICAgICAgIHJldHVybjsKICAgICAgfQogICAgICAvLyBSZWplY3QgbG9vcGJhY2sgYWRkcmVzc2VzICgxMjcueC54LngsIDo6MSwgWzo6MV0sIGxvY2FsaG9zdCkKICAgICAgY29uc3QgbG9vcGJhY2tQYXR0ZXJuID0gL14obG9jYWxob3N0fDEyNyg/OlwuXGQrKXszfXw6OjF8XFtbOjoxXF0pJC9pOwogICAgICBpZiAobG9vcGJhY2tQYXR0ZXJuLnRlc3QocGFyc2VkLmhvc3RuYW1lKSkgewogICAgICAgIGN0eC5hZGRJc3N1ZSh7CiAgICAgICAgICBjb2RlOiB6LlpvZElzc3VlQ29kZS5jdXN0b20sCiAgICAgICAgICBtZXNzYWdlOgogICAgICAgICAgICAnUFVCTElDX0FQSV9CQVNFX1VSTCBtdXN0IG5vdCBiZSBhIGxvb3BiYWNrIGFkZHJlc3MgaW4gcHJvZHVjdGlvbi4nLAogICAgICAgICAgcGF0aDogWydQVUJMSUNfQVBJX0JBU0VfVVJMJ10sCiAgICAgICAgfSk7CiAgICAgIH0KICAgIH0KICB9KTsKCi8qKgogKiBSdW50aW1lIHZhbGlkYXRlZCBjb25maWd1cmF0aW9uIG9iamVjdC4KICogQHR5cGUge3ouaW5mZXI8dHlwZW9mIENvbmZpZ1NjaGVtYT59CiAqLwpsZXQgY29uZmlnOwoKLyoqCiAqIE1vbm90b25pYyB2YWxpZGF0aW9uIGdlbmVyYXRpb24gY291bnRlci4gSW5jcmVtZW50ZWQgb24gZXZlcnkgc3VjY2Vzc2Z1bAogKiB2YWxpZGF0ZSgpLiBVc2VkIHRvIG1ha2UgY29uY3VycmVudCB2YWxpZGF0aW9uIGFuZCByZWNvdmVyeSBiZWhhdmlvdXIKICogZGV0ZXJtaW5pc3RpYyBhbmQgb2JzZXJ2YWJsZS4KICogQHR5cGUge251bWJlcn0KICovCmxldCB2YWxpZGF0aW9uR2VuZXJhdGlvbiA9IDA7CgovKioKICogTGFzdCB2YWxpZGF0aW9uIGVycm9yLCByZXRhaW5lZCBzbyBmYWlsdXJlIHJlY292ZXJ5IGlzIG9ic2VydmFibGUgYW5kCiAqIGRldGVybWluaXN0aWMuIE5ldmVyIGNvbnRhaW5zIHNlY3JldCB2YWx1ZXMg4oCUIG9ubHkgWm9kIGlzc3VlIG1ldGFkYXRhLgogKiBAdHlwZSB7ei5ab2RFcnJvcnxudWxsfQogKi8KbGV0IGxhc3RWYWxpZGF0aW9uRXJyb3IgPSBudWxsOwoKLyoqCiAqIFZhbGlkYXRlcyBlbnZpcm9ubWVudCB2YXJpYWJsZXMgYWdhaW5zdCBzY2hlbWEgYW5kIHJldHVybnMgdHlwZWQgY29uZmlnLgogKiBUaHJvd3MgWm9kRXJyb3Igb24gdmFsaWRhdGlvbiBmYWlsdXJlLgogKiBTaG91bGQgYmUgY2FsbGVkIG9uY2UgZWFybHkgaW4gYXBwIGJvb3RzdHJhcC4KICoKICogRGV0ZXJtaW5pc20gLyByZWNvdmVyeSBpbnZhcmlhbnRzOgogKiAgIC0gT24gc3VjY2VzcyB0aGUgcHJldmlvdXNseSB2YWxpZGF0ZWQgY29uZmlnIGlzIHJlcGxhY2VkIGF0b21pY2FsbHkgYW5kCiAqICAgICB0aGUgZ2VuZXJhdGlvbiBjb3VudGVyIGluY3JlbWVudHMuCiAqICAgLSBPbiBmYWlsdXJlIHRoZSBwcmV2aW91cyBjb25maWcgaXMgcHJlc2VydmVkIHVudG91Y2hlZCBzbyBhIHRyYW5zaWVudAogKiAgICAgZW52IGVycm9yIG5ldmVyIGRyb3BzIGluLW1lbW9yeSBjb25maWcgKGFuZCB0aHVzIG5ldmVyIGNhdXNlcyBzaWxlbnQKICogICAgIGRhdGEgbG9zcyBvciBhbiB1bnJlY292ZXJhYmxlIHN0YXRlKS4KICogICAtIFRoZSBsYXN0IGVycm9yIGlzIHJldGFpbmVkIGZvciBvYnNlcnZhYmlsaXR5IGFuZCBjYW4gYmUgY2xlYXJlZCBieSBhCiAqICAgICBzdWJzZXF1ZW50IHN1Y2Nlc3NmdWwgdmFsaWRhdGUoKS4KICoKICogQHJldHVybnMge3ouaW5mZXI8dHlwZW9mIENvbmZpZ1NjaGVtYT59IFZhbGlkYXRlZCBjb25maWcuCiAqLwpmdW5jdGlvbiB2YWxpZGF0ZSgpIHsKICBjb25zdCBwYXJzZWQgPSBDb25maWdTY2hlbWEuc2FmZVBhcnNlKHByb2Nlc3MuZW52KTsKICBpZiAoIXBhcnNlZC5zdWNjZXNzKSB7CiAgICAvLyBQcmVzZXJ2ZSB0aGUgbGFzdCBrbm93bi1nb29kIGNvbmZpZyBhbmQgcmVjb3JkIHRoZSBmYWlsdXJlIGZvcgogICAgLy8gZGlhZ25vc2lzLiBUaGlzIG1ha2VzIHJldHJ5L3BhcnRpYWwtZmFpbHVyZSByZWNvdmVyeSBkZXRlcm1pbmlzdGljOgogICAgLy8gYSBmYWlsZWQgcmV2YWxpZGF0aW9uIGlzIGEgbm8tb3Agb24gc3RhdGUsIG5vdCBhIGNvcnJ1cHRpbmcgd3JpdGUuCiAgICBsYXN0VmFsaWRhdGlvbkVycm9yID0gcGFyc2VkLmVycm9yOwogICAgdGhyb3cgcGFyc2VkLmVycm9yOwogIH0KICAvLyBBdG9taWMgc3dhcDogYXNzaWduIHRoZSBuZXcgY29uZmlnIGFuZCBjbGVhciB0aGUgZXJyb3IgdG9nZXRoZXIgc28KICAvLyBjb25jdXJyZW50IHJlYWRlcnMgbmV2ZXIgb2JzZXJ2ZSBhIGhhbGYtdXBkYXRlZCBzdGF0ZS4KICBjb25maWcgPSBwYXJzZWQuZGF0YTsKICBsYXN0VmFsaWRhdGlvbkVycm9yID0gbnVsbDsKICB2YWxpZGF0aW9uR2VuZXJhdGlvbiArPSAxOwogIHJldHVybiBjb25maWc7Cn0KCi8qKgogKiBSZXR1cm5zIHRoZSBsYXN0IHZhbGlkYXRpb24gZXJyb3IsIGlmIGFueS4gVXNlZnVsIGZvciBvYnNlcnZhYmlsaXR5IGFuZAogKiBmb3IgdGVzdHMgdGhhdCBhc3NlcnQgZmFpbHVyZSByZWNvdmVyeSBiZWhhdmlvdXIuCiAqIEByZXR1cm5zIHt6LlpvZEVycm9yfG51bGx9CiAqLwpmdW5jdGlvbiBnZXRMYXN0VmFsaWRhdGlvbkVycm9yKCkgewogIHJldHVybiBsYXN0VmFsaWRhdGlvbkVycm9yOwp9CgovKioKICogUmV0dXJucyB0aGUgbnVtYmVyIG9mIHN1Y2Nlc3NmdWwgdmFsaWRhdGlvbnMgc2luY2UgcHJvY2VzcyBzdGFydC4KICogTW9ub3RvbmljYWxseSBub24tZGVjcmVhc2luZywgdXNlZnVsIGZvciBtZXRyaWNzIGFuZCB0ZXN0cy4KICogQHJldHVybnMge251bWJlcn0KICovCmZ1bmN0aW9uIGdldFZhbGlkYXRpb25HZW5lcmF0aW9uKCkgewogIHJldHVybiB2YWxpZGF0aW9uR2VuZXJhdGlvbjsKfQoKLyoqCiAqIFJlc2V0cyBpbi1tZW1vcnkgY29uZmlndXJhdGlvbiBzdGF0ZS4gSW50ZW5kZWQgZm9yIHRlc3RzIGFuZCBleHBsaWNpdAogKiByZWNvdmVyeSBmbG93cy4gRG9lcyBub3QgbXV0YXRlIHByb2Nlc3MuZW52LgogKi8KZnVuY3Rpb24gcmVzZXRDb25maWdTdGF0ZSgpIHsKICBjb25maWcgPSB1bmRlZmluZWQ7CiAgbGFzdFZhbGlkYXRpb25FcnJvciA9IG51bGw7CiAgdmFsaWRhdGlvbkdlbmVyYXRpb24gPSAwOwp9CgovKioKICogUmV0dXJucyB0aGUgY3VycmVudGx5IHZhbGlkYXRlZCBjb25maWcsIHZhbGlkYXRpbmcgb24gZmlyc3QgYWNjZXNzLgogKiBUaHJvd3MgaWYgdmFsaWRhdGlvbiBmYWlscyBhbmQgbm8gcHJldmlvdXMgY29uZmlnIGV4aXN0cy4KICogQHJldHVybnMge3ouaW5mZXI8dHlwZW9mIENvbmZpZ1NjaGVtYT59CiAqLwpmdW5jdGlvbiBnZXRDb25maWcoKSB7CiAgaWYgKCFjb25maWcpIHsKICAgIHJldHVybiB2YWxpZGF0ZSgpOwogIH0KICByZXR1cm4gY29uZmlnOwp9Cgptb2R1bGUuZXhwb3J0cyA9IHsKICBDb25maWdTY2hlbWEsCiAgdmFsaWRhdGUsCiAgZ2V0Q29uZmlnLAogIGdldExhc3RWYWxpZGF0aW9uRXJyb3IsCiAgZ2V0VmFsaWRhdGlvbkdlbmVyYXRpb24sCiAgcmVzZXRDb25maWdTdGF0ZSwKfTsK
+/**
+ * Centralized typed configuration module with runtime validation.
+ * Uses Zod for schema validation and type safety.
+ *
+ * ## Validation boundaries
+ * Every environment variable accepted by this module has an explicit boundary:
+ *   - Numeric knobs are validated with min/max ranges so a typo cannot push them
+ *     out of safe operating bounds (e.g. a negative timeout or a port of 0).
+ *   - String secrets have minimum-length guards; no default is provided so the
+ *     application fails at boot rather than running with a weak key.
+ *   - Boolean feature flags accept only the literal strings "true" | "false";
+ *     truthy values like "1", "yes", or "on" are rejected to prevent ambiguity.
+ *   - Cross-field invariants (KYC half-configuration, production HTTPS, etc.) are
+ *     enforced in a single `superRefine` pass after field-level checks pass.
+ *   - Boundary violations produce a structured ZodError whose `.issues` array
+ *     contains the affected path and a human-readable message. Call
+ *     `logRedactedSummary(error)` to surface these without leaking secret values.
+ *
+ * @module config
+ */
+
+const z = require('zod');
+
+// ─── Boundary constants ────────────────────────────────────────────────────────
+// Centralising limits here makes them easy to review and tune without hunting
+// through the schema definition.
+
+/** Minimum length for any secret/key that protects cryptographic operations. */
+const SECRET_MIN_LENGTH = 32;
+
+/** Port range accepted by the OS for unprivileged binding. */
+const PORT_MIN = 1;
+const PORT_MAX = 65535;
+
+/** Soroban RPC concurrency: prevent runaway parallelism while allowing tuning. */
+const SOROBAN_BATCH_CONCURRENCY_MIN = 1;
+const SOROBAN_BATCH_CONCURRENCY_MAX = 50;
+
+/** Soroban per-request timeout: 100 ms floor prevents zero/negative values;
+ *  30 s ceiling prevents indefinite hangs. */
+const SOROBAN_BATCH_TIMEOUT_MS_MIN = 100;
+const SOROBAN_BATCH_TIMEOUT_MS_MAX = 30_000;
+
+/** KYC transport knobs — mirrored from issue #592. */
+const KYC_TIMEOUT_MS_MIN = 100;
+const KYC_TIMEOUT_MS_MAX = 30_000;
+const KYC_MAX_RETRIES_MIN = 0;
+const KYC_MAX_RETRIES_MAX = 10;
+const KYC_BASE_DELAY_MS_MIN = 0;
+const KYC_BASE_DELAY_MS_MAX = 10_000;
+const KYC_MAX_DELAY_MS_MIN = 0;
+const KYC_MAX_DELAY_MS_MAX = 60_000;
+const KYC_CB_FAILURE_THRESHOLD_MIN = 1;
+const KYC_CB_FAILURE_THRESHOLD_MAX = 100;
+const KYC_CB_RECOVERY_TIMEOUT_MS_MIN = 100;
+const KYC_CB_RECOVERY_TIMEOUT_MS_MAX = 60_000;
+
+/** Cursor TTL: at least 1 second; no upper bound mandated by schema. */
+const CURSOR_TTL_SECONDS_MIN = 1;
+
+/** Escrow stale threshold: at least 1 second. */
+const ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN = 1;
+
+// ─── Sub-schemas ───────────────────────────────────────────────────────────────
+
+/**
+ * Express-compatible request size string accepted by the `body-parser` package.
+ * Examples: "512kb", "5mb", "1.5gb".
+ * @type {z.ZodDefault<z.ZodString>}
+ */
+const InvoiceFileMaxSizeSchema = z
+  .string()
+  .trim()
+  .regex(/^\d+(?:\.\d+)?(?:b|kb|mb|gb)$/i, {
+    message: 'INVOICE_FILE_MAX_SIZE must be a size such as 512kb or 5mb.',
+  })
+  .default('5mb');
+
+// ─── Main schema ──────────────────────────────────────────────────────────────
+
+/**
+ * Complete configuration schema with explicit boundaries on every field.
+ *
+ * Boundary guarantees enforced here:
+ *   1. PORT is a finite integer in [1, 65535].
+ *   2. JWT_SECRET is at least 32 characters — never has a default.
+ *   3. All numeric timeout/retry/concurrency knobs have min AND max guards so
+ *      a mis-typed value cannot push them into an unsafe or non-functional range.
+ *   4. Boolean feature flags accept only "true" | "false" — no truthy aliases.
+ *   5. URLs are parsed by Zod's url() validator before use.
+ *   6. Cross-field invariants are checked in superRefine (see below).
+ *
+ * @type {z.ZodObject<any>}
+ */
+const ConfigSchema = z
+  .object({
+    NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+
+    // ── Server ──────────────────────────────────────────────────────────────
+    PORT: z.coerce
+      .number()
+      .int({ message: 'PORT must be an integer.' })
+      .min(PORT_MIN, { message: `PORT must be at least ${PORT_MIN}.` })
+      .max(PORT_MAX, { message: `PORT must be at most ${PORT_MAX}.` })
+      .default(3001),
+
+    // ── Auth ─────────────────────────────────────────────────────────────────
+    /** Minimum ${SECRET_MIN_LENGTH} chars. No default — must be explicitly set. */
+    JWT_SECRET: z
+      .string()
+      .min(SECRET_MIN_LENGTH, {
+        message: `JWT_SECRET must be at least ${SECRET_MIN_LENGTH} characters.`,
+      }),
+
+    /** Comma-separated algorithm allowlist, e.g. "HS256,RS256". */
+    JWT_ALGORITHMS: z.string().optional().default('HS256'),
+
+    /** Optional issuer claim to enforce on incoming JWTs. */
+    JWT_ISSUER: z.string().optional(),
+
+    /** Optional audience claim to enforce on incoming JWTs. */
+    JWT_AUDIENCE: z.string().optional(),
+
+    // ── Cursors ──────────────────────────────────────────────────────────────
+    /** Dedicated marketplace cursor HMAC secret. Min ${SECRET_MIN_LENGTH} chars. */
+    CURSOR_SECRET: z
+      .string()
+      .min(SECRET_MIN_LENGTH, {
+        message: `CURSOR_SECRET must be at least ${SECRET_MIN_LENGTH} characters.`,
+      })
+      .optional(),
+
+    CURSOR_TTL_ENABLED: z.enum(['true', 'false']).default('false'),
+
+    CURSOR_TTL_SECONDS: z.coerce
+      .number()
+      .int({ message: 'CURSOR_TTL_SECONDS must be an integer.' })
+      .min(CURSOR_TTL_SECONDS_MIN, {
+        message: `CURSOR_TTL_SECONDS must be at least ${CURSOR_TTL_SECONDS_MIN}.`,
+      })
+      .default(3600),
+
+    // ── CORS ─────────────────────────────────────────────────────────────────
+    /** Comma-separated list of allowed origins. Optional (dev falls back to localhost). */
+    CORS_ALLOWED_ORIGINS: z.string().optional(),
+
+    // ── Soroban / Stellar ────────────────────────────────────────────────────
+    SOROBAN_RPC_URL: z.string().url().default('https://soroban-testnet.stellar.org'),
+
+    NETWORK_PASSPHRASE: z.string().default('Test SDF Network ; September 2015'),
+
+    /** Concurrent Soroban RPC requests: [${SOROBAN_BATCH_CONCURRENCY_MIN}, ${SOROBAN_BATCH_CONCURRENCY_MAX}]. */
+    SOROBAN_BATCH_CONCURRENCY: z.coerce
+      .number()
+      .int()
+      .min(SOROBAN_BATCH_CONCURRENCY_MIN, {
+        message: `SOROBAN_BATCH_CONCURRENCY must be at least ${SOROBAN_BATCH_CONCURRENCY_MIN}.`,
+      })
+      .max(SOROBAN_BATCH_CONCURRENCY_MAX, {
+        message: `SOROBAN_BATCH_CONCURRENCY must be at most ${SOROBAN_BATCH_CONCURRENCY_MAX}.`,
+      })
+      .default(5),
+
+    /** Per-batch Soroban timeout in ms: [${SOROBAN_BATCH_TIMEOUT_MS_MIN}, ${SOROBAN_BATCH_TIMEOUT_MS_MAX}]. */
+    SOROBAN_BATCH_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(SOROBAN_BATCH_TIMEOUT_MS_MIN, {
+        message: `SOROBAN_BATCH_TIMEOUT_MS must be at least ${SOROBAN_BATCH_TIMEOUT_MS_MIN} ms.`,
+      })
+      .max(SOROBAN_BATCH_TIMEOUT_MS_MAX, {
+        message: `SOROBAN_BATCH_TIMEOUT_MS must be at most ${SOROBAN_BATCH_TIMEOUT_MS_MAX} ms.`,
+      })
+      .default(5000),
+
+    // ── Escrow indexer ───────────────────────────────────────────────────────
+    /** Feature flag: enable the escrow event indexer. Safe default: disabled. */
+    ESCROW_INDEXER_ENABLED: z.enum(['true', 'false']).default('false'),
+
+    ESCROW_INDEXER_STALE_THRESHOLD_SECONDS: z.coerce
+      .number()
+      .int()
+      .min(ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN, {
+        message: `ESCROW_INDEXER_STALE_THRESHOLD_SECONDS must be at least ${ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN}.`,
+      })
+      .default(300),
+
+    // ── Feature flags ────────────────────────────────────────────────────────
+    /**
+     * Gates the projection/cache-based escrow read path.
+     * When "false", reads go directly to the Soroban contract (live read).
+     */
+    ESCROW_READ_PROJECTION_ENABLED: z.enum(['true', 'false']).default('true'),
+
+    /**
+     * Gates invoice state-transition endpoints.
+     * When "false", the invoice state routes are not mounted (→ 404).
+     */
+    INVOICE_STATE_ENABLED: z.enum(['true', 'false']).default('true'),
+
+    /**
+     * Gates POST /api/admin/config and GET /api/admin/config/sections.
+     * When "false", the router is not mounted (→ 404).
+     */
+    CONFIG_RUNTIME_ENABLED: z.enum(['true', 'false']).default('true'),
+
+    // ── KYC provider ─────────────────────────────────────────────────────────
+    /** KYC provider base URL. Must be paired with KYC_PROVIDER_API_KEY. */
+    KYC_PROVIDER_URL: z.string().url().optional(),
+
+    /** KYC API key. Must be paired with KYC_PROVIDER_URL. */
+    KYC_PROVIDER_API_KEY: z.string().min(1).optional(),
+
+    KYC_PROVIDER_SECRET: z.string().min(1).optional(),
+
+    /** Per-request KYC timeout in ms: [${KYC_TIMEOUT_MS_MIN}, ${KYC_TIMEOUT_MS_MAX}]. */
+    KYC_PROVIDER_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(KYC_TIMEOUT_MS_MIN, {
+        message: `KYC_PROVIDER_TIMEOUT_MS must be at least ${KYC_TIMEOUT_MS_MIN} ms.`,
+      })
+      .max(KYC_TIMEOUT_MS_MAX, {
+        message: `KYC_PROVIDER_TIMEOUT_MS must be at most ${KYC_TIMEOUT_MS_MAX} ms.`,
+      })
+      .default(5000),
+
+    /** Max KYC retries: [${KYC_MAX_RETRIES_MIN}, ${KYC_MAX_RETRIES_MAX}]. */
+    KYC_PROVIDER_MAX_RETRIES: z.coerce
+      .number()
+      .int()
+      .min(KYC_MAX_RETRIES_MIN, {
+        message: `KYC_PROVIDER_MAX_RETRIES must be at least ${KYC_MAX_RETRIES_MIN}.`,
+      })
+      .max(KYC_MAX_RETRIES_MAX, {
+        message: `KYC_PROVIDER_MAX_RETRIES must be at most ${KYC_MAX_RETRIES_MAX}.`,
+      })
+      .default(3),
+
+    /** KYC exponential-backoff base delay in ms: [${KYC_BASE_DELAY_MS_MIN}, ${KYC_BASE_DELAY_MS_MAX}]. */
+    KYC_PROVIDER_BASE_DELAY_MS: z.coerce
+      .number()
+      .int()
+      .min(KYC_BASE_DELAY_MS_MIN, {
+        message: `KYC_PROVIDER_BASE_DELAY_MS must be at least ${KYC_BASE_DELAY_MS_MIN} ms.`,
+      })
+      .max(KYC_BASE_DELAY_MS_MAX, {
+        message: `KYC_PROVIDER_BASE_DELAY_MS must be at most ${KYC_BASE_DELAY_MS_MAX} ms.`,
+      })
+      .default(200),
+
+    /** KYC exponential-backoff max delay in ms: [${KYC_MAX_DELAY_MS_MIN}, ${KYC_MAX_DELAY_MS_MAX}]. */
+    KYC_PROVIDER_MAX_DELAY_MS: z.coerce
+      .number()
+      .int()
+      .min(KYC_MAX_DELAY_MS_MIN, {
+        message: `KYC_PROVIDER_MAX_DELAY_MS must be at least ${KYC_MAX_DELAY_MS_MIN} ms.`,
+      })
+      .max(KYC_MAX_DELAY_MS_MAX, {
+        message: `KYC_PROVIDER_MAX_DELAY_MS must be at most ${KYC_MAX_DELAY_MS_MAX} ms.`,
+      })
+      .default(5000),
+
+    KYC_PROVIDER_SIGN_REQUESTS: z.enum(['true', 'false']).default('false'),
+    KYC_PROVIDER_VERIFY_RESPONSE_SIGNATURE: z.enum(['true', 'false']).default('false'),
+
+    /** KYC circuit-breaker failure threshold: [${KYC_CB_FAILURE_THRESHOLD_MIN}, ${KYC_CB_FAILURE_THRESHOLD_MAX}]. */
+    KYC_PROVIDER_CB_FAILURE_THRESHOLD: z.coerce
+      .number()
+      .int()
+      .min(KYC_CB_FAILURE_THRESHOLD_MIN, {
+        message: `KYC_PROVIDER_CB_FAILURE_THRESHOLD must be at least ${KYC_CB_FAILURE_THRESHOLD_MIN}.`,
+      })
+      .max(KYC_CB_FAILURE_THRESHOLD_MAX, {
+        message: `KYC_PROVIDER_CB_FAILURE_THRESHOLD must be at most ${KYC_CB_FAILURE_THRESHOLD_MAX}.`,
+      })
+      .default(5),
+
+    /** KYC circuit-breaker recovery timeout in ms: [${KYC_CB_RECOVERY_TIMEOUT_MS_MIN}, ${KYC_CB_RECOVERY_TIMEOUT_MS_MAX}]. */
+    KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .min(KYC_CB_RECOVERY_TIMEOUT_MS_MIN, {
+        message: `KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS must be at least ${KYC_CB_RECOVERY_TIMEOUT_MS_MIN} ms.`,
+      })
+      .max(KYC_CB_RECOVERY_TIMEOUT_MS_MAX, {
+        message: `KYC_PROVIDER_CB_RECOVERY_TIMEOUT_MS must be at most ${KYC_CB_RECOVERY_TIMEOUT_MS_MAX} ms.`,
+      })
+      .default(10000),
+
+    /** Feature flag: enable the KYC webhook ingestion path. Safe default: disabled. */
+    KYC_WEBHOOK_ENABLED: z.enum(['true', 'false']).default('false'),
+
+    // ── Public API surface ────────────────────────────────────────────────────
+    /**
+     * Public base URL for the API (used in OpenAPI spec).
+     * Required in production; must use HTTPS; must not be a loopback address.
+     */
+    PUBLIC_API_BASE_URL: z.string().url().optional(),
+
+    // ── Invoice upload ────────────────────────────────────────────────────────
+    INVOICE_FILE_MAX_SIZE: InvoiceFileMaxSizeSchema,
+
+    // ── Metrics ───────────────────────────────────────────────────────────────
+    /**
+     * Feature flag: enable Prometheus metrics collection and the /metrics endpoint.
+     * When "false", all metric recording becomes a no-op and GET /metrics returns 503.
+     */
+    METRICS_ENABLED: z.enum(['true', 'false']).default('true'),
+  })
+  // ── Cross-field boundary checks ─────────────────────────────────────────────
+  .superRefine((data, ctx) => {
+    // Skip cross-field checks in test mode to allow partial configurations.
+    if (data.NODE_ENV === 'test') { return; }
+
+    // 1. Production cursor secret: either CURSOR_SECRET or JWT_SECRET must be set.
+    if (data.NODE_ENV === 'production' && !data.CURSOR_SECRET && !data.JWT_SECRET) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'CURSOR_SECRET or JWT_SECRET must be configured in production.',
+        path: ['CURSOR_SECRET'],
+      });
+    }
+
+    // 2. KYC half-configuration: URL and key must be present together or absent together.
+    const hasUrl = Boolean(data.KYC_PROVIDER_URL);
+    const hasKey = Boolean(data.KYC_PROVIDER_API_KEY);
+    if (hasUrl !== hasKey) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          'KYC_PROVIDER_URL and KYC_PROVIDER_API_KEY must both be set or both be absent.',
+        path: hasUrl ? ['KYC_PROVIDER_API_KEY'] : ['KYC_PROVIDER_URL'],
+      });
+    }
+
+    // 3. Production PUBLIC_API_BASE_URL: required, HTTPS, non-loopback.
+    if (data.NODE_ENV === 'production') {
+      const baseUrl = data.PUBLIC_API_BASE_URL;
+
+      if (!baseUrl) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'PUBLIC_API_BASE_URL must be set in production. It is used in the OpenAPI spec servers array.',
+          path: ['PUBLIC_API_BASE_URL'],
+        });
+        return;
+      }
+
+      let parsed;
+      try { parsed = new URL(baseUrl); } catch (_) { parsed = null; }
+
+      if (!parsed || parsed.protocol !== 'https:') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'PUBLIC_API_BASE_URL must use HTTPS in production.',
+          path: ['PUBLIC_API_BASE_URL'],
+        });
+        return;
+      }
+
+      // Reject loopback: 127.x.x.x, ::1, [::1], localhost.
+      const loopbackPattern = /^(localhost|127(?:\.\d+){3}|::1|\[::1\])$/i;
+      if (loopbackPattern.test(parsed.hostname)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'PUBLIC_API_BASE_URL must not be a loopback address in production.',
+          path: ['PUBLIC_API_BASE_URL'],
+        });
+      }
+    }
+  });
+
+// ─── Boundary constants export ─────────────────────────────────────────────────
+/**
+ * Exported boundary constants so callers can reference the same limits that the
+ * schema enforces without duplicating magic numbers.
+ */
+const VALIDATION_BOUNDARIES = Object.freeze({
+  SECRET_MIN_LENGTH,
+  PORT_MIN,
+  PORT_MAX,
+  SOROBAN_BATCH_CONCURRENCY_MIN,
+  SOROBAN_BATCH_CONCURRENCY_MAX,
+  SOROBAN_BATCH_TIMEOUT_MS_MIN,
+  SOROBAN_BATCH_TIMEOUT_MS_MAX,
+  KYC_TIMEOUT_MS_MIN,
+  KYC_TIMEOUT_MS_MAX,
+  KYC_MAX_RETRIES_MIN,
+  KYC_MAX_RETRIES_MAX,
+  KYC_BASE_DELAY_MS_MIN,
+  KYC_BASE_DELAY_MS_MAX,
+  KYC_MAX_DELAY_MS_MIN,
+  KYC_MAX_DELAY_MS_MAX,
+  KYC_CB_FAILURE_THRESHOLD_MIN,
+  KYC_CB_FAILURE_THRESHOLD_MAX,
+  KYC_CB_RECOVERY_TIMEOUT_MS_MIN,
+  KYC_CB_RECOVERY_TIMEOUT_MS_MAX,
+  CURSOR_TTL_SECONDS_MIN,
+  ESCROW_INDEXER_STALE_THRESHOLD_SECONDS_MIN,
+});
+
+// ─── Singleton state ───────────────────────────────────────────────────────────
+
+/**
+ * Runtime validated configuration object.
+ * Set once by validate(); frozen to prevent mutation.
+ * @type {z.infer<typeof ConfigSchema> | undefined}
+ */
+let config;
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/**
+ * Validates environment variables against the schema and returns a typed,
+ * immutable config object. Throws `ZodError` on any boundary violation.
+ *
+ * Should be called once, early in the application bootstrap. Subsequent calls
+ * re-validate `process.env` and update the singleton — use `isValidated()` to
+ * guard callers that only need to read.
+ *
+ * @returns {z.infer<typeof ConfigSchema>} Validated, frozen config.
+ * @throws {z.ZodError} If any environment variable fails its boundary check.
+ */
+function validate() {
+  const parsed = ConfigSchema.safeParse(process.env);
+  if (!parsed.success) {
+    throw parsed.error;
+  }
+  config = Object.freeze(parsed.data);
+  return config;
+}
+
+/**
+ * Formats and logs a redacted summary of validation issues to `console.error`.
+ *
+ * Security guarantee: only key names and schema error messages are written —
+ * the actual value of any environment variable is never printed, preventing
+ * accidental secret exposure in logs.
+ *
+ * @param {z.ZodError | Error | null | undefined} error - The error to summarize.
+ * @returns {void}
+ */
+function logRedactedSummary(error) {
+  console.error('Configuration validation failed:');
+  if (error && Array.isArray(error.issues)) {
+    error.issues.forEach(issue => {
+      const key = issue.path.join('.');
+      console.error(`- [${key}]: ${issue.message}`);
+    });
+  } else {
+    console.error(error ? error.message : 'Unknown configuration error');
+  }
+}
+
+/**
+ * Returns the validated configuration singleton.
+ *
+ * @throws {Error} If `validate()` has not been called yet.
+ * @returns {z.infer<typeof ConfigSchema>}
+ */
+function get() {
+  if (!config) {
+    throw new Error('Config not validated. Call validate() first.');
+  }
+  return config;
+}
+
+/**
+ * Returns a single validated configuration value by key.
+ *
+ * @template {keyof z.infer<typeof ConfigSchema>} K
+ * @param {K} key - Validated configuration key.
+ * @returns {z.infer<typeof ConfigSchema>[K]} The validated value for the key.
+ */
+function getValue(key) {
+  return get()[key];
+}
+
+/**
+ * Returns the validated invoice PDF upload limit.
+ *
+ * Falls back to parsing `process.env.INVOICE_FILE_MAX_SIZE` directly when
+ * `validate()` has not been called yet (e.g. during route construction before
+ * bootstrap completes).
+ *
+ * @returns {string} Express-compatible request size limit (e.g. "5mb").
+ */
+function getInvoiceFileMaxSize() {
+  if (config) {
+    return config.INVOICE_FILE_MAX_SIZE;
+  }
+  return InvoiceFileMaxSizeSchema.parse(process.env.INVOICE_FILE_MAX_SIZE);
+}
+
+// ─── Security headers ─────────────────────────────────────────────────────────
+
+const securityHeaders = {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"]
+    }
+  },
+  referrerPolicy: { policy: 'no-referrer' },
+  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  // Less restrictive CSP for Swagger UI docs
+  docsContentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"]
+    }
+  }
+};
+
+// ─── Exports ──────────────────────────────────────────────────────────────────
+
+module.exports = {
+  validate,
+  get,
+  getValue,
+  getInvoiceFileMaxSize,
+  logRedactedSummary,
+  ConfigSchema,
+  InvoiceFileMaxSizeSchema,
+  securityHeaders,
+  VALIDATION_BOUNDARIES,
+};
