@@ -14,16 +14,6 @@ const DEFAULT_TIMEOUT_MS = 500;
 const MIN_TIMEOUT_MS = 50;
 const MAX_TIMEOUT_MS = 5000;
 
-const MAX_INVOICE_ID_LENGTH = 128;
-const INVOICE_ID_PATTERN = /^[a-zA-Z0-9:_-]{1,128}$/;
-
-const MAX_KEY_PREFIX_LENGTH = 64;
-const KEY_PREFIX_PATTERN = /^[a-zA-Z0-9:_.-]{1,64}$/;
-
-const MAX_SUMMARY_PAYLOAD_BYTES = 256 * 1024;
-
-const MAX_CURRENT_LEGGER = Number.MAX_SAFE_INTEGER;
-
 let redis;
 try {
   redis = require('redis');
@@ -45,7 +35,7 @@ if (redis && (process.env.NODE_ENV !== 'test' || process.env.USE_REDIS_TEST === 
 
   redisClient.on('error', (err) => {
     isRedisConnected = false;
-    console.warn('Redis connection degraded or broken:', err.message);
+    console.warn('tedis connection degraded or broken:', err.message);
   });
 
   redisClient.connect().catch((err) => {
@@ -232,12 +222,59 @@ function isValidSummary(summary) {
  */
 function withTimeout(promise, ms) {
   let timer;
-  const timeout = new Promise((_, reject) => {
+  const timeout = new Promise((resolve, reject) => {
     timer = setTimeout(() => {
       reject(new Error('Redis operation timed out'));
     }, ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Validates that a summary object is safe to serialize and cache.
+ * Rejects primitives, null, arrays, and objects with a circular reference.
+ * @param {any} summary The candidate summary.
+ * @returns {boolean} True if the summary is a cacheable plain object.
+ */
+function isCacheableSummary(summary) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) {
+    return false;
+  }
+  try {
+    JSON.stringify(summary);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validates the decoded cache envelope. Returns the envelope when it is well
+ * formed and null otherwise. Ensures that corrupted or foreign payloads cannot
+ * propagate into callers as valid cache hits.
+ * @param {string|null|undefined} raw The raw Redis value.
+ * @returns {Object|null} The validated envelope or null.
+ */
+function parseCacheEnvelope(raw) {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return null;
+  }
+  let envelope;
+  try {
+    envelope = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) {
+    return null;
+  }
+  if (!envelope.summary || typeof envelope.summary !== 'object' || Array.isArray(envelope.summary)) {
+    return null;
+  }
+  if (envelope.cachedLedger !== null && !Number.isFinite(envelope.cachedLedger)) {
+    return null;
+  }
+  return envelope;
 }
 
 class RedisEscrowSummaryCache {
@@ -303,6 +340,13 @@ class RedisEscrowSummaryCache {
    * Wraps the Redis GET in a bounded timeout and circuit breaker.
    * On any Redis/timeout/CB failure, fails open by returning a cache miss
    * so the caller falls through to the DB/RPC layer.
+   *
+   * Invariants:
+   * - Only validated invoice IDs reach Redis.
+   * - Only well-formed envelopes are returned as hits; corrupt payloads are
+   *   treated as misses and best-effort evicted.
+   * - Ledger-gap eviction is atomic with respect to the returned result:
+   *   we never return a hit for an entry we just decided to invalidate.
    * @param {string} invoiceId The invoice ID.
    * @param {number} [currentLedger] The current ledger sequence.
    * @returns {Promise<Object>} The cache result including hit status and value.
@@ -327,36 +371,23 @@ class RedisEscrowSummaryCache {
         return { hit: false, reason: 'miss' };
       }
 
-      let entry;
-      try {
-        entry = JSON.parse(raw);
-      } catch {
-        // Corrupted cache entry — evict best-effort and fail open.
-        try {
-          await withTimeout(this.client.del(key), this.timeoutMs);
-        } catch {
-          // Ignore eviction errors; the TWL will handle cleanup.
-        }
-        return { hit: false, reason: 'corrupt_entry' };
+      const envelope = parseCacheEnvelope(raw);
+      if (!envelope) {
+        // Corrupt or foreign payload — evict best-effort and fail open.
+        await this._safeDelete(key);
+        return { hit: false, reason: 'corrupt' };
       }
 
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-        return { hit: false, reason: 'corrupt_entry' };
+      if (
+        Number.isFinite(currentLedger) &&
+        Number.isFinite(envelope.cachedLedger) &&
+        Math.abs(currentLedger - envelope.cachedLedger) > this.ledgerGapThreshold
+      ) {
+        await this._safeDelete(key);
+        return { hit: false, reason: 'ledger_gap' };
       }
 
-      if (isValidLedger(currentLedger) && isValidLedger(entry.cachedLedger)) {
-        if (Math.abs(currentLedger - entry.cachedLedger) > this.ledgerGapThreshold) {
-          // Best-effort eviction — failures here are non-critical.
-          try {
-            await withTimeout(this.client.del(key), this.timeoutMs);
-          } catch {
-            // Ignore eviction errors; the TWL will handle cleanup.
-          }
-          return { hit: false, reason: 'ledger_gap' };
-        }
-      }
-
-      return { hit: true, value: entry.summary };
+      return { hit: true, value: envelope.summary };
     } catch {
       // Redis error, timeout, or circuit breaker exception — fail open.
       redisCacheFailOpenTotal.inc();
@@ -369,6 +400,11 @@ class RedisEscrowSummaryCache {
    * Wraps the Redis SET in a bounded timeout and circuit breaker.
    * On any failure, fails open by returning false so the caller
    * proceeds without caching. Never throws.
+   *
+   * Invariants:
+   * - Only validated invoice IDs and cacheable summaries are written.
+   * - The envelope always contains a stringifiable summary and a numeric
+   *   or null cachedLedger, so readers can trust the shape.
    * @param {string} invoiceId The invoice ID.
    * @param {Object} summary The summary object to cache.
    * @param {number} [currentLedger] The current ledger sequence.
@@ -382,6 +418,9 @@ class RedisEscrowSummaryCache {
       return false;
     }
     if (!isValidSummary(summary)) {
+      return false;
+    }
+    if (!isCacheableSummary(summary)) {
       return false;
     }
 
@@ -411,7 +450,7 @@ class RedisEscrowSummaryCache {
    * Wraps the Redis DEL in a bounded timeout and circuit breaker.
    * On any failure, fails open by returning false. Never throws.
    * @param {string} invoiceId The invoice ID.
-   * @returns {Promise<boolean>} True if the key was deleted.
+   * @returns {Promise<boolean}> Whether Redis accepted the deletion.
    */
   async deleteSummary(invoiceId) {
     if (!this.client) {
@@ -433,6 +472,22 @@ class RedisEscrowSummaryCache {
       return false;
     }
   }
+
+  /**
+   * Best-effort delete that never throws. Used for invalidating corrupt or stale
+   * entries during reads; failures are swallowed because the TTL will eventually
+   * clean the key up.
+   * @param {string} key The Redis key.
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _safeDelete(key) {
+    try {
+      await withTimeout(this.client.del(key), this.timeoutMs);
+    } catch {
+      // Best-effort only — TTL will reclaim the key.
+    }
+  }
 }
 
 module.exports = {
@@ -441,8 +496,7 @@ module.exports = {
   parseRedisEscrowCacheConfig,
   createRedisClient,
   isValidInvoiceId,
-  isValidKeyPrefix,
-  isValidLedger,
-  isValidSummary,
-  parsePositiveInt,
+  withTimeout,
+  isCacheableSummary,
+  parseCacheEnvelope,
 };

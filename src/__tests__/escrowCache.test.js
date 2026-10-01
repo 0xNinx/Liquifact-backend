@@ -2,12 +2,8 @@
 
 const {
   RedisEscrowSummaryCache,
-  validateInvoiceId,
-  validateSummary,
-  validateTtlSeconds,
-  validateVersion,
-  MAX_INVOICE_ID_LENGTH,
-  MAX_TTL_SECONDS,
+  isCacheableSummary,
+  parseCacheEnvelope,
 } = require('../cache/redis');
 const { CircuitBreaker, CircuitBreakerState } = require('../utils/circuitBreaker');
 
@@ -121,161 +117,194 @@ describe('Escrow Cache Integration', () => {
   });
 });
 
-describe('Escrow Cache Validation Boundaries', () => {
-  describe('validateInvoiceId', () => {
-    it('accepts a well-formed invoice id', () => {
-      expect(validateInvoiceId('inv_100')).toEqual({ valid: true, value: 'inv_100' });
-    });
+describe('Escrow Cache Invariants', () => {
+  it('rejects invalid invoice IDs on read and write', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
 
-    it('accepts boundary-length invoice ids', () => {
-      const max = 'a'.repeat(MAX_INVOICE_ID_LENGTH);
-      expect(validateInvoiceId(max).valid).toBe(true);
-      expect(validateInvoiceId('a').valid).toBe(true);
-    });
-
-    it('rejects non-string, empty, and whitespace-only ids', () => {
-      expect(validateInvoiceId(undefined).valid).toBe(false);
-      expect(validateInvoiceId(null).valid).toBe(false);
-      expect(validateInvoiceId(123).valid).toBe(false);
-      expect(validateInvoiceId('').valid).toBe(false);
-      expect(validateInvoiceId('   ').valid).toBe(false);
-    });
-
-    it('rejects ids exceeding the maximum length', () => {
-      const tooLong = 'a'.repeat(MAX_INVOICE_ID_LENGTH + 1);
-      const result = validateInvoiceId(tooLong);
-      expect(result.valid).toBe(false);
-      expect(result.reason).toBe('invoice_id_too_long');
-    });
-
-    it('rejects ids containing control characters', () => {
-      expect(validateInvoiceId('inv\u0000_1').valid).toBe(false);
-      expect(validateInvoiceId('inv\n_1').valid).toBe(false);
-    });
+    for (const bad of ['', ' ', 'inv 100', 'inv_100!', 'a'.repeat(129), null, undefined, 42]) {
+      const r = await cache.getSummary(bad);
+      expect(r.hit).toBe(false);
+      expect(r.reason).toBe('invalid_input');
+      expect(await cache.setSummary(bad, { a: 1 })).toBe(false);
+      expect(await cache.deleteSummary(bad)).toBe(false);
+    }
   });
 
-  describe('validateSummary', () => {
-    it('accepts a plain object summary', () => {
-      const summary = { invoiceId: 'inv_1', status: 'funded' };
-      expect(validateSummary(summary)).toEqual({ valid: true, value: summary });
-    });
+  it('rejects uncacheable summaries without touching Redis', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
 
-    it('rejects null, arrays, and primitives', () => {
-      expect(validateSummary(null).valid).toBe(false);
-      expect(validateSummary([]).valid).toBe(false);
-      expect(validateSummary('str').valid).toBe(false);
-      expect(validateSummary(42).valid).toBe(false);
-    });
+    const circular = {};
+    circular.self = circular;
 
-    it('rejects summaries that are not JSON-serializable', () => {
-      const cyclic = {};
-      cyclic.self = cyclic;
-      const result = validateSummary(cyclic);
-      expect(result.valid).toBe(false);
-      expect(result.reason).toBe('summary_not_serializable');
-    });
+    for (const bad of [null, undefined, 'string', 123, [1, 2], circular]) {
+      expect(await cache.setSummary('inv_ok', bad)).toBe(false);
+    }
+    expect(client.map.size).toBe(0);
   });
 
-  describe('validateTtlSeconds', () => {
-    it('accepts positive integers within bounds', () => {
-      expect(validateTtlSeconds(1)).toEqual({ valid: true, value: 1 });
-      expect(validateTtlSeconds(MAX_TTL_SECONDS).valid).toBe(true);
-    });
+  it('treats corrupt cache payloads as misses and evicts them', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
+    const key = cache.key('inv_corrupt');
 
-    it('rejects zero, negatives, non-integers, and out-of-range values', () => {
-      expect(validateTtlSeconds(0).valid).toBe(false);
-      expect(validateTtlSeconds(-5).valid).toBe(false);
-      expect(validateTtlSeconds(1.5).valid).toBe(false);
-      expect(validateTtlSeconds(MAX_TTL_SECONDS + 1).valid).toBe(false);
-      expect(validateTtlSeconds('60').valid).toBe(false);
-    });
-  });
+    const corruptPayloads = [
+      '{ not json ',
+      'null',
+      'true',
+      '123',
+      '[1,2,3]',
+      JSON.stringify({ cachedLedger: 1, cachedAt: 'now' }),
+      JSON.stringify({ summary: 'not-an-object', cachedLedger: 1 }),
+      JSON.stringify({ summary: { a: 1 }, cachedLedger: 'not-a-number' }),
+    ];
 
-  describe('validateVersion', () => {
-    it('accepts non-negative integers and undefined', () => {
-      expect(validateVersion(undefined).valid).toBe(true);
-      expect(validateVersion(0).valid).toBe(true);
-      expect(validateVersion(42).valid).toBe(true);
-    });
-
-    it('rejects negatives and non-integers', () => {
-      expect(validateVersion(-1).valid).toBe(false);
-      expect(validateVersion(1.2).valid).toBe(false);
-      expect(validateVersion('1').valid).toBe(false);
-    });
-  });
-
-  describe('cache behavior with invalid input', () => {
-    it('getSummary rejects invalid invoice ids without touching Redis', async () => {
-      let getCalls = 0;
-      const client = {
-        get: async () => {
-          getCalls += 1;
-          return null;
-        },
-        set: async () => 'OK',
-        del: async () => 1,
-      };
-      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
-
-      const result = await cache.getSummary('');
+    for (const payload of corruptPayloads) {
+      client.map.set(key, payload);
+      const result = await cache.getSummary('inv_corrupt');
       expect(result.hit).toBe(false);
-      expect(result.reason).toBe('invalid_invoice_id');
-      expect(getCalls).toBe(0);
+      expect(result.reason).toBe('corrupt');
+      expect(client.map.has(key)).toBe(false);
+    }
+  });
+
+  it('evicts and reports ledger_gap at the threshold boundary', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client, ledgerGapThreshold: 3 });
+
+    await cache.setSummary('inv_gap', { a: 1 }, 100);
+
+    // Exactly at threshold — still a hit.
+    const atThreshold = await cache.getSummary('inv_gap', 103);
+    expect(atThreshold.hit).toBe(true);
+
+    // One past threshold — evicted and reported as gap.
+    const over = await cache.getSummary('inv_gap', 104);
+    expect(over.hit).toBe(false);
+    expect(over.reason).toBe('ledger_gap');
+    expect(client.map.has(cache.key('inv_gap'))).toBe(false);
+
+    // Negative direction also evicts.
+    await cache.setSummary('inv_gap', { a: 1 }, 100);
+    const negative = await cache.getSummary('inv_gap', 96);
+    expect(negative.hit).toBe(false);
+    expect(negative.reason).toBe('ledger_gap');
+  });
+
+  it('serves hits when ledger is missing or non-finite', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
+
+    await cache.setSummary('inv_no_ledger', { a: 1 });
+    const noLedger = await cache.getSummary('inv_no_ledger');
+    expect(noLedger.hit).toBe(true);
+
+    const naLedger = await cache.getSummary('inv_no_ledger', NaN);
+    expect(naLedger.hit).toBe(true);
+  });
+
+  it('returns invalid_input when no client is configured', async () => {
+    const cache = new RedisEscrowSummaryCache({ client: null });
+    const r = await cache.getSummary('inv_1');
+    expect(r.hit).toBe(false);
+    expect(r.reason).toBe('invalid_input');
+    expect(await cache.setSummary('inv_1', { a: 1 })).toBe(false);
+  });
+
+  it('treats a circuit-breaker fallback null as a miss, not a hit', async () => {
+    const client = new FakeRedisClient();
+    const breaker = new CircuitBreaker({
+      failureThreshold: 1,
+      recoveryTimeout: 60000,
+      fallbackLogic: () => null,
     });
+    breaker.state = CircuitBreakerState.OPEN;
+    breaker.nextAttemptTime = Date.now() + 60000;
 
-    it('setSummary rejects invalid invoice ids and summaries', async () => {
-      const client = new FakeRedisClient();
-      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+    const cache = new RedisEscrowSummaryCache({ client, circuitBreaker: breaker });
+    const r = await cache.getSummary('inv_cb');
+    expect(r.hit).toBe(false);
+    expect(r.reason).toBe('miss');
+  });
 
-      expect(await cache.setSummary('', { status: 'funded' })).toBe(false);
-      expect(await cache.setSummary('inv_1', null)).toBe(false);
-      expect(client.map.size).toBe(false);
-    });
+  it('survives concurrent reads and writes without interference', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
 
-    it('setSummary rejects invalid ttl values', async () => {
-      const client = new FakeRedisClient();
-      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+    const writes = [];
+    for (let i = 0; i < 20; i++) {
+      writes.push(cache.setSummary(`inv_${i}`, { i: i }, i));
+    }
+    const results = await Promise.all(writes);
+    expect(results.every(Boolean)).toBe(true);
 
-      expect(await cache.setSummary('inv_1', { status: 'funded' }, 0)).toBe(false);
-      expect(await cache.setSummary('inv_1', { status: 'funded' }, -1)).toBe(false);
-      expect(await cache.setSummary('inv_1', { status: 'funded' }, 1.5)).toBe(false);
-      expect(client.map.size).toBe(0);
-    });
+    const reads = [];
+    for (let i = 0; i < 20; i++) {
+      reads.push(cache.getSummary(`inv_${i}`, i));
+    }
+    const readResults = await Promise.all(reads);
+    for (let i = 0; i < 20; i++) {
+      expect(readResults[i].hit).toBe(true);
+      expect(readResults[i].value).toEqual({ i: i });
+    }
+  });
 
-    it('getSummary rejects invalid version values', async () => {
-      const client = new FakeRedisClient();
-      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+  it('deleteSummary is idempotent and fails open on error', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
 
-      const result = await cache.getSummary('inv_1', -1);
-      expect(result.hit).toBe(false);
-      expect(result.reason).toBe('invalid_version');
-    });
+    await cache.setSummary('inv_del', { a: 1 });
+    expect(await cache.deleteSummary('inv_del')).toBe(true);
+    expect(await cache.deleteSummary('inv_del')).toBe(true);
 
-    it('duplicate setSummary calls are idempotent for the same payload', async () => {
-      const client = new FakeRedisClient();
-      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
-      const summary = { invoiceId: 'inv_dup', status: 'funded' };
+    const failingClient = {
+      get: () => Promise.resolve(null),
+      set: () => Promise.resolve('OK'),
+      del: () => Promise.reject(new Error('boom')),
+    };
+    const failingCache = new RedisEscrowSummaryCache({ client: failingClient });
+    expect(await failingCache.deleteSummary('inv_del')).toBe(false);
+  });
+});
 
-      expect(await cache.setSummary('inv_dup', summary, 10)).toBe(true);
-      expect(await cache.setSummary('inv_dup', summary, 10)).toBe(true);
+describe('Escrow Cache State Invariants', () => {
+  it('key() is deterministic and namespaced per invoiceId', () => {
+    const cache = new RedisEscrowSummaryCache({ client: new FakeRedisClient() });
+    expect(cache.key('inv_1')).toBe(cache.key('inv_1'));
+    expect(cache.key('inv_1')).not.toBe(cache.key('inv_2'));
+  });
 
-      const hit = await cache.getSummary('inv_dup', 11);
-      expect(hit.hit).toBe(true);
-      expect(hit.value).toEqual(summary);
-    });
+  it('default ledgerGapThreshold evicts on large forward jumps', async () => {
+    const client = new FakeRedisClient();
+    const cache = new RedisEscrowSummaryCache({ client });
+    await cache.setSummary('inv_default_gap', { a: 1 }, 1);
+    const far = await cache.getSummary('inv_default_gap', 1_000_000);
+    expect(far.hit).toBe(false);
+    expect(far.reason).toBe('ledger_gap');
+  });
+});
 
-    it('rejects a stale version read after a newer write', async () => {
-      const client = new FakeRedisClient();
-      const cache = new RedisEscrowSummaryCache({ client, ttlSeconds: 60 });
+describe('Escrow Cache Helpers', () => {
+  it('isCacheableSummary accepts only plain objects', () => {
+    expect(isCacheableSummary({ a: 1 })).toBe(true);
+    expect(isCacheableSummary(null)).toBe(false);
+    expect(isCacheableSummary(undefined)).toBe(false);
+    expect(isCacheableSummary('x')).toBe(false);
+    expect(isCacheableSummary([])).toBe(false);
+    const c = {};
+    c.self = c;
+    expect(isCacheableSummary(c)).toBe(false);
+  });
 
-      await cache.setSummary('inv_ver', { invoiceId: 'inv_ver', status: 'a' }, 100);
-      const stale = await cache.getSummary('inv_ver', 99);
-      expect(stale.hit).toBe(false);
-      expect(stale.reason).toBe('stale_version');
-
-      const fresh = await cache.getSummary('inv_ver', 100);
-      expect(fresh.hit).toBe(true);
-    });
+  it('parseCacheEnvelope rejects malformed payloads', () => {
+    expect(parseCacheEnvelope(null)).toBeNull();
+    expect(parseCacheEnvelope('')).toBeNull();
+    expect(parseCacheEnvelope('not-json')).toBeNull();
+    expect(parseCacheEnvelope('null')).toBeNull();
+    expect(parseCacheEnvelope('[1,2]')).toBeNull();
+    expect(parseCacheEnvelope(JSON.stringify({ summary: 'x' }))).toBeNull();
+    expect(parseCacheEnvelope(JSON.stringify({ summary: { a: 1 }, cachedLedger: 'nope' }))).toBeNull();
+    expect(parseCacheEnvelope(JSON.stringify({ summary: { a: 1 }, cachedLedger: 5 }))).toEqual({ summary: { a: 1 }, cachedLedger: 5 });
   });
 });

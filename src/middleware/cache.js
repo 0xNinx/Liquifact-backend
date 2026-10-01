@@ -10,6 +10,9 @@
  * - {@link makeInvestorLocksKey} — tenant-scoped key for the locks-list endpoint
  * - {@link makeInvestorLockKey}  — key for a single lock identified by invoiceId + funderAddress
  *
+ * Cache keys are validated before use: empty, non-string, or oversized keys
+ * are rejected so a bad `keyFn` cannot poison the store or collide entries.
+ *
  * The {@link invalidatePrefix} helper lets write-side services (e.g. invoice
  * state machine, investor commitment) flush groups of related cache entries
  * without knowing the exact keys.
@@ -30,6 +33,9 @@ const { cacheStoreErrorsTotal } = require('../metrics');
 const { getInvestorLockPrincipalScope } = require('../utils/investorLockScope');
 
 const SENSITIVE_QUERY_PARAMS = new Set(['funderAddress']);
+
+/** Maximum accepted cache-key length; longer keys are rejected as unsafe. */
+const MAX_CACHE_KEY_LENGTH = 2048;
 
 /**
  * Maximum length allowed for a cache key. Keys longer than this are rejected
@@ -136,6 +142,26 @@ function hashCacheComponent(value) {
 }
 
 /**
+ * Validates a resolved cache key before it is used against the store.
+ *
+ * A key must be a non-empty string within {@link MAX_CACHE_KEY_LENGTH}. This
+ * guards against `keyFn` implementations that return `undefined`, objects,
+ * or unbounded attacker-influenced strings (e.g. raw query strings), which
+ * would otherwise cause store errors, cross-tenant collisions, or unbounded
+ * memory growth.
+ *
+ * @param {unknown} key - Candidate cache key.
+ * @returns {boolean} `true` when the key is safe to use.
+ */
+function isValidCacheKey(key) {
+  return (
+    typeof key === 'string' &&
+    key.length > 0 &&
+    key.length <= MAX_CACHE_KEY_LENGTH
+  );
+}
+
+/**
  * Converts an Express query value into deterministic key segments.
  *
  * @param {string} name - Query parameter name.
@@ -210,6 +236,40 @@ function makeInvestorPrincipalScopeKey(req) {
 }
 
 /**
+ * Resolves and validates the cache key for a request.
+ *
+ * Returns `null` when the key is missing or invalid so callers can bypass the
+ * cache rather than risk an unsafe store operation. The failure is reported
+ * through the structured logger and the `cache_store_errors_total` counter
+ * without leaking the offending key value.
+ *
+ * @param {Function} resolveKey - Key derivation function.
+ * @param {import('express').Request} req - The Express request.
+ * @returns {string|null} Validated cache key, or `null` when invalid.
+ */
+function resolveValidatedKey(resolveKey, req) {
+  let key;
+  try {
+    key = resolveKey(req);
+  } catch (err) {
+    cacheStoreErrorsTotal.inc();
+    (req.log || logger).warn({ err, component: 'cache' }, 'Cache key derivation error, bypassing cache');
+    return null;
+  }
+
+  if (!isValidCacheKey(key)) {
+    cacheStoreErrorsTotal.inc();
+    (req.log || logger).warn(
+      { component: 'cache', keyType: typeof key },
+      'Invalid cache key, bypassing cache'
+    );
+    return null;
+  }
+
+  return key;
+}
+
+/**
  * Creates an Express middleware that caches JSON responses with a TTL.
  *
  * On cache hit, returns the cached JSON and sets `X-Cache: HIT` header.
@@ -257,19 +317,8 @@ function cacheResponse({ ttl, store, keyFn }) {
     }
 
     let cached;
-    let key;
-    try {
-      key = resolveKey(req);
-    } catch (err) {
-      cacheStoreErrorsTotal.inc();
-      (req.log || logger).warn({ err, component: 'cache' }, 'Cache key derivation error, falling through');
-      return next();
-    }
-    if (!isValidCacheKey(key)) {
-      (req.log || logger).warn(
-        { component: 'cache', keyLength: typeof key === 'string' ? key.length : 0 },
-        'Invalid cache key, bypassing cache'
-      );
+    const key = resolveValidatedKey(resolveKey, req);
+    if (key === null) {
       return next();
     }
 
@@ -344,6 +393,23 @@ function makeInvestorLocksKey(req) {
 }
 
 /**
+ * Reads a required route/query parameter for investor-lock cache keys.
+ *
+ * Invariant: cache keys must never contain `undefined`/`null` segments, as
+ * that would let distinct requests collide on the same key. Missing or
+ * non-string values are rejected so the caller can bypass the cache.
+ *
+ * @param {unknown} value - Candidate parameter value.
+ * @returns {string|null} Normalized value, or `null` when invalid.
+ */
+function normalizeLockKeyPart(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    return null;
+  }
+  return value;
+}
+
+/**
  * Creates a tenant-isolated cache key for a single investor lock by invoice
  * ID and funder address.
  *
@@ -351,15 +417,18 @@ function makeInvestorLocksKey(req) {
  * @returns {string} Cache key, e.g. `investor:lock:tenant-abc:invoice-123:sha256:...`
  */
 function makeInvestorLockKey(req) {
-  const tenantId = normalizeTenantId(req && req.tenantId);
-  const invoiceId = req && req.params && req.params.invoiceId;
-  const funderAddress = req && req.query ? req.query.funderAddress : undefined;
-  const invoiceSegment = isValidSegment(invoiceId) ? invoiceId : UNKNOWN_SEGMENT;
-  const funderSegment = `sha256:${hashCacheComponent(funderAddress)}`;
-  const key = 'investor:lock:' + tenantId + ':' + invoiceSegment + ':' + funderSegment;
-  return isValidCacheKey(key)
-    ? key
-    : 'investor:lock:' + tenantId + ':' + UNKNOWN_SEGMENT + ':' + funderSegment;
+  const tenantId = req.tenantId || 'unknown';
+  const invoiceId = normalizeLockKeyPart(req.params && req.params.invoiceId);
+  const funderAddress = normalizeLockKeyPart(req.query && req.query.funderAddress);
+  if (invoiceId === null || funderAddress === null) {
+    cacheStoreErrorsTotal.inc();
+    (req.log || logger).warn(
+      { component: 'cache', hasInvoiceId: invoiceId !== null, hasFunderAddress: funderAddress !== null },
+      'Invalid investor lock cache key parts, bypassing cache'
+    );
+    return null;
+  }
+  return 'investor:lock:' + tenantId + ':' + makeInvestorPrincipalScopeKey(req) + ':' + invoiceId + ':sha256:' + hashCacheComponent(funderAddress);
 }
 
 /**
@@ -374,10 +443,10 @@ function makeInvestorLockKey(req) {
  * @param {object} [loggerOption]  - Optional logger override.
  * @returns {number} Number of keys invalidated.
  */
-function invalidatePrefix(store, prefix, loggerOption) {
-  const log = loggerOption || logger;
-  if (!store || typeof prefix !== 'string' || prefix.length === 0) {
-    return 0;
+function invalidatePrefix(store, prefix) {
+  if (typeof prefix !== 'string' || prefix.length === 0) {
+    logger.warn({ component: 'cache', prefixType: typeof prefix }, 'Invalid cache invalidation prefix, skipping');
+    return;
   }
   try {
     if (typeof store.deleteByPrefix === 'function') {
@@ -417,12 +486,5 @@ module.exports = {
   isValidCacheKey,
   normalizeTenantId,
   hashCacheComponent,
-  makeInvestorRequestTargetKey,
-  makeInvestorPrincipalScopeKey,
-  MAX_CACHE_KEY_LENGTH,
-  MAX_QUERY_PARAMS,
-  MAX_QUERY_VALUES_PER_PARAM,
-  MAX_QUERY_VALUE_LENGTH,
-  MAX_TENANT_ID_LENGTH,
-  UNKNOWN_SEGMENT,
+  isValidCacheKey,
 };
